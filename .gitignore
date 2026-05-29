@@ -1,0 +1,14 @@
+# Local runtime artifacts
+.codex_tmp_logs/
+*.log
+src/Intro/LaunchQuinnHidden.vbs
+
+# PowerShell and editor noise
+*.tmp
+*.bak
+*.swp
+
+# Windows / IDE
+.vs/
+Thumbs.db
+Desktop.ini

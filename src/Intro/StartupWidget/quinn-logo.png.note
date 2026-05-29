@@ -1,0 +1,15 @@
+PLACEHOLDER: Quinn Logo
+
+This file should be a 40x40px PNG image of the Quinn/Studio Voly logo.
+
+The logo is loaded dynamically by the StartupWidget.UI.psm1 module.
+If this file doesn't exist, the widget will still function but without the icon.
+
+Options:
+1. Add quinn-logo.png (40x40px PNG) to this directory
+2. Reference the existing StudioVolySplash.png from ../StudioVolySplash.png
+3. Create a simple icon and place it here
+
+Current image control will try to load: quinn-logo.png
+If you want to use a different image, update the path in StartupWidget.UI.psm1:
+  Line ~20: $pngPath = Join-Path $PSScriptRoot "quinn-logo.png"
