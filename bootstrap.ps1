@@ -277,3 +277,4 @@ finally {
     try { Stop-Transcript | Out-Null } catch {}
     Set-Location $originalLocation
 }
+
