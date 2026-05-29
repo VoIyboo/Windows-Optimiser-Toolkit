@@ -33,3 +33,5 @@ if (-not $VerboseStartup) {
 Write-Host ("Launching local toolkit from: {0}" -f $root)
 Write-Host ("Intro log: {0}" -f $introLog)
 & $psExe @args
+
+
