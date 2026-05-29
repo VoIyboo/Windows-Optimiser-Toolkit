@@ -15,3 +15,4 @@ REM Use %SystemRoot% so this works on machines where Windows is not on C:.
 cd /d "%SystemRoot%\System32"
 cls
 echo Quinn Optimizer Toolkit closed.
+
