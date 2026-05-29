@@ -1,6 +1,7 @@
 <p align="center">
 
-<img width="400" height="400" alt="studio_voly_small (2)" src="[https://github.com/user-attachments/assets/cff95849-ff1d-4e9c-a748-092487d31a51](https://github.com/VoIyboo/Windows-Optimiser-Toolkit/blob/main/src/Intro/StudioVolySplash.png)" />
+<p align="center">
+  <img width="400" height="400" alt="studio_voly_small" src="src/Intro/StudioVolySplash.png" />
 </p>
 
 <p align="center">
