@@ -666,7 +666,9 @@ try {
     $mainWindowLaunchTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
     try {
-        Start-QOTMain -RootPath $rootPath
+        # Hand the startup widget to MainWindow so it can replace it cleanly
+        # as soon as the main UI is ready to render.
+        Start-QOTMain -RootPath $rootPath -SplashWindow $widget
     }
     catch {
         $startMainErrorDetail = if ($_.Exception) { $_.Exception.ToString() } else { $_.ToString() }

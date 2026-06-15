@@ -34,12 +34,14 @@ function New-QOTBootstrapUi {
     Title="Quinn Optimiser Toolkit"
     Width="300"
     SizeToContent="Height"
-    ResizeMode="NoResize"
     WindowStyle="None"
+    ResizeMode="NoResize"
     AllowsTransparency="True"
     Background="Transparent"
     ShowInTaskbar="False"
-    Topmost="True">
+    Topmost="True"
+    WindowStartupLocation="Manual"
+    ShowActivated="False">
     <Window.Resources>
         <Storyboard x:Key="FadeInAnimation">
             <DoubleAnimation Storyboard.TargetProperty="Opacity"
@@ -73,10 +75,10 @@ function New-QOTBootstrapUi {
             <ProgressBar
                 x:Name="BootstrapProgressBar"
                 Grid.Row="1"
-                Height="16"
+                Height="8"
                 Minimum="0"
                 Maximum="100"
-                Value="5"
+                Value="0"
                 Foreground="#0066FF"
                 Background="Transparent" />
         </Grid>
@@ -127,6 +129,25 @@ function New-QOTBootstrapUi {
 
         $window.UpdateLayout()
         $window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Background) | Out-Null
+
+        # Match the intro widget behavior: stay topmost briefly so users notice
+        # the loader, then stop pinning it above everything else.
+        try {
+            $timer = New-Object System.Timers.Timer
+            $timer.Interval = 3000
+            $timer.AutoReset = $false
+            $timer.Add_Elapsed({
+                try {
+                    $window.Dispatcher.Invoke([action]{
+                        $window.Topmost = $false
+                    }, [System.Windows.Threading.DispatcherPriority]::Normal) | Out-Null
+                }
+                catch { }
+                try { $timer.Dispose() } catch { }
+            })
+            $timer.Start()
+        }
+        catch { }
 
         return [pscustomobject]@{
             Window       = $window
