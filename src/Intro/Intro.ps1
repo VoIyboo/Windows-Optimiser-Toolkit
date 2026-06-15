@@ -331,7 +331,10 @@ try {
                                 }
                             }
 
-                            return (& $sync -MaxPerMailbox $MaxPerMailbox -AllowStartOutlook)
+                            # Do not cold-launch Outlook during the intro phase.
+                            # On fresh machines this can steal focus with first-run/setup dialogs
+                            # before users clearly see Quinn's startup UI.
+                            return (& $sync -MaxPerMailbox $MaxPerMailbox)
                         }).AddArgument($ticketsCoreModule).AddArgument(25)
 
                         $introSyncAsync = $introSyncPs.BeginInvoke()

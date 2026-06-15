@@ -237,88 +237,8 @@ function Get-QOTOutlookNamespace {
     $existingNamespace = & $tryResolveNamespace
     if ($existingNamespace) { return $existingNamespace }
 
-    if (-not $AllowStartOutlook) {
-        throw "Classic Outlook is not running. Open Outlook and retry."
-    }
-
-    # Start classic Outlook explicitly, then attach via the running instance.
-    # Direct COM startup can block for a long time on some machines when Outlook is cold.
-    $candidateExePaths = @()
-    try {
-        foreach ($regPath in @(
-                "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE",
-                "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE",
-                "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE")) {
-            try {
-                $value = (Get-ItemProperty -LiteralPath $regPath -ErrorAction SilentlyContinue).'(default)'
-                $exe = ([string]($value + "")).Trim()
-                if (-not [string]::IsNullOrWhiteSpace($exe)) { $candidateExePaths += @($exe) }
-            } catch { }
-        }
-    } catch { }
-    try {
-        foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
-            if ([string]::IsNullOrWhiteSpace([string]$root)) { continue }
-            foreach ($rel in @(
-                    "Microsoft Office\root\Office16\OUTLOOK.EXE",
-                    "Microsoft Office\Office16\OUTLOOK.EXE",
-                    "Microsoft Office\root\Office15\OUTLOOK.EXE",
-                    "Microsoft Office\Office15\OUTLOOK.EXE")) {
-                $candidateExePaths += @(Join-Path $root $rel)
-            }
-        }
-    } catch { }
-    $candidateExePaths += @("OUTLOOK.EXE")
-
-    $started = $false
-    $lastStartError = ""
-    foreach ($candidate in @($candidateExePaths | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)) {
-        try {
-            if ($candidate -ne "OUTLOOK.EXE" -and -not (Test-Path -LiteralPath $candidate)) { continue }
-            $startedProcess = Start-Process -FilePath $candidate -ArgumentList "/recycle" -WindowStyle Minimized -PassThru -ErrorAction Stop
-            try { $null = $startedProcess.WaitForInputIdle(12000) } catch { }
-            Write-QOTOutlookSyncLog ("Started Outlook process for COM attach using: " + $candidate)
-            $started = $true
-            break
-        } catch {
-            $lastStartError = [string]$_.Exception.Message
-        }
-    }
-
-    if ($started) {
-        $maxAttempts = 24  # ~12 seconds
-        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-            Start-Sleep -Milliseconds 500
-
-            $attachedNamespace = & $tryResolveNamespace
-            if ($attachedNamespace) { return $attachedNamespace }
-        }
-    }
-
-    $details = @()
-    try {
-        $createdOutlook = New-QOTOutlookComApplication -RetryCount 3 -RetryDelayMilliseconds 1500
-        if ($createdOutlook) {
-            $createdNamespace = $createdOutlook.GetNamespace("MAPI")
-            if ($createdNamespace) {
-                Write-QOTOutlookSyncLog "Attached to Classic Outlook by creating a COM application instance after active-object attach failed." "WARN"
-                return $createdNamespace
-            }
-        }
-    } catch {
-        $fallbackMessage = ""
-        try { $fallbackMessage = ([string]$_.Exception.Message).Trim() } catch { $fallbackMessage = "" }
-        if (-not [string]::IsNullOrWhiteSpace($fallbackMessage)) {
-            $details += @("COM: " + $fallbackMessage)
-        }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($lastStartError)) {
-        $details += @("Start: " + $lastStartError)
-    }
-    $detailSuffix = ""
-    if ($details.Count -gt 0) {
-        $detailSuffix = " (" + ($details -join " | ") + ")"
+    if ($AllowStartOutlook) {
+        Write-QOTOutlookSyncLog "Outlook auto-start was requested, but QOT now waits for users to open Outlook manually." "INFO"
     }
 
     $elevatedHint = ""
@@ -328,9 +248,8 @@ function Get-QOTOutlookNamespace {
         }
     } catch { }
 
-    Write-QOTOutlookSyncLog "Outlook COM attach/startup failed after retries." "WARN"
-
-    throw ("Outlook COM unavailable: could not attach to Classic Outlook. Ensure Classic Outlook (not New Outlook) is installed/running and fully opened, then retry." + $elevatedHint + $detailSuffix)
+    Write-QOTOutlookSyncLog "Classic Outlook is not open, so QOT is waiting for the user to open it." "WARN"
+    throw ("Classic Outlook is not open. Open Outlook and sign in, then QOT will connect automatically." + $elevatedHint)
 }
 
 function Get-QOTOutlookApplication {
@@ -1512,7 +1431,7 @@ function Sync-QOTicketsFromOutlook {
     Initialize-QOTicketsCoreApi
     $mailboxes = @(Get-QOTEffectiveMonitoredMailboxAddresses -AllowStartOutlook:$AllowStartOutlook -PersistWhenSingle)
     if (-not $mailboxes -or $mailboxes.Count -eq 0) {
-        $note = "No monitored mailbox addresses set. Add one in Settings, or sign in to a single Outlook mailbox so QOT can auto-detect it."
+        $note = "No monitored mailbox addresses are configured. Open Outlook and sign in, then add a mailbox in Settings or let QOT auto-detect a single mailbox."
         Write-QOTOutlookSyncLog $note "WARN"
         return [pscustomobject]@{ Success = $false; Added = 0; Note = $note }
     }
@@ -1540,8 +1459,8 @@ function Sync-QOTicketsFromOutlook {
     $cutoffUtc    = Get-QOTEffectiveEmailCutoffUtc -LastSyncUtc $lastSyncUtc
     $syncStartedAtUtc = (Get-Date).ToUniversalTime()
 
-    # Background sync keeps this disabled so periodic polls fail fast.
-    # Startup paths can opt in to launch Outlook and hydrate tickets before the UI opens.
+    # Background and startup sync both keep Outlook launch disabled so polls fail fast
+    # and the UI can explain what is happening instead of opening Outlook unexpectedly.
     $mapi  = Get-QOTOutlookNamespace -AllowStartOutlook:$AllowStartOutlook
     Write-QOTOutlookSyncLog "Outlook namespace resolved."
     $added = 0

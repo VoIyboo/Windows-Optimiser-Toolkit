@@ -1505,6 +1505,9 @@ function Get-QOTicketsSyncStatusDisplayState {
         elseif (
             $normalized.StartsWith("background sync") -or
             $normalized.StartsWith("email sync loading") -or
+            $normalized.StartsWith("checking outlook") -or
+            $normalized.StartsWith("open outlook") -or
+            $normalized.StartsWith("classic outlook is not open") -or
             $normalized.StartsWith("outlook reconnecting") -or
             $normalized.StartsWith("manual sync") -or
             $normalized.StartsWith("sync failed") -or
@@ -1526,6 +1529,9 @@ function Get-QOTicketsSyncStatusDisplayState {
         }
     }
 
+    if ($messageText.ToLowerInvariant().StartsWith("open outlook") -or $messageText.ToLowerInvariant().StartsWith("classic outlook is not open")) {
+        $toolTipParts += @("Open Classic Outlook and sign in. QOT will attach automatically once Outlook is ready.")
+    }
     $toolTipParts += @("Click to sync now.")
     $toolTipText = @(
         $toolTipParts |
@@ -5654,11 +5660,9 @@ function Set-QOTicketsSyncStatus {
     try { if ($displayState -and $displayState.PSObject.Properties.Name -contains "Text") { $visibleText = [string]$displayState.Text } } catch { $visibleText = $displayLabel }
     try { if ($displayState -and $displayState.PSObject.Properties.Name -contains "ToolTip") { $toolTipText = $displayState.ToolTip } } catch { $toolTipText = $null }
 
-    # Add click to sync hint to tooltip
     if ([string]::IsNullOrWhiteSpace($toolTipText)) {
         $toolTipText = $displayLabel
     }
-    $toolTipText = "$toolTipText`r`n`r`nClick to sync now."
 
     try {
         if ($StatusText.Dispatcher.CheckAccess()) {
@@ -6048,10 +6052,10 @@ function Get-QOTicketsSyncRecoveringStatusMessage {
 
     $delayLabel = Get-QOTicketsSyncRetryDelayLabel -NextAttemptUtc $NextAttemptUtc
     if ($delayLabel -eq "now") {
-        return "Outlook reconnecting... retrying now"
+        return "Open Outlook to enable ticket sync... retrying now"
     }
 
-    return ("Outlook reconnecting... retry in {0}" -f $delayLabel)
+    return ("Open Outlook to enable ticket sync... retry in {0}" -f $delayLabel)
 }
 
 function Convert-QOTicketsSyncResultObject {
@@ -6799,7 +6803,6 @@ function Start-TicketsEmailSyncAsync {
                 "-ToolkitRoot", $toolkitRootPath,
                 "-SyncCommand", $syncCmdName,
                 "-MaxPerMailbox", [string]$MaxPerMailbox,
-                "-AllowStartOutlook",
                 "-ResultPath", $resultPath
             )
             $argumentString = ConvertTo-QOTProcessArgumentString -Arguments $argList
@@ -6851,7 +6854,7 @@ function Start-TicketsEmailSyncAsync {
                 }
 
                 try {
-                    return (& $SyncCmdName -MaxPerMailbox $MaxPerMailbox -AllowStartOutlook)
+                    return (& $SyncCmdName -MaxPerMailbox $MaxPerMailbox)
                 } catch {
                     return [pscustomobject]@{
                         Success     = $false
@@ -13824,7 +13827,7 @@ function Initialize-QOTicketsUI {
         }
     } catch { }
 
-    Set-QOTicketsSyncStatus -StatusText $syncStatusText -Message "Starting background sync..."
+    Set-QOTicketsSyncStatus -StatusText $syncStatusText -Message "Checking Outlook for ticket sync..."
     Write-QOTicketsUILog "Tickets: Starting auto sync worker and initial sync pass."
     Start-QOTicketsAutoSyncWorker -Grid $grid -GetTicketsCmd $getTicketsCmd -SyncCmd $syncCmd -StatusText $syncStatusText
     if (-not $syncCmd) {
