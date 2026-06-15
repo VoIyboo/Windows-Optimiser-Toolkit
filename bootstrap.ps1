@@ -143,6 +143,9 @@ function Get-QOTBootstrapLogoPath {
         [Parameter(Mandatory)]
         $Layout,
 
+        [AllowNull()]
+        $State,
+
         [Parameter(Mandatory)]
         [string[]]$Owners,
 
@@ -153,7 +156,11 @@ function Get-QOTBootstrapLogoPath {
         [string]$Branch
     )
 
-    $installedLogo = Join-Path $Layout.CurrentRoot "src\Intro\StudioVolySplash.png"
+    $installedRoot = Get-QOTInstalledToolkitRoot -Layout $Layout -State $State
+    $installedLogo = ""
+    if (-not [string]::IsNullOrWhiteSpace($installedRoot)) {
+        $installedLogo = Join-Path $installedRoot "src\Intro\StudioVolySplash.png"
+    }
     if (Test-Path -LiteralPath $installedLogo) {
         return $installedLogo
     }
@@ -374,6 +381,7 @@ function Get-QOTInstallLayout {
         return [pscustomobject]@{
             RootPath       = $candidate
             AppRoot        = Join-Path $candidate "App"
+            ReleasesRoot   = Join-Path $candidate "App\Releases"
             CurrentRoot    = Join-Path $candidate "App\Current"
             PreviousRoot   = Join-Path $candidate "App\Previous"
             StagingRoot    = Join-Path $candidate "App\Staging"
@@ -418,6 +426,33 @@ function Write-QOTInstallState {
 
     $json = $State | ConvertTo-Json -Depth 10
     Set-Content -LiteralPath $StatePath -Value $json -Encoding UTF8
+}
+
+function Get-QOTInstalledToolkitRoot {
+    param(
+        [Parameter(Mandatory)]
+        $Layout,
+
+        [AllowNull()]
+        $State
+    )
+
+    $stateInstallRoot = ""
+    try { $stateInstallRoot = ([string]($State.InstallRoot + "")).Trim() } catch { $stateInstallRoot = "" }
+
+    if (-not [string]::IsNullOrWhiteSpace($stateInstallRoot)) {
+        $stateIntro = Join-Path $stateInstallRoot "src\Intro\Intro.ps1"
+        if (Test-Path -LiteralPath $stateIntro) {
+            return $stateInstallRoot
+        }
+    }
+
+    $currentIntro = Join-Path $Layout.CurrentRoot "src\Intro\Intro.ps1"
+    if (Test-Path -LiteralPath $currentIntro) {
+        return $Layout.CurrentRoot
+    }
+
+    return ""
 }
 
 function Get-QOTLatestRemoteInfo {
@@ -548,7 +583,7 @@ function Install-QOTFromGitHub {
         $RemoteInfo
     )
 
-    foreach ($dir in @($Layout.AppRoot, $Layout.DownloadRoot)) {
+    foreach ($dir in @($Layout.AppRoot, $Layout.ReleasesRoot, $Layout.DownloadRoot)) {
         if (-not (Test-Path -LiteralPath $dir)) {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
@@ -556,7 +591,18 @@ function Install-QOTFromGitHub {
 
     $zipPath = Join-Path $Layout.DownloadRoot "repo.zip"
     $extractRoot = Join-Path $Layout.DownloadRoot "extract"
-    $stagingCurrent = Join-Path $Layout.StagingRoot "Current"
+    $commitSegment = ""
+    try { $commitSegment = ([string]($RemoteInfo.CommitSha + "")).Trim() } catch { $commitSegment = "" }
+    if ([string]::IsNullOrWhiteSpace($commitSegment)) {
+        $commitSegment = (Get-Date -Format "yyyyMMdd_HHmmss")
+    }
+    $commitSegment = ($commitSegment -replace '[^A-Za-z0-9._-]', '').Trim()
+    if ([string]::IsNullOrWhiteSpace($commitSegment)) {
+        $commitSegment = [Guid]::NewGuid().ToString("N")
+    }
+
+    $stagingCurrent = Join-Path $Layout.StagingRoot ("Current_{0}" -f $commitSegment)
+    $releaseRoot = Join-Path $Layout.ReleasesRoot $commitSegment
 
     foreach ($path in @($extractRoot, $Layout.StagingRoot, $zipPath)) {
         if (Test-Path -LiteralPath $path) {
@@ -591,15 +637,11 @@ function Install-QOTFromGitHub {
         throw "Staged toolkit is invalid: missing $stagedIntro"
     }
 
-    if (Test-Path -LiteralPath $Layout.PreviousRoot) {
-        Remove-Item -LiteralPath $Layout.PreviousRoot -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $releaseRoot) {
+        Remove-Item -LiteralPath $releaseRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    if (Test-Path -LiteralPath $Layout.CurrentRoot) {
-        Move-Item -LiteralPath $Layout.CurrentRoot -Destination $Layout.PreviousRoot -Force
-    }
-
-    Move-Item -LiteralPath $stagingCurrent -Destination $Layout.CurrentRoot -Force
+    Move-Item -LiteralPath $stagingCurrent -Destination $releaseRoot -Force
 
     if (Test-Path -LiteralPath $Layout.StagingRoot) {
         Remove-Item -LiteralPath $Layout.StagingRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -612,7 +654,7 @@ function Install-QOTFromGitHub {
         Branch         = $Branch
         CommitSha      = if ($RemoteInfo) { [string]$RemoteInfo.CommitSha } else { "" }
         CommitDate     = if ($RemoteInfo) { [string]$RemoteInfo.CommitDate } else { "" }
-        InstallRoot    = $Layout.CurrentRoot
+        InstallRoot    = $releaseRoot
     }
     Write-QOTInstallState -StatePath $Layout.StatePath -State $installedState
 
@@ -698,15 +740,14 @@ try {
     }
 
     $layout = Get-QOTInstallLayout
+    $state = Read-QOTInstallState -StatePath $layout.StatePath
 
     $bootstrapUi = $null
     if (-not $ForceRemote) {
-        $logoPath = Get-QOTBootstrapLogoPath -Layout $layout -Owners $repoOwners -RepoName $repoName -Branch $Branch
+        $logoPath = Get-QOTBootstrapLogoPath -Layout $layout -State $state -Owners $repoOwners -RepoName $repoName -Branch $Branch
         $bootstrapUi = New-QOTBootstrapUi -LogoPath $logoPath
         Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 8 -Status "Preparing startup..." -Detail "Checking your Quinn Optimiser Toolkit installation."
     }
-
-    $state = Read-QOTInstallState -StatePath $layout.StatePath
 
     $toolkitRoot = $null
     $localRoot = $PSScriptRoot
@@ -723,8 +764,13 @@ try {
         return
     }
 
-    $installedIntro = Join-Path $layout.CurrentRoot "src\Intro\Intro.ps1"
-    $hasInstalledCopy = Test-Path -LiteralPath $installedIntro
+    $installedToolkitRoot = Get-QOTInstalledToolkitRoot -Layout $layout -State $state
+    $installedIntro = ""
+    $hasInstalledCopy = $false
+    if (-not [string]::IsNullOrWhiteSpace($installedToolkitRoot)) {
+        $installedIntro = Join-Path $installedToolkitRoot "src\Intro\Intro.ps1"
+        $hasInstalledCopy = Test-Path -LiteralPath $installedIntro
+    }
 
     $installedCopyDetail = "No installed copy found yet. Preparing first-time download."
     if ($hasInstalledCopy) {
@@ -786,7 +832,11 @@ try {
 
     Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 92 -Status "Launching Quinn..." -Detail "Opening the toolkit window now."
     Close-QOTBootstrapUi -Ui $bootstrapUi
-    Start-QOTInstalledCopy -ToolkitRoot $layout.CurrentRoot -LogDir $logDir -VerboseStartup:$VerboseStartup
+    $installedToolkitRoot = Get-QOTInstalledToolkitRoot -Layout $layout -State $state
+    if ([string]::IsNullOrWhiteSpace($installedToolkitRoot)) {
+        throw "Toolkit install state was updated, but no runnable installed copy could be found."
+    }
+    Start-QOTInstalledCopy -ToolkitRoot $installedToolkitRoot -LogDir $logDir -VerboseStartup:$VerboseStartup
 }
 catch {
     Close-QOTBootstrapUi -Ui $bootstrapUi
