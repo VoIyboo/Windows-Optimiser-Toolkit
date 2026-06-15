@@ -18,6 +18,207 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $originalLocation = Get-Location
 
+function New-QOTBootstrapUi {
+    param(
+        [AllowNull()][string]$LogoPath
+    )
+
+    try {
+        Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
+
+        [xml]$xaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Quinn Optimiser Toolkit"
+    Width="460"
+    Height="290"
+    ResizeMode="NoResize"
+    WindowStartupLocation="CenterScreen"
+    Background="#111827"
+    Foreground="White"
+    ShowInTaskbar="True"
+    Topmost="True">
+    <Border Padding="22" Background="#111827">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <Border
+                Grid.Row="0"
+                Width="150"
+                Height="150"
+                HorizontalAlignment="Center"
+                Margin="0,0,0,14"
+                Background="Transparent">
+                <Image
+                    x:Name="BootstrapLogoImage"
+                    Stretch="Uniform" />
+            </Border>
+
+            <TextBlock
+                Grid.Row="1"
+                Text="Quinn Optimiser Toolkit"
+                FontSize="24"
+                FontWeight="SemiBold"
+                HorizontalAlignment="Center"
+                Margin="0,0,0,8" />
+
+            <TextBlock
+                x:Name="BootstrapStatusText"
+                Grid.Row="2"
+                Text="Starting..."
+                FontSize="15"
+                HorizontalAlignment="Center"
+                Margin="0,0,0,16"
+                Foreground="#D1D5DB" />
+
+            <ProgressBar
+                x:Name="BootstrapProgressBar"
+                Grid.Row="3"
+                Height="16"
+                Minimum="0"
+                Maximum="100"
+                Value="5"
+                Margin="0,0,0,14" />
+
+            <TextBlock
+                x:Name="BootstrapDetailText"
+                Grid.Row="4"
+                Text="Preparing startup..."
+                FontSize="12"
+                TextWrapping="Wrap"
+                TextAlignment="Center"
+                Foreground="#9CA3AF" />
+        </Grid>
+    </Border>
+</Window>
+"@
+
+        $reader = New-Object System.Xml.XmlNodeReader($xaml)
+        $window = [Windows.Markup.XamlReader]::Load($reader)
+        $logoImage = $window.FindName("BootstrapLogoImage")
+
+        if ($logoImage -and -not [string]::IsNullOrWhiteSpace([string]$LogoPath) -and (Test-Path -LiteralPath $LogoPath)) {
+            try {
+                $bitmap = New-Object System.Windows.Media.Imaging.BitmapImage
+                $bitmap.BeginInit()
+                $bitmap.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+                $bitmap.UriSource = New-Object System.Uri($LogoPath, [System.UriKind]::Absolute)
+                $bitmap.EndInit()
+                $logoImage.Source = $bitmap
+            }
+            catch { }
+        }
+
+        $window.Show()
+        $window.UpdateLayout()
+        $window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Background) | Out-Null
+
+        return [pscustomobject]@{
+            Window       = $window
+            StatusText   = $window.FindName("BootstrapStatusText")
+            ProgressBar  = $window.FindName("BootstrapProgressBar")
+            DetailText   = $window.FindName("BootstrapDetailText")
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-QOTBootstrapLogoPath {
+    param(
+        [Parameter(Mandatory)]
+        $Layout,
+
+        [Parameter(Mandatory)]
+        [string[]]$Owners,
+
+        [Parameter(Mandatory)]
+        [string]$RepoName,
+
+        [Parameter(Mandatory)]
+        [string]$Branch
+    )
+
+    $installedLogo = Join-Path $Layout.CurrentRoot "src\Intro\StudioVolySplash.png"
+    if (Test-Path -LiteralPath $installedLogo) {
+        return $installedLogo
+    }
+
+    if (-not (Test-Path -LiteralPath $Layout.DownloadRoot)) {
+        New-Item -ItemType Directory -Path $Layout.DownloadRoot -Force | Out-Null
+    }
+
+    $logoPath = Join-Path $Layout.DownloadRoot "StudioVolySplash.png"
+    if (Test-Path -LiteralPath $logoPath) {
+        return $logoPath
+    }
+
+    foreach ($owner in $Owners) {
+        $logoUrl = "https://raw.githubusercontent.com/$owner/$RepoName/$Branch/src/Intro/StudioVolySplash.png"
+        try {
+            Invoke-QOTWebRequestToFile -Uri $logoUrl -OutFile $logoPath
+            if (Test-Path -LiteralPath $logoPath) {
+                return $logoPath
+            }
+        }
+        catch { }
+    }
+
+    return $null
+}
+
+function Update-QOTBootstrapUi {
+    param(
+        [AllowNull()]$Ui,
+        [int]$Progress = -1,
+        [string]$Status,
+        [string]$Detail
+    )
+
+    if (-not $Ui -or -not $Ui.Window) { return }
+
+    try {
+        $Ui.Window.Dispatcher.Invoke([action]{
+            if ($Progress -ge 0 -and $Ui.ProgressBar) {
+                $Ui.ProgressBar.Value = [Math]::Max(0, [Math]::Min(100, $Progress))
+            }
+            if ($null -ne $Status -and $Ui.StatusText) {
+                $Ui.StatusText.Text = $Status
+            }
+            if ($null -ne $Detail -and $Ui.DetailText) {
+                $Ui.DetailText.Text = $Detail
+            }
+            $Ui.Window.UpdateLayout()
+        }, [System.Windows.Threading.DispatcherPriority]::Render) | Out-Null
+
+        $Ui.Window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Background) | Out-Null
+    }
+    catch { }
+}
+
+function Close-QOTBootstrapUi {
+    param(
+        [AllowNull()]$Ui
+    )
+
+    if (-not $Ui -or -not $Ui.Window) { return }
+
+    try {
+        $Ui.Window.Dispatcher.Invoke([action]{
+            $Ui.Window.Close()
+        }) | Out-Null
+    }
+    catch { }
+}
+
 function Invoke-QOTWebRequestToFile {
     param(
         [Parameter(Mandatory)]
@@ -486,6 +687,14 @@ try {
     }
 
     $layout = Get-QOTInstallLayout
+
+    $bootstrapUi = $null
+    if (-not $ForceRemote) {
+        $logoPath = Get-QOTBootstrapLogoPath -Layout $layout -Owners $repoOwners -RepoName $repoName -Branch $Branch
+        $bootstrapUi = New-QOTBootstrapUi -LogoPath $logoPath
+        Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 8 -Status "Preparing startup..." -Detail "Checking your Quinn Optimiser Toolkit installation."
+    }
+
     $state = Read-QOTInstallState -StatePath $layout.StatePath
 
     $toolkitRoot = $null
@@ -497,6 +706,8 @@ try {
 
     if ((-not $ForceRemote) -and $localIntro -and (Test-Path -LiteralPath $localIntro)) {
         Write-Host "Using local toolkit source (developer/local checkout)."
+        Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 90 -Status "Launching local build..." -Detail "Opening Quinn Optimiser Toolkit from the current project folder."
+        Close-QOTBootstrapUi -Ui $bootstrapUi
         Start-QOTInstalledCopy -ToolkitRoot $localRoot -LogDir $logDir -VerboseStartup:$VerboseStartup
         return
     }
@@ -504,15 +715,20 @@ try {
     $installedIntro = Join-Path $layout.CurrentRoot "src\Intro\Intro.ps1"
     $hasInstalledCopy = Test-Path -LiteralPath $installedIntro
 
+    Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 18 -Status "Checking installed copy..." -Detail (if ($hasInstalledCopy) { "Installed copy found. Checking GitHub for updates." } else { "No installed copy found yet. Preparing first-time download." })
+
     $remoteInfo = $null
     $remoteLookupError = $null
     try {
+        Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 28 -Status "Checking GitHub..." -Detail "Looking for the latest Quinn Optimiser Toolkit version."
         $remoteInfo = Get-QOTLatestRemoteInfo -Owners $repoOwners -RepoName $repoName -Branch $Branch
         Write-Host ("Latest GitHub commit: {0}" -f $remoteInfo.CommitSha)
+        Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 38 -Status "GitHub check complete" -Detail ("Latest version detected: {0}" -f $remoteInfo.CommitSha.Substring(0, [Math]::Min(8, $remoteInfo.CommitSha.Length)))
     }
     catch {
         $remoteLookupError = $_.Exception.Message
         Write-Host ("Warning: could not query GitHub for the latest version. {0}" -f $remoteLookupError)
+        Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 38 -Status "GitHub check unavailable" -Detail "Could not contact GitHub. If Quinn is already installed, we will try the local copy."
     }
 
     $shouldInstallOrUpdate = $ForceRefresh.IsPresent -or (-not $hasInstalledCopy)
@@ -530,23 +746,35 @@ try {
     if ($shouldInstallOrUpdate) {
         $actionLabel = if ($hasInstalledCopy) { "Updating installed copy..." } else { "No installed copy found. Downloading current GitHub version..." }
         Write-Host $actionLabel
+        if ($hasInstalledCopy) {
+            Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 52 -Status "Updating Quinn..." -Detail "Downloading the latest toolkit files from GitHub."
+        }
+        else {
+            Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 52 -Status "Downloading Quinn..." -Detail "First-time setup: downloading the current toolkit from GitHub."
+        }
         $state = Install-QOTFromGitHub -Layout $layout -Owners $repoOwners -RepoName $repoName -Branch $Branch -RemoteInfo $remoteInfo
         $hasInstalledCopy = $true
+        Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 78 -Status "Install complete" -Detail "Quinn Optimiser Toolkit is ready to open."
     }
     elseif ($hasInstalledCopy) {
         Write-Host "Installed copy is up to date. Launching local copy."
+        Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 78 -Status "Installed copy is ready" -Detail "No update needed. Launching your local Quinn copy."
     }
 
     if (-not $hasInstalledCopy) {
+        Close-QOTBootstrapUi -Ui $bootstrapUi
         if ($remoteLookupError) {
             throw "Toolkit is not installed yet, and GitHub could not be reached to download it. $remoteLookupError"
         }
         throw "Toolkit is not installed yet, and the download step did not complete."
     }
 
+    Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 92 -Status "Launching Quinn..." -Detail "Opening the toolkit window now."
+    Close-QOTBootstrapUi -Ui $bootstrapUi
     Start-QOTInstalledCopy -ToolkitRoot $layout.CurrentRoot -LogDir $logDir -VerboseStartup:$VerboseStartup
 }
 catch {
+    Close-QOTBootstrapUi -Ui $bootstrapUi
     try {
         Add-Type -AssemblyName PresentationFramework | Out-Null
         [System.Windows.MessageBox]::Show(
