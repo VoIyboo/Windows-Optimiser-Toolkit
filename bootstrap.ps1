@@ -1,18 +1,253 @@
 param(
     [string]$Branch = "main",
     [switch]$VerboseStartup,
-    [switch]$ForceRemote
+    [switch]$ForceRemote,
+    [switch]$ForceRefresh
 )
 
 # bootstrap.ps1
-# Remote bootstrap for: irm "<raw url>" | iex
-# Downloads fresh repo zip into TEMP, extracts, runs Intro.ps1
-# NEVER touches %LOCALAPPDATA%\StudioVoly\QuinnToolkit
+# Remote bootstrap for:
+#   irm "https://raw.githubusercontent.com/VoIyboo/Windows-Optimiser-Toolkit/main/bootstrap.ps1" | iex
+#
+# Behaviour:
+# - If a local installed copy exists, check GitHub for updates, then run it.
+# - If no local installed copy exists, download the current GitHub copy, install it, then run it.
+# - If GitHub cannot be reached but a local installed copy exists, run the installed copy anyway.
 
 $ErrorActionPreference = "Stop"
-$ProgressPreference   = "SilentlyContinue"
-
+$ProgressPreference = "SilentlyContinue"
 $originalLocation = Get-Location
+
+function Invoke-QOTWebRequestToFile {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [Parameter(Mandatory)]
+        [string]$OutFile
+    )
+
+    $requestParams = @{
+        Uri     = $Uri
+        OutFile = $OutFile
+        Headers = @{
+            "User-Agent" = "QuinnOptimiserToolkit-Bootstrap/2.0"
+            "Accept"     = "application/octet-stream,*/*"
+        }
+    }
+
+    $iwrCommand = Get-Command Invoke-WebRequest -ErrorAction Stop
+    if ($iwrCommand.Parameters.ContainsKey("UseBasicParsing")) {
+        $requestParams.UseBasicParsing = $true
+    }
+
+    try {
+        Invoke-WebRequest @requestParams | Out-Null
+        return
+    }
+    catch {
+        $iwrMessage = $_.Exception.Message
+        $webClient = $null
+        try {
+            $webClient = New-Object System.Net.WebClient
+            $webClient.Headers.Add("User-Agent", "QuinnOptimiserToolkit-Bootstrap/2.0")
+            $webClient.Headers.Add("Accept", "application/octet-stream,*/*")
+            $webClient.DownloadFile($Uri, $OutFile)
+            return
+        }
+        catch {
+            $wcMessage = $_.Exception.Message
+            throw "Invoke-WebRequest failed: $iwrMessage | WebClient fallback failed: $wcMessage"
+        }
+        finally {
+            if ($webClient) { $webClient.Dispose() }
+        }
+    }
+}
+
+function Invoke-QOTWebRequestText {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [string]$Accept = "application/json"
+    )
+
+    $requestParams = @{
+        Uri     = $Uri
+        Headers = @{
+            "User-Agent" = "QuinnOptimiserToolkit-Bootstrap/2.0"
+            "Accept"     = $Accept
+        }
+    }
+
+    $iwrCommand = Get-Command Invoke-WebRequest -ErrorAction Stop
+    if ($iwrCommand.Parameters.ContainsKey("UseBasicParsing")) {
+        $requestParams.UseBasicParsing = $true
+    }
+
+    try {
+        $response = Invoke-WebRequest @requestParams
+        return [string]$response.Content
+    }
+    catch {
+        $iwrMessage = $_.Exception.Message
+        $webClient = $null
+        try {
+            $webClient = New-Object System.Net.WebClient
+            $webClient.Headers.Add("User-Agent", "QuinnOptimiserToolkit-Bootstrap/2.0")
+            $webClient.Headers.Add("Accept", $Accept)
+            return [string]$webClient.DownloadString($Uri)
+        }
+        catch {
+            $wcMessage = $_.Exception.Message
+            throw "Invoke-WebRequest failed: $iwrMessage | WebClient fallback failed: $wcMessage"
+        }
+        finally {
+            if ($webClient) { $webClient.Dispose() }
+        }
+    }
+}
+
+function Test-QOTPathWritable {
+    param(
+        [AllowNull()][string]$Path
+    )
+
+    $candidatePath = ([string]($Path + "")).Trim()
+    if ([string]::IsNullOrWhiteSpace($candidatePath)) { return $false }
+
+    try {
+        if (-not (Test-Path -LiteralPath $candidatePath)) {
+            New-Item -ItemType Directory -Path $candidatePath -Force | Out-Null
+        }
+
+        $probePath = Join-Path $candidatePath (".qot-write-test-{0}.tmp" -f [guid]::NewGuid().ToString("N"))
+        [System.IO.File]::WriteAllText($probePath, "")
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-QOTBootstrapLogDir {
+    $candidates = @(
+        (Join-Path $env:ProgramData "QuinnOptimiserToolkit\Logs"),
+        (Join-Path $env:LOCALAPPDATA "StudioVoly\QuinnToolkit\Logs"),
+        (Join-Path $env:TEMP "QuinnOptimiserToolkit\Logs")
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    foreach ($candidate in $candidates) {
+        if (Test-QOTPathWritable -Path $candidate) {
+            return $candidate
+        }
+    }
+
+    throw "Unable to create a writable log directory for bootstrap."
+}
+
+function Get-QOTInstallLayout {
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "StudioVoly\QuinnToolkit"),
+        (Join-Path $env:APPDATA "StudioVoly\QuinnToolkit"),
+        (Join-Path $env:USERPROFILE "StudioVoly\QuinnToolkit"),
+        (Join-Path $env:TEMP "QuinnOptimiserToolkit")
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    foreach ($candidate in $candidates) {
+        if (-not (Test-QOTPathWritable -Path $candidate)) { continue }
+
+        return [pscustomobject]@{
+            RootPath       = $candidate
+            AppRoot        = Join-Path $candidate "App"
+            CurrentRoot    = Join-Path $candidate "App\Current"
+            PreviousRoot   = Join-Path $candidate "App\Previous"
+            StagingRoot    = Join-Path $candidate "App\Staging"
+            DownloadRoot   = Join-Path $candidate "Bootstrap"
+            StatePath      = Join-Path $candidate "Bootstrap\install-state.json"
+            BootstrapLog   = Join-Path $candidate "Bootstrap"
+        }
+    }
+
+    throw "Unable to find a writable install root for Quinn Optimiser Toolkit."
+}
+
+function Read-QOTInstallState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$StatePath
+    )
+
+    if (-not (Test-Path -LiteralPath $StatePath)) { return $null }
+
+    try {
+        return (Get-Content -LiteralPath $StatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Write-QOTInstallState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$StatePath,
+
+        [Parameter(Mandatory)]
+        $State
+    )
+
+    $dir = Split-Path -Parent $StatePath
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+
+    $json = $State | ConvertTo-Json -Depth 10
+    Set-Content -LiteralPath $StatePath -Value $json -Encoding UTF8
+}
+
+function Get-QOTLatestRemoteInfo {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Owners,
+
+        [Parameter(Mandatory)]
+        [string]$RepoName,
+
+        [Parameter(Mandatory)]
+        [string]$Branch
+    )
+
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    foreach ($owner in $Owners) {
+        $apiUrl = "https://api.github.com/repos/$owner/$RepoName/commits/$Branch"
+        try {
+            $payload = Invoke-QOTWebRequestText -Uri $apiUrl -Accept "application/vnd.github+json"
+            $data = $payload | ConvertFrom-Json -ErrorAction Stop
+
+            if (-not $data.sha) {
+                throw "GitHub API response did not include a commit SHA."
+            }
+
+            return [pscustomobject]@{
+                Owner      = $owner
+                RepoName   = $RepoName
+                Branch     = $Branch
+                CommitSha  = [string]$data.sha
+                CommitDate = [string]$data.commit.committer.date
+                HtmlUrl    = [string]$data.html_url
+            }
+        }
+        catch {
+            $errors.Add("$apiUrl => $($_.Exception.Message)") | Out-Null
+        }
+    }
+
+    throw "Unable to query the latest GitHub commit metadata. Errors: $($errors -join '; ')"
+}
 
 function Invoke-QOTDownloadRepoZip {
     param(
@@ -50,7 +285,6 @@ function Invoke-QOTDownloadRepoZip {
             }
             catch {
                 $errors.Add("$url (attempt $attempt): $($_.Exception.Message)") | Out-Null
-
                 if ($attempt -lt $MaxAttemptsPerUrl) {
                     Start-Sleep -Milliseconds 500
                 }
@@ -61,111 +295,200 @@ function Invoke-QOTDownloadRepoZip {
     throw "Failed to download repository zip. Errors: $($errors -join '; ')"
 }
 
-function Invoke-QOTWebRequestToFile {
+function Find-QOTToolkitRoot {
     param(
         [Parameter(Mandatory)]
-        [string]$Uri,
-
-        [Parameter(Mandatory)]
-        [string]$OutFile
+        [string]$SearchRoot
     )
 
-    $requestParams = @{
-        Uri     = $Uri
-        OutFile = $OutFile
-        Headers = @{ "User-Agent" = "QuinnOptimiserToolkit-Bootstrap/1.0"; "Accept" = "application/octet-stream,*/*" }
+    $candidateRoots = New-Object System.Collections.Generic.List[string]
+    $candidateRoots.Add($SearchRoot) | Out-Null
+
+    foreach ($directory in (Get-ChildItem -Path $SearchRoot -Directory -Recurse -ErrorAction SilentlyContinue)) {
+        $candidateRoots.Add($directory.FullName) | Out-Null
     }
 
-    $iwrCommand = Get-Command Invoke-WebRequest -ErrorAction Stop
-    if ($iwrCommand.Parameters.ContainsKey('UseBasicParsing')) {
-        $requestParams.UseBasicParsing = $true
+    foreach ($candidateRoot in ($candidateRoots | Select-Object -Unique)) {
+        $candidateIntro = Join-Path $candidateRoot "src\Intro\Intro.ps1"
+        if (Test-Path -LiteralPath $candidateIntro) {
+            return $candidateRoot
+        }
     }
 
-    try {
-        Invoke-WebRequest @requestParams | Out-Null
-        return
-    }
-    catch {
-        $iwrMessage = $_.Exception.Message
-
-        # Fallback for environments where Invoke-WebRequest fails due to TLS proxying,
-        # content filtering, or stricter network stack policies.
-        $webClient = $null
-        try {
-            $webClient = New-Object System.Net.WebClient
-            $webClient.Headers.Add("User-Agent", "QuinnOptimiserToolkit-Bootstrap/1.0")
-            $webClient.Headers.Add("Accept", "application/octet-stream,*/*")
-            $webClient.DownloadFile($Uri, $OutFile)
-            return
-        }
-        catch {
-            $wcMessage = $_.Exception.Message
-            throw "Invoke-WebRequest failed: $iwrMessage | WebClient fallback failed: $wcMessage"
-        }
-        finally {
-            if ($webClient) { $webClient.Dispose() }
-        }
-    }
+    return $null
 }
 
-function Get-QOTBootstrapLogDir {
-    $candidates = @(
-        (Join-Path $env:ProgramData "QuinnOptimiserToolkit\Logs"),
-        (Join-Path $env:LOCALAPPDATA "StudioVoly\QuinnToolkit\Logs"),
-        (Join-Path $env:TEMP "QuinnOptimiserToolkit\Logs")
-    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+function Install-QOTFromGitHub {
+    param(
+        [Parameter(Mandatory)]
+        $Layout,
 
-    foreach ($candidate in $candidates) {
-        try {
-            if (-not (Test-Path -LiteralPath $candidate)) {
-                New-Item -ItemType Directory -Path $candidate -Force | Out-Null
-            }
+        [Parameter(Mandatory)]
+        [string[]]$Owners,
 
-            # Confirm write access before choosing the folder.
-            $probePath = Join-Path $candidate "write-test.tmp"
-            "ok" | Set-Content -LiteralPath $probePath -Encoding UTF8
-            Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        [Parameter(Mandatory)]
+        [string]$RepoName,
 
-            return $candidate
-        }
-        catch {
-            # Try next candidate.
+        [Parameter(Mandatory)]
+        [string]$Branch,
+
+        [AllowNull()]
+        $RemoteInfo
+    )
+
+    foreach ($dir in @($Layout.AppRoot, $Layout.DownloadRoot)) {
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
     }
 
-    throw "Unable to create a writable log directory for bootstrap."
+    $zipPath = Join-Path $Layout.DownloadRoot "repo.zip"
+    $extractRoot = Join-Path $Layout.DownloadRoot "extract"
+    $stagingCurrent = Join-Path $Layout.StagingRoot "Current"
+
+    foreach ($path in @($extractRoot, $Layout.StagingRoot, $zipPath)) {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $Layout.StagingRoot -Force | Out-Null
+
+    $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $downloadUrls = New-Object System.Collections.Generic.List[string]
+    foreach ($owner in $Owners) {
+        $downloadUrls.Add("https://github.com/$owner/$RepoName/archive/refs/heads/$Branch.zip?cb=$cacheBust") | Out-Null
+        $downloadUrls.Add("https://codeload.github.com/$owner/$RepoName/zip/refs/heads/$Branch?cb=$cacheBust") | Out-Null
+    }
+
+    Write-Host "Downloading Quinn Optimiser Toolkit..."
+    Write-Host "Branch: $Branch"
+    Invoke-QOTDownloadRepoZip -Urls $downloadUrls -OutFile $zipPath
+    Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
+
+    $resolvedRoot = Find-QOTToolkitRoot -SearchRoot $extractRoot
+    if (-not $resolvedRoot) {
+        throw "Could not locate downloaded toolkit root after extraction (missing src\Intro\Intro.ps1)."
+    }
+
+    Copy-Item -LiteralPath $resolvedRoot -Destination $stagingCurrent -Recurse -Force
+
+    $stagedIntro = Join-Path $stagingCurrent "src\Intro\Intro.ps1"
+    if (-not (Test-Path -LiteralPath $stagedIntro)) {
+        throw "Staged toolkit is invalid: missing $stagedIntro"
+    }
+
+    if (Test-Path -LiteralPath $Layout.PreviousRoot) {
+        Remove-Item -LiteralPath $Layout.PreviousRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    if (Test-Path -LiteralPath $Layout.CurrentRoot) {
+        Move-Item -LiteralPath $Layout.CurrentRoot -Destination $Layout.PreviousRoot -Force
+    }
+
+    Move-Item -LiteralPath $stagingCurrent -Destination $Layout.CurrentRoot -Force
+
+    if (Test-Path -LiteralPath $Layout.StagingRoot) {
+        Remove-Item -LiteralPath $Layout.StagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $installedState = [pscustomobject]@{
+        InstalledAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+        Owner          = if ($RemoteInfo) { [string]$RemoteInfo.Owner } else { [string]$Owners[0] }
+        RepoName       = $RepoName
+        Branch         = $Branch
+        CommitSha      = if ($RemoteInfo) { [string]$RemoteInfo.CommitSha } else { "" }
+        CommitDate     = if ($RemoteInfo) { [string]$RemoteInfo.CommitDate } else { "" }
+        InstallRoot    = $Layout.CurrentRoot
+    }
+    Write-QOTInstallState -StatePath $Layout.StatePath -State $installedState
+
+    return $installedState
 }
 
-# -------------------------
-# Logging
-# -------------------------
+function Start-QOTInstalledCopy {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ToolkitRoot,
+
+        [Parameter(Mandatory)]
+        [string]$LogDir,
+
+        [switch]$VerboseStartup
+    )
+
+    $runLocalPath = Join-Path $ToolkitRoot "run-local.ps1"
+    $introPath = Join-Path $ToolkitRoot "src\Intro\Intro.ps1"
+
+    if (-not (Test-Path -LiteralPath $runLocalPath) -and -not (Test-Path -LiteralPath $introPath)) {
+        throw "Installed toolkit copy is incomplete. Missing run-local.ps1 and src\Intro\Intro.ps1 under: $ToolkitRoot"
+    }
+
+    $psExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+    if (-not (Test-Path -LiteralPath $psExe)) {
+        throw "Windows PowerShell executable was not found at: $psExe"
+    }
+
+    if (Test-Path -LiteralPath $runLocalPath) {
+        $psArgs = @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $runLocalPath
+        )
+
+        if ($VerboseStartup) {
+            $psArgs += "-VerboseStartup"
+        }
+    }
+    else {
+        $introLog = Join-Path $LogDir ("Intro_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+        $psArgs = @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-STA",
+            "-File", $introPath,
+            "-LogPath", $introLog
+        )
+
+        if (-not $VerboseStartup) {
+            $psArgs += "-Quiet"
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Toolkit root: $ToolkitRoot"
+    Write-Host "Data folder:  $env:LOCALAPPDATA\StudioVoly\QuinnToolkit"
+    Write-Host ""
+
+    Set-Location $ToolkitRoot
+    & $psExe @psArgs
+}
+
 $logDir = Get-QOTBootstrapLogDir
-
 $bootstrapLog = Join-Path $logDir ("Bootstrap_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 Start-Transcript -Path $bootstrapLog | Out-Null
 
 try {
-    # TLS
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    } catch {}
+    }
+    catch { }
 
-    # -------------------------
-    # Repo info
-    # -------------------------
     $repoOwners = @(
         "VoIyboo",
         "Volyboo"
     )
-    $repoName  = "Windows-Optimiser-Toolkit"
+    $repoName = "Windows-Optimiser-Toolkit"
+
     if ([string]::IsNullOrWhiteSpace($Branch)) {
         $Branch = "main"
     }
 
-    $branch = $Branch
+    $layout = Get-QOTInstallLayout
+    $state = Read-QOTInstallState -StatePath $layout.StatePath
 
-        $toolkitRoot = $null
-    $introPath = $null
+    $toolkitRoot = $null
     $localRoot = $PSScriptRoot
     $localIntro = $null
     if (-not [string]::IsNullOrWhiteSpace($localRoot)) {
@@ -173,108 +496,68 @@ try {
     }
 
     if ((-not $ForceRemote) -and $localIntro -and (Test-Path -LiteralPath $localIntro)) {
-        $toolkitRoot = $localRoot
-        $introPath = $localIntro
-        Write-Host "Using local toolkit source (no download)."
+        Write-Host "Using local toolkit source (developer/local checkout)."
+        Start-QOTInstalledCopy -ToolkitRoot $localRoot -LogDir $logDir -VerboseStartup:$VerboseStartup
+        return
     }
-    else {
-        # -------------------------
-        # TEMP workspace (code only)
-        # -------------------------
-        $baseTemp = Join-Path $env:TEMP "QuinnOptimiserToolkit"
-        $zipPath  = Join-Path $baseTemp "repo.zip"
 
-        if (Test-Path $baseTemp) {
-            Remove-Item $baseTemp -Recurse -Force -ErrorAction SilentlyContinue
+    $installedIntro = Join-Path $layout.CurrentRoot "src\Intro\Intro.ps1"
+    $hasInstalledCopy = Test-Path -LiteralPath $installedIntro
+
+    $remoteInfo = $null
+    $remoteLookupError = $null
+    try {
+        $remoteInfo = Get-QOTLatestRemoteInfo -Owners $repoOwners -RepoName $repoName -Branch $Branch
+        Write-Host ("Latest GitHub commit: {0}" -f $remoteInfo.CommitSha)
+    }
+    catch {
+        $remoteLookupError = $_.Exception.Message
+        Write-Host ("Warning: could not query GitHub for the latest version. {0}" -f $remoteLookupError)
+    }
+
+    $shouldInstallOrUpdate = $ForceRefresh.IsPresent -or (-not $hasInstalledCopy)
+    if (-not $shouldInstallOrUpdate -and $remoteInfo) {
+        $installedSha = ""
+        try { $installedSha = ([string]($state.CommitSha + "")).Trim() } catch { $installedSha = "" }
+        if ([string]::IsNullOrWhiteSpace($installedSha)) {
+            $shouldInstallOrUpdate = $true
         }
-
-        New-Item -ItemType Directory -Path $baseTemp -Force | Out-Null
-
-        # Cache bust
-        $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-
-        Write-Host "Downloading Quinn Optimiser Toolkit..."
-        Write-Host "Branch: $branch"
-
-        $downloadUrls = New-Object System.Collections.Generic.List[string]
-
-        foreach ($repoOwner in $repoOwners) {
-            $downloadUrls.Add("https://github.com/$repoOwner/$repoName/archive/refs/heads/$branch.zip?cb=$cacheBust") | Out-Null
-            $downloadUrls.Add("https://codeload.github.com/$repoOwner/$repoName/zip/refs/heads/$branch?cb=$cacheBust") | Out-Null
-        }
-
-        Invoke-QOTDownloadRepoZip -Urls $downloadUrls -OutFile $zipPath
-        Expand-Archive -Path $zipPath -DestinationPath $baseTemp -Force
-
-        # -------------------------
-        # Resolve extracted folder
-        # -------------------------
-        $candidateRoots = New-Object System.Collections.Generic.List[string]
-        $candidateRoots.Add($baseTemp) | Out-Null
-
-        foreach ($directory in (Get-ChildItem -Path $baseTemp -Directory -Recurse -ErrorAction SilentlyContinue)) {
-            $candidateRoots.Add($directory.FullName) | Out-Null
-        }
-
-        foreach ($candidateRoot in ($candidateRoots | Select-Object -Unique)) {
-            $candidateIntro = Join-Path $candidateRoot "src\Intro\Intro.ps1"
-            if (Test-Path -LiteralPath $candidateIntro) {
-                $toolkitRoot = $candidateRoot
-                $introPath = $candidateIntro
-                break
-            }
+        elseif ($installedSha -ne $remoteInfo.CommitSha) {
+            $shouldInstallOrUpdate = $true
         }
     }
 
-    if (-not $introPath) {
-        throw "Could not locate extracted repo folder (missing src\Intro\Intro.ps1 under: $baseTemp)"
+    if ($shouldInstallOrUpdate) {
+        $actionLabel = if ($hasInstalledCopy) { "Updating installed copy..." } else { "No installed copy found. Downloading current GitHub version..." }
+        Write-Host $actionLabel
+        $state = Install-QOTFromGitHub -Layout $layout -Owners $repoOwners -RepoName $repoName -Branch $Branch -RemoteInfo $remoteInfo
+        $hasInstalledCopy = $true
     }
-    
-    if (-not (Test-Path -LiteralPath $toolkitRoot)) {
-        throw "Resolved toolkit root path does not exist: $toolkitRoot"
-    }
-    
-    $introLog = Join-Path $logDir ("Intro_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-
-    Write-Host ""
-    Write-Host "Toolkit root: $toolkitRoot"
-    Write-Host "Intro path:   $introPath"
-    Write-Host "Intro log:    $introLog"
-    Write-Host "Data folder:  $env:LOCALAPPDATA\StudioVoly\QuinnToolkit"
-    Write-Host ""
-
-    Set-Location $toolkitRoot
-
-    # -------------------------
-    # Launch WPF in Windows PowerShell (STA)
-    # -------------------------
-    $psExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $introArgs = @(
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-STA",
-        "-File", $introPath,
-        "-LogPath", $introLog
-    )
-
-    if (-not $VerboseStartup) {
-        $introArgs += "-Quiet"
+    elseif ($hasInstalledCopy) {
+        Write-Host "Installed copy is up to date. Launching local copy."
     }
 
-    & $psExe @introArgs
+    if (-not $hasInstalledCopy) {
+        if ($remoteLookupError) {
+            throw "Toolkit is not installed yet, and GitHub could not be reached to download it. $remoteLookupError"
+        }
+        throw "Toolkit is not installed yet, and the download step did not complete."
+    }
+
+    Start-QOTInstalledCopy -ToolkitRoot $layout.CurrentRoot -LogDir $logDir -VerboseStartup:$VerboseStartup
 }
 catch {
     try {
         Add-Type -AssemblyName PresentationFramework | Out-Null
         [System.Windows.MessageBox]::Show(
-            "Bootstrap failed.`r`n$($_.Exception.Message)",
+            "Bootstrap failed.`r`n$($_.Exception.Message)`r`n`r`nBootstrap log:`r`n$bootstrapLog",
             "Quinn Optimiser Toolkit"
         ) | Out-Null
-    } catch {}
+    }
+    catch { }
     throw
 }
 finally {
-    try { Stop-Transcript | Out-Null } catch {}
+    try { Stop-Transcript | Out-Null } catch { }
     Set-Location $originalLocation
 }
-
