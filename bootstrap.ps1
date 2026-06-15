@@ -25,78 +25,62 @@ function New-QOTBootstrapUi {
 
     try {
         Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
+        try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue } catch { }
 
         [xml]$xaml = @"
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="Quinn Optimiser Toolkit"
-    Width="460"
-    Height="290"
+    Width="300"
+    SizeToContent="Height"
     ResizeMode="NoResize"
-    WindowStartupLocation="CenterScreen"
-    Background="#111827"
-    Foreground="White"
-    ShowInTaskbar="True"
+    WindowStyle="None"
+    AllowsTransparency="True"
+    Background="Transparent"
+    ShowInTaskbar="False"
     Topmost="True">
-    <Border Padding="22" Background="#111827">
+    <Window.Resources>
+        <Storyboard x:Key="FadeInAnimation">
+            <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                           From="0"
+                           To="1"
+                           Duration="0:0:0.2" />
+        </Storyboard>
+        <Storyboard x:Key="FadeOutAnimation">
+            <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                           From="1"
+                           To="0"
+                           Duration="0:0:0.3" />
+        </Storyboard>
+    </Window.Resources>
+    <Grid Margin="16">
         <Grid>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="*" />
             </Grid.RowDefinitions>
 
-            <Border
+            <Image
+                x:Name="BootstrapLogoImage"
                 Grid.Row="0"
                 Width="150"
                 Height="150"
+                Stretch="UniformToFill"
                 HorizontalAlignment="Center"
-                Margin="0,0,0,14"
-                Background="Transparent">
-                <Image
-                    x:Name="BootstrapLogoImage"
-                    Stretch="Uniform" />
-            </Border>
-
-            <TextBlock
-                Grid.Row="1"
-                Text="Quinn Optimiser Toolkit"
-                FontSize="24"
-                FontWeight="SemiBold"
-                HorizontalAlignment="Center"
-                Margin="0,0,0,8" />
-
-            <TextBlock
-                x:Name="BootstrapStatusText"
-                Grid.Row="2"
-                Text="Starting..."
-                FontSize="15"
-                HorizontalAlignment="Center"
-                Margin="0,0,0,16"
-                Foreground="#D1D5DB" />
+                Margin="0,0,0,12" />
 
             <ProgressBar
                 x:Name="BootstrapProgressBar"
-                Grid.Row="3"
+                Grid.Row="1"
                 Height="16"
                 Minimum="0"
                 Maximum="100"
                 Value="5"
-                Margin="0,0,0,14" />
-
-            <TextBlock
-                x:Name="BootstrapDetailText"
-                Grid.Row="4"
-                Text="Preparing startup..."
-                FontSize="12"
-                TextWrapping="Wrap"
-                TextAlignment="Center"
-                Foreground="#9CA3AF" />
+                Foreground="#0066FF"
+                Background="Transparent" />
         </Grid>
-    </Border>
+    </Grid>
 </Window>
 "@
 
@@ -116,15 +100,37 @@ function New-QOTBootstrapUi {
             catch { }
         }
 
+        $window.Opacity = 0
         $window.Show()
+
+        try {
+            if ([System.Windows.Forms.Screen]) {
+                $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+                $window.Left = $workingArea.Right - $window.Width - 10
+                $window.Top = $workingArea.Bottom - $window.Height - 10
+            }
+        }
+        catch { }
+
+        try {
+            $fadeInStoryboard = $window.FindResource("FadeInAnimation")
+            if ($fadeInStoryboard) {
+                $fadeInStoryboard.Begin($window)
+            }
+            else {
+                $window.Opacity = 1
+            }
+        }
+        catch {
+            $window.Opacity = 1
+        }
+
         $window.UpdateLayout()
         $window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Background) | Out-Null
 
         return [pscustomobject]@{
             Window       = $window
-            StatusText   = $window.FindName("BootstrapStatusText")
             ProgressBar  = $window.FindName("BootstrapProgressBar")
-            DetailText   = $window.FindName("BootstrapDetailText")
         }
     }
     catch {
@@ -190,12 +196,6 @@ function Update-QOTBootstrapUi {
             if ($Progress -ge 0 -and $Ui.ProgressBar) {
                 $Ui.ProgressBar.Value = [Math]::Max(0, [Math]::Min(100, $Progress))
             }
-            if ($null -ne $Status -and $Ui.StatusText) {
-                $Ui.StatusText.Text = $Status
-            }
-            if ($null -ne $Detail -and $Ui.DetailText) {
-                $Ui.DetailText.Text = $Detail
-            }
             $Ui.Window.UpdateLayout()
         }, [System.Windows.Threading.DispatcherPriority]::Render) | Out-Null
 
@@ -213,7 +213,18 @@ function Close-QOTBootstrapUi {
 
     try {
         $Ui.Window.Dispatcher.Invoke([action]{
-            $Ui.Window.Close()
+            $fadeOutStoryboard = $Ui.Window.FindResource("FadeOutAnimation")
+            if ($fadeOutStoryboard) {
+                $storyboardCopy = $fadeOutStoryboard.Clone()
+                $storyboardCopy.Add_Completed({
+                    param($sender, $args)
+                    try { $Ui.Window.Close() } catch { }
+                })
+                $storyboardCopy.Begin($Ui.Window)
+            }
+            else {
+                $Ui.Window.Close()
+            }
         }) | Out-Null
     }
     catch { }
@@ -715,7 +726,11 @@ try {
     $installedIntro = Join-Path $layout.CurrentRoot "src\Intro\Intro.ps1"
     $hasInstalledCopy = Test-Path -LiteralPath $installedIntro
 
-    Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 18 -Status "Checking installed copy..." -Detail (if ($hasInstalledCopy) { "Installed copy found. Checking GitHub for updates." } else { "No installed copy found yet. Preparing first-time download." })
+    $installedCopyDetail = "No installed copy found yet. Preparing first-time download."
+    if ($hasInstalledCopy) {
+        $installedCopyDetail = "Installed copy found. Checking GitHub for updates."
+    }
+    Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 18 -Status "Checking installed copy..." -Detail $installedCopyDetail
 
     $remoteInfo = $null
     $remoteLookupError = $null
