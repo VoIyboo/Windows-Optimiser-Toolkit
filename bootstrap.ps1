@@ -157,7 +157,7 @@ try {
         "VoIyboo",
         "Volyboo"
     )
-    $repoName  = "Windows-Optimiser-Toolkit-"
+    $repoName  = "Windows-Optimiser-Toolkit"
     if ([string]::IsNullOrWhiteSpace($Branch)) {
         $Branch = "main"
     }
