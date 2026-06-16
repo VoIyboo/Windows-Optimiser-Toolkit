@@ -742,7 +742,13 @@ function Start-QOTInstalledCopy {
     Write-Host ""
 
     Set-Location $ToolkitRoot
-    & $psExe @psArgs
+
+    # Launch intro in its own hidden-console process so the startup widget can
+    # present independently of the caller's PowerShell window.
+    $startedProcess = Start-Process -FilePath $psExe -ArgumentList $psArgs -WorkingDirectory $ToolkitRoot -WindowStyle Hidden -PassThru
+    if (-not $startedProcess) {
+        throw "Failed to start the Quinn intro process."
+    }
 }
 
 $logDir = Get-QOTBootstrapLogDir

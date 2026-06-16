@@ -114,6 +114,12 @@ function Show-QOTStartupWidget {
 
         # Show the window (invisible due to opacity)
         $Window.Show()
+        try {
+            $Window.Topmost = $true
+            $Window.Activate() | Out-Null
+            $Window.Focus() | Out-Null
+        }
+        catch { }
 
         # Position widget in bottom-right corner before fading in
         $Window.Dispatcher.Invoke({
