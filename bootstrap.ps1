@@ -234,13 +234,18 @@ function Update-QOTBootstrapUi {
 
 function Close-QOTBootstrapUi {
     param(
-        [AllowNull()]$Ui
+        [AllowNull()]$Ui,
+        [switch]$Immediate
     )
 
     if (-not $Ui -or -not $Ui.Window) { return }
 
     try {
         $Ui.Window.Dispatcher.Invoke([action]{
+            if ($Immediate) {
+                try { $Ui.Window.Close() } catch { }
+                return
+            }
             $fadeOutStoryboard = $Ui.Window.FindResource("FadeOutAnimation")
             if ($fadeOutStoryboard) {
                 $storyboardCopy = $fadeOutStoryboard.Clone()
@@ -780,7 +785,7 @@ try {
     if ((-not $ForceRemote) -and $localIntro -and (Test-Path -LiteralPath $localIntro)) {
         Write-Host "Using local toolkit source (developer/local checkout)."
         Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 90 -Status "Launching local build..." -Detail "Opening Quinn Optimiser Toolkit from the current project folder."
-        Close-QOTBootstrapUi -Ui $bootstrapUi
+        Close-QOTBootstrapUi -Ui $bootstrapUi -Immediate
         Start-QOTInstalledCopy -ToolkitRoot $localRoot -LogDir $logDir -VerboseStartup:$VerboseStartup
         return
     }
@@ -852,7 +857,7 @@ try {
     }
 
     Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 92 -Status "Launching Quinn..." -Detail "Opening the toolkit window now."
-    Close-QOTBootstrapUi -Ui $bootstrapUi
+    Close-QOTBootstrapUi -Ui $bootstrapUi -Immediate
     $installedToolkitRoot = Get-QOTInstalledToolkitRoot -Layout $layout -State $state
     if ([string]::IsNullOrWhiteSpace($installedToolkitRoot)) {
         throw "Toolkit install state was updated, but no runnable installed copy could be found."
