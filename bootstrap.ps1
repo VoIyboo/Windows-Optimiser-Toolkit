@@ -182,7 +182,7 @@ function Get-QOTBootstrapLogoPath {
     if (-not [string]::IsNullOrWhiteSpace($installedRoot)) {
         $installedLogo = Join-Path $installedRoot "src\Intro\StudioVolySplash.png"
     }
-    if (Test-Path -LiteralPath $installedLogo) {
+    if (-not [string]::IsNullOrWhiteSpace($installedLogo) -and (Test-Path -LiteralPath $installedLogo)) {
         return $installedLogo
     }
 
