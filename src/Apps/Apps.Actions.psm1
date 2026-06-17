@@ -473,20 +473,94 @@ function Invoke-QOTRunSelectedAppsActions {
                 return [pscustomobject]@{ ExitCode = 1; StdOut = ""; StdErr = "Empty uninstall command" }
             }
 
-            $filePath = $null
-            $arguments = ""
+            function ConvertTo-QOTWorkerCommandParts {
+                param([string]$CommandText)
 
-            if ($safeCommand -match '^\s*"([^"]+)"\s*(.*)$') {
-                $filePath = $matches[1]
-                $arguments = $matches[2]
+                if ([string]::IsNullOrWhiteSpace($CommandText)) { return $null }
+
+                $expandedCommand = [Environment]::ExpandEnvironmentVariables($CommandText.Trim())
+                if ([string]::IsNullOrWhiteSpace($expandedCommand)) { return $null }
+
+                $exePath = ""
+                $argString = ""
+
+                if ($expandedCommand.StartsWith('"')) {
+                    $closeIdx = $expandedCommand.IndexOf('"', 1)
+                    if ($closeIdx -le 1) { return $null }
+
+                    $exePath = $expandedCommand.Substring(1, $closeIdx - 1)
+                    if ($expandedCommand.Length -gt ($closeIdx + 1)) {
+                        $argString = $expandedCommand.Substring($closeIdx + 1).Trim()
+                    }
+                }
+                else {
+                    $tokens = $expandedCommand -split '\s+'
+                    for ($i = $tokens.Count; $i -ge 1; $i--) {
+                        $candidate = ($tokens[0..($i - 1)] -join ' ')
+                        $hit = $null
+
+                        if (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction SilentlyContinue) {
+                            $hit = $candidate
+                        }
+                        elseif (Test-Path -LiteralPath ($candidate + '.exe') -PathType Leaf -ErrorAction SilentlyContinue) {
+                            $hit = $candidate + '.exe'
+                        }
+
+                        if ($hit) {
+                            $exePath = $hit
+                            if ($i -lt $tokens.Count) {
+                                $argString = ($tokens[$i..($tokens.Count - 1)] -join ' ')
+                            }
+                            break
+                        }
+                    }
+
+                    if (-not $exePath) {
+                        $exePath = $tokens[0]
+                        if ($tokens.Count -gt 1) {
+                            $argString = ($tokens[1..($tokens.Count - 1)] -join ' ')
+                        }
+                    }
+                }
+
+                if (-not (Test-Path -LiteralPath $exePath -PathType Leaf -ErrorAction SilentlyContinue)) {
+                    $resolved = Get-Command -Name $exePath -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($resolved -and $resolved.Path) {
+                        $exePath = $resolved.Path
+                    }
+                }
+
+                if (-not (Test-Path -LiteralPath $exePath -PathType Leaf -ErrorAction SilentlyContinue)) {
+                    return $null
+                }
+
+                $argList = @()
+                if (-not [string]::IsNullOrWhiteSpace($argString)) {
+                    $tokenRegex = [regex]'"([^"]*)"|(\S+)'
+                    foreach ($m in $tokenRegex.Matches($argString)) {
+                        if ($m.Groups[1].Success) {
+                            $argList += $m.Groups[1].Value
+                        }
+                        elseif ($m.Groups[2].Success) {
+                            $argList += $m.Groups[2].Value
+                        }
+                    }
+                }
+
+                return [pscustomobject]@{
+                    ExePath      = $exePath
+                    Arguments    = $argList
+                    RawArguments = $argString
+                }
             }
-            elseif ($safeCommand -match '^\s*([A-Za-z]:\\.*?\.exe)\s*(.*)$') {
-                $filePath = $matches[1]
-                $arguments = $matches[2]
-            }
-            elseif ($safeCommand -match '^\s*([^\s]+)\s*(.*)$') {
-                $filePath = $matches[1]
-                $arguments = $matches[2]
+
+            $commandParts = ConvertTo-QOTWorkerCommandParts -CommandText $safeCommand
+            if (-not $commandParts) {
+                return [pscustomobject]@{
+                    ExitCode = 1
+                    StdOut   = ""
+                    StdErr   = "Unable to resolve uninstall command without cmd.exe fallback: $safeCommand"
+                }
             }
 
             $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -494,15 +568,9 @@ function Invoke-QOTRunSelectedAppsActions {
             $psi.UseShellExecute = $false
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
-
-            if (-not [string]::IsNullOrWhiteSpace($filePath)) {
-                $psi.FileName = $filePath
-                $psi.Arguments = $arguments
-            }
-            else {
-                $wrappedCommand = "`"$safeCommand`""
-                $psi.FileName = "cmd.exe"
-                $psi.Arguments = "/d /s /c " + $wrappedCommand
+            $psi.FileName = $commandParts.ExePath
+            if (-not [string]::IsNullOrWhiteSpace($commandParts.RawArguments)) {
+                $psi.Arguments = $commandParts.RawArguments
             }
 
             $proc = New-Object System.Diagnostics.Process
@@ -757,6 +825,4 @@ function Invoke-QOTUninstallSelectedApps {
 }
 
 Export-ModuleMember -Function Get-QOTSilentUninstallCommand, Start-QOTProcessFromCommand, Invoke-QOTInstallCommonAppItem, Invoke-QOTUninstallAppItem, Invoke-QOTRunSelectedAppsActions, Invoke-QOTInstallSelectedCommonApps, Invoke-QOTUninstallSelectedApps, Request-QOTAppsActionsCancel, Test-QOTAppsActionsCancelRequested
-
-
 
