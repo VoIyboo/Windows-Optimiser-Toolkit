@@ -263,6 +263,29 @@ function Close-QOTBootstrapUi {
     catch { }
 }
 
+function Wait-QOTBootstrapHandoff {
+    param(
+        [string]$SignalPath,
+        [int]$TimeoutMs = 5000
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SignalPath)) { return $false }
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($stopwatch.ElapsedMilliseconds -lt $TimeoutMs) {
+            if (Test-Path -LiteralPath $SignalPath) {
+                return $true
+            }
+            Start-Sleep -Milliseconds 75
+        }
+        return $false
+    }
+    finally {
+        $stopwatch.Stop()
+    }
+}
+
 function Invoke-QOTWebRequestToFile {
     param(
         [Parameter(Mandatory)]
@@ -710,6 +733,12 @@ function Start-QOTInstalledCopy {
         throw "Windows PowerShell executable was not found at: $psExe"
     }
 
+    $handoffSignalPath = Join-Path $env:TEMP ("QOT.StartupWidget.ready.{0}.signal" -f ([guid]::NewGuid().ToString("N")))
+    try {
+        [Environment]::SetEnvironmentVariable("QOT_BOOTSTRAP_HANDOFF_SIGNAL", $handoffSignalPath, "Process")
+    }
+    catch { }
+
     if (Test-Path -LiteralPath $runLocalPath) {
         $psArgs = @(
             "-NoProfile",
@@ -749,6 +778,21 @@ function Start-QOTInstalledCopy {
     if (-not $startedProcess) {
         throw "Failed to start the Quinn intro process."
     }
+
+    $handoffSeen = Wait-QOTBootstrapHandoff -SignalPath $handoffSignalPath -TimeoutMs 5000
+    if (-not $handoffSeen) {
+        Start-Sleep -Milliseconds 250
+    }
+
+    try {
+        Remove-Item -LiteralPath $handoffSignalPath -Force -ErrorAction SilentlyContinue
+    }
+    catch { }
+
+    try {
+        [Environment]::SetEnvironmentVariable("QOT_BOOTSTRAP_HANDOFF_SIGNAL", $null, "Process")
+    }
+    catch { }
 }
 
 $logDir = Get-QOTBootstrapLogDir

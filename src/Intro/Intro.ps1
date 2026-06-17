@@ -36,6 +36,8 @@ public class ConsoleHelper {
 }
 
 function Show-ConsoleWindow {
+    if ($Quiet) { return }
+
     try {
         Add-Type -TypeDefinition @"
 using System;
@@ -192,6 +194,16 @@ try {
             $widget = New-QOTStartupWidget -Path $widgetXaml
             if ($widget) {
                 Show-QOTStartupWidget -Window $widget
+                $handoffSignalPath = [Environment]::GetEnvironmentVariable('QOT_BOOTSTRAP_HANDOFF_SIGNAL', 'Process')
+                if (-not [string]::IsNullOrWhiteSpace($handoffSignalPath)) {
+                    try {
+                        New-Item -ItemType File -Path $handoffSignalPath -Force | Out-Null
+                        & $script:QOTLog ("[STARTUP] Bootstrap handoff signal written: {0}" -f $handoffSignalPath) "INFO"
+                    }
+                    catch {
+                        & $script:QOTLog ("[STARTUP] Failed to write bootstrap handoff signal: {0}" -f $_.Exception.Message) "WARN"
+                    }
+                }
                 Write-StartupMark "Intro shown (startup widget displayed)"
                 & $script:QOTLog "[STARTUP] Startup widget displayed." "INFO"
             }

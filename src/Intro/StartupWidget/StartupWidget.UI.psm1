@@ -109,10 +109,9 @@ function Show-QOTStartupWidget {
     if (-not $Window) { return }
 
     try {
-        # Set opacity to 0 before showing (for fade-in effect)
-        $Window.Opacity = 0
-
-        # Show the window (invisible due to opacity)
+        # Show fully rendered right away so it can cleanly replace the bootstrap
+        # loader without a second half-fade or visual blink.
+        $Window.Opacity = 1
         $Window.Show()
         try {
             $Window.Topmost = $true
@@ -125,14 +124,8 @@ function Show-QOTStartupWidget {
         $Window.Dispatcher.Invoke({
             Move-QOTStartupWidgetToBottomRight -Window $Window
         }, [System.Windows.Threading.DispatcherPriority]::Input) | Out-Null
-
-        # Now fade in with opacity animation
-        $Window.Dispatcher.Invoke({
-            $fadeInStoryboard = $Window.FindResource("FadeInAnimation")
-            if ($fadeInStoryboard) {
-                $fadeInStoryboard.Begin($Window)
-            }
-        }, [System.Windows.Threading.DispatcherPriority]::Normal) | Out-Null
+        $Window.UpdateLayout()
+        $Window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render) | Out-Null
 
         # Auto-disable Topmost after 3 seconds
         $timer = New-Object System.Timers.Timer

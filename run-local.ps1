@@ -32,6 +32,9 @@ if (-not $VerboseStartup) {
 
 Write-Host ("Launching local toolkit from: {0}" -f $root)
 Write-Host ("Intro log: {0}" -f $introLog)
-& $psExe @args
+$startedProcess = Start-Process -FilePath $psExe -ArgumentList $args -WorkingDirectory $root -WindowStyle Hidden -PassThru
+if (-not $startedProcess) {
+    throw "Failed to start the intro process."
+}
 
 
