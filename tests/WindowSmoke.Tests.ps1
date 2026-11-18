@@ -1,9 +1,9 @@
 # Run in Windows PowerShell. The child process owns its dispatcher and fixture files.
-param([string]$FixturePath, [ValidateSet('EarlyClose','FreshAppEarlyClose','TicketCommands','Normal')][string]$Scenario='Normal')
+param([string]$FixturePath, [ValidateSet('EarlyClose','FreshAppEarlyClose','CloseThenCleanupError','TicketCommands','Normal')][string]$Scenario='Normal')
 $ErrorActionPreference = 'Stop'
 $parent = [IO.Path]::GetTempPath().TrimEnd('\')
 if (!$FixturePath) {
-    $scenarios = if ($PSBoundParameters.ContainsKey('Scenario')) { @($Scenario) } else { @('EarlyClose','FreshAppEarlyClose','TicketCommands','Normal') }
+    $scenarios = if ($PSBoundParameters.ContainsKey('Scenario')) { @($Scenario) } else { @('EarlyClose','FreshAppEarlyClose','CloseThenCleanupError','TicketCommands','Normal') }
     foreach ($testScenario in $scenarios) {
         $dir = Join-Path $parent ('Qot WindowTest-' + [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $dir
@@ -146,6 +146,73 @@ function Test-StartupHandoff {
     Assert $handoff.MatchedBackground 'Native painting surface starts with the main window background colour'
 }
 Import-Module (Join-Path $src 'UI/MainWindow.UI.psm1') -DisableNameChecking
+if ($Scenario -eq 'CloseThenCleanupError') {
+    # Keep the actual modal window and close button; inject a failure in the
+    # engine after the window loop exits. A retry leaves a marker in the fixture.
+    Add-TestOverrides 'Core/Engine/Engine.psm1' @(@'
+function Start-QOTMain {
+    param($RootPath,$SplashWindow)
+    $ui = Join-Path $RootPath 'src/UI/MainWindow.UI.psm1'
+    $global:QotSmokeLaunchModule = Import-Module $ui -Force -PassThru
+    Start-QOTMainWindow -SplashWindow $SplashWindow
+    Set-Content $ui 'function Start-QOTMainWindow { Set-Content (Join-Path $env:QOT_SMOKE_DIR retry.txt) retry }'
+    throw 'Simulated cleanup failure after main window close'
+}
+'@)
+    Add-Type -AssemblyName PresentationFramework
+    $closeTimer = [Windows.Threading.DispatcherTimer]::new()
+    $closeTimer.Interval = [timespan]::FromMilliseconds(100)
+    $closeTimer.Add_Tick({
+        $main = [Windows.Application]::Current.MainWindow
+        if ($main -and $main.IsVisible -and $main.IsLoaded) {
+            $closeTimer.Stop()
+            $button = $main.FindName('BtnWindowClose')
+            $click = [Windows.Controls.Primitives.ButtonBase]::ClickEvent
+            $cancel = [ComponentModel.CancelEventHandler]{ param($sender,$e) $e.Cancel = $true }
+            $main.Add_Closing($cancel)
+            try { $button.RaiseEvent([Windows.RoutedEventArgs]::new($click)) }
+            finally { $main.Remove_Closing($cancel) }
+            if ($main.IsVisible -and ![Windows.Application]::Current.Properties['QOT.MainWindowClosed']) {
+                Set-Content (Join-Path $fixture 'opened.txt') $main.Title
+            }
+            # Exercise the startup close guard even when building the fixture
+            # took more than five seconds on this machine.
+            & $global:QotSmokeLaunchModule {
+                $script:MainWindowStartupCloseGuard.Restart()
+                $script:MainWindowUnexpectedCloseBlocked = $false
+            }
+            $button.RaiseEvent([Windows.RoutedEventArgs]::new($click))
+            if ($main.IsVisible) {
+                Set-Content (Join-Path $fixture 'blocked.txt') blocked
+                [Windows.Application]::Current.Shutdown()
+            }
+        }
+    })
+    # If a broken button leaves the modal loop running, end the fixture and
+    # report the failed close instead of waiting for user input.
+    $watchdog = [Windows.Threading.DispatcherTimer]::new()
+    $watchdog.Interval = [timespan]::FromSeconds(45)
+    $watchdog.Add_Tick({
+        $watchdog.Stop()
+        Set-Content (Join-Path $fixture 'timeout.txt') timeout
+        [Windows.Application]::Current.Shutdown()
+    })
+    $log = Join-Path $fixture 'intro.log'
+    $cleanupError = $null
+    $closeTimer.Start()
+    $watchdog.Start()
+    try { & (Join-Path $src 'Intro/Intro.ps1') -SkipSplash -Quiet -LogPath $log }
+    catch { $cleanupError = $_ }
+    finally { $watchdog.Stop(); $closeTimer.Stop() }
+    Assert (!(Test-Path (Join-Path $fixture 'timeout.txt'))) 'The title-bar close completed before the fixture deadline'
+    Assert (!(Test-Path (Join-Path $fixture 'blocked.txt'))) 'An explicit title-bar close works during the five-second startup guard'
+    Assert ((Get-Content (Join-Path $fixture 'opened.txt')) -eq 'Quinn Optimiser Toolkit') 'A cancelled title-bar close keeps the main window open and its close marker clear'
+    Assert ($cleanupError.Exception.Message -eq 'Simulated cleanup failure after main window close') 'Propagated the original cleanup error to the caller'
+    $logText = Get-Content -Raw $log
+    Assert ($logText -match '\[SHUTDOWN\].*Simulated cleanup failure after main window close' -and $logText -notmatch 'FATAL ERROR') 'Logged the cleanup error without reporting a startup failure'
+    Assert (!(Test-Path (Join-Path $fixture 'retry.txt'))) 'A cleanup exception after close cannot start another main window'
+    return
+}
 if ($Scenario -eq 'TicketCommands') {
     & (Join-Path $PSScriptRoot 'TicketCommands.ps1') -FixtureSource $src
     return

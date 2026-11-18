@@ -92,6 +92,7 @@ public static class QOTShellAppIdIntro {
 
 $oldWarningPreference = $WarningPreference
 $WarningPreference    = "SilentlyContinue"
+$launchProperties = $null
 
 try {
     Set-QOTProcessTaskbarIdentity
@@ -394,6 +395,7 @@ try {
             Percent   = 70
             Status    = "Preparing startup tasks..."
             Completed = $false
+            TimedOut  = $false
             Error     = $null
         })
 
@@ -523,7 +525,6 @@ try {
         $startupFrame = New-Object System.Windows.Threading.DispatcherFrame
         $startupTimer = New-Object System.Windows.Threading.DispatcherTimer
         $startupTimeoutMs = 45000
-        $startupTimeoutHit = $false
         $startupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $startupTimer.Interval = [TimeSpan]::FromMilliseconds(120)
         $startupTimer.Add_Tick({
@@ -537,7 +538,7 @@ try {
             }
 
             if ($startupStopwatch.ElapsedMilliseconds -ge $startupTimeoutMs) {
-                $startupTimeoutHit = $true
+                $startupState.TimedOut = $true
                 $startupState.Status = "Startup warmup timed out, continuing..."
                 $startupTimer.Stop()
                 $startupFrame.Continue = $false
@@ -547,7 +548,7 @@ try {
             [System.Windows.Threading.Dispatcher]::PushFrame($startupFrame)
 
             try {
-                if ($startupTimeoutHit) {
+                if ($startupState.TimedOut) {
                     try {
                         $startupPs.Stop()
                     } catch { }
@@ -602,12 +603,15 @@ try {
     & $script:QOTLog "Starting main window" "INFO"
     & $script:QOTLog "[STARTUP] MainWindow launch started" "INFO"
 
-    # Start-QOTMain owns the WPF message loop. A normal return means the user
-    # has closed the window. Only a launch exception calls for another attempt.
+    # Start-QOTMain owns the WPF message loop. Closing the main window ends
+    # this launch, even if a later cleanup step fails.
+    $launchProperties = $introApp.Properties
+    $launchProperties['QOT.MainWindowClosed'] = $false
     try {
         Start-QOTMain -RootPath $rootPath -SplashWindow $widget
     }
     catch {
+        if ($launchProperties['QOT.MainWindowClosed']) { throw }
         & $script:QOTLog ("[STARTUP] Main window launch failed. Trying the UI module directly. {0}" -f $_.Exception.Message) "WARN"
         $mainWindowModulePath = Join-Path $rootPath "src\UI\MainWindow.UI.psm1"
         $fallbackModule = Import-Module -Name $mainWindowModulePath -Force -PassThru -ErrorAction Stop
@@ -618,6 +622,10 @@ try {
     Stop-StartupChunk "MainWindow launch"
 }
 catch {
+    if ($launchProperties -and $launchProperties['QOT.MainWindowClosed']) {
+        & $script:QOTLog ("[SHUTDOWN] Error after the main window closed: {0}" -f $_.Exception.ToString()) "ERROR"
+        throw
+    }
     $fatalError = $_.Exception.Message
     $fatalStack = if ($_.Exception) { $_.Exception.StackTrace } else { "" }
     & $script:QOTLog ("[STARTUP] FATAL ERROR - Application startup failed: {0}" -f $fatalError) "ERROR"
@@ -638,7 +646,7 @@ catch {
         Write-Host "FATAL ERROR: $fatalError" -ForegroundColor Red
         Write-Host "Check logs for details" -ForegroundColor Red
     }
-
+    throw
 }
 finally {
     $WarningPreference = $oldWarningPreference

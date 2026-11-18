@@ -3960,12 +3960,9 @@ function Start-QOTMainWindow {
 
     if ($btnWindowClose) {
         $btnWindowClose.Add_Click({
-            try {
-                $script:MainWindowAllowClose = $true
-                $script:MainWindowCloseReason = "CustomTitleBarCloseButton"
-                $window.Close()
-            } catch { }
-        }.GetNewClosure())
+            param($sender, $eventArgs)
+            Request-QOTMainWindowClose -Window ([System.Windows.Window]::GetWindow($sender)) -Reason 'CustomTitleBarCloseButton'
+        })
     }
 
     foreach ($dragSurface in @($windowDragSurface, $headerContentDragSurface)) {
@@ -4677,6 +4674,9 @@ function Start-QOTMainWindow {
         $app.ShutdownMode = [System.Windows.ShutdownMode]::OnMainWindowClose
         Write-QOTStartupTrace ("Application ShutdownMode set to: {0}" -f $app.ShutdownMode)
 
+        # Record the actual close before any splash or timer cleanup handlers run.
+        $launchProperties = $app.Properties
+        $window.Add_Closed({ $launchProperties['QOT.MainWindowClosed'] = $true }.GetNewClosure())
         $window.Add_Loaded({ Write-QOTStartupTrace "MainWindow lifecycle event fired: Loaded" })
         $window.Add_SourceInitialized({
             try {
