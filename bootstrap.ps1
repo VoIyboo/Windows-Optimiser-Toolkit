@@ -756,12 +756,14 @@ function Start-QOTInstalledCopy {
     Write-Host ""
 
 
-    # Launch intro in its own hidden-console process so the startup widget can
-    # present independently of the caller's PowerShell window.
+    # The startup widget owns the UI. Its PowerShell host needs no console.
     try {
         $env:QOT_BOOTSTRAP_LOG_DIR = $LogDir
-        $startedProcess = Start-Process -FilePath $psExe -ArgumentList $psArgs -WorkingDirectory $ToolkitRoot -WindowStyle Hidden -PassThru
-        if (-not $startedProcess) { throw "Failed to start the Quinn intro process." }
+        $startInfo = [Diagnostics.ProcessStartInfo]::new($psExe, ($psArgs -join ' '))
+        $startInfo.WorkingDirectory = $ToolkitRoot
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        [Diagnostics.Process]::Start($startInfo).Dispose()
         $null = Wait-QOTBootstrapHandoff -SignalPath $handoffSignalPath -TimeoutMs 5000
     }
     finally {
@@ -773,6 +775,7 @@ function Start-QOTInstalledCopy {
 
 $logDir = Get-QOTBootstrapLogDir
 $bootstrapLog = Join-Path $logDir ("Bootstrap_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$bootstrapUi = $null
 Start-Transcript -Path $bootstrapLog | Out-Null
 
 try {
@@ -791,7 +794,6 @@ try {
     $layout = Get-QOTInstallLayout
     $state = Read-QOTInstallState -StatePath $layout.StatePath
 
-    $bootstrapUi = $null
     if (-not $ForceRemote) {
         $logoPath = Get-QOTBootstrapLogoPath -Layout $layout -State $state -Owners $repoOwners -RepoName $repoName -Branch $Branch
         $bootstrapUi = New-QOTBootstrapUi -LogoPath $logoPath
@@ -808,8 +810,8 @@ try {
     if ((-not $ForceRemote) -and $localIntro -and (Test-Path -LiteralPath $localIntro)) {
         Write-Host "Using local toolkit source (developer/local checkout)."
         Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 90 -Status "Launching local build..." -Detail "Opening Quinn Optimiser Toolkit from the current project folder."
-        Close-QOTBootstrapUi -Ui $bootstrapUi -Immediate
         Start-QOTInstalledCopy -ToolkitRoot $localRoot -LogDir $logDir -VerboseStartup:$VerboseStartup
+        Close-QOTBootstrapUi -Ui $bootstrapUi -Immediate
         return
     }
 
@@ -878,7 +880,6 @@ try {
     }
 
     if (-not $hasInstalledCopy) {
-        Close-QOTBootstrapUi -Ui $bootstrapUi
         if ($remoteLookupError) {
             throw "Toolkit is not installed yet, and GitHub could not be reached to download it. $remoteLookupError"
         }
@@ -886,15 +887,15 @@ try {
     }
 
     Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 92 -Status "Launching Quinn..." -Detail "Opening the toolkit window now."
-    Close-QOTBootstrapUi -Ui $bootstrapUi -Immediate
     $installedToolkitRoot = Get-QOTInstalledToolkitRoot -Layout $layout -State $state
     if ([string]::IsNullOrWhiteSpace($installedToolkitRoot)) {
         throw "Toolkit install state was updated, but no runnable installed copy could be found."
     }
     Start-QOTInstalledCopy -ToolkitRoot $installedToolkitRoot -LogDir $logDir -VerboseStartup:$VerboseStartup
+    Close-QOTBootstrapUi -Ui $bootstrapUi -Immediate
 }
 catch {
-    Close-QOTBootstrapUi -Ui $bootstrapUi
+    Close-QOTBootstrapUi -Ui $bootstrapUi -Immediate
     try {
         Add-Type -AssemblyName PresentationFramework | Out-Null
         [System.Windows.MessageBox]::Show(

@@ -1,17 +1,19 @@
 # Run in Windows PowerShell. The child process owns its dispatcher and fixture files.
-param([string]$FixturePath)
+param([string]$FixturePath, [ValidateSet('EarlyClose','FreshAppEarlyClose','Normal')][string]$Scenario='Normal')
 $ErrorActionPreference = 'Stop'
 $parent = [IO.Path]::GetTempPath().TrimEnd('\')
 if (!$FixturePath) {
-    $dir = Join-Path $parent ('Qot WindowTest-' + [guid]::NewGuid().ToString('N'))
-    $null = New-Item -ItemType Directory -Path $dir
-    try {
-        & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -STA -ExecutionPolicy Bypass -File $PSCommandPath -FixturePath $dir
-        if ($LASTEXITCODE) { throw "Window smoke test exited with code $LASTEXITCODE" }
-    } finally {
-        $target = (Resolve-Path -LiteralPath $dir).Path
-        if ((Split-Path $target -Parent) -eq $parent -and (Split-Path $target -Leaf) -match '^Qot WindowTest-[a-f0-9]{32}$') {
-            Remove-Item -LiteralPath $target -Recurse -Force
+    foreach ($testScenario in 'EarlyClose','FreshAppEarlyClose','Normal') {
+        $dir = Join-Path $parent ('Qot WindowTest-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $dir
+        try {
+            & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -STA -ExecutionPolicy Bypass -File $PSCommandPath -FixturePath $dir -Scenario $testScenario
+            if ($LASTEXITCODE) { throw "Window smoke test exited with code $LASTEXITCODE" }
+        } finally {
+            $target = (Resolve-Path -LiteralPath $dir).Path
+            if ((Split-Path $target -Parent) -eq $parent -and (Split-Path $target -Leaf) -match '^Qot WindowTest-[a-f0-9]{32}$') {
+                Remove-Item -LiteralPath $target -Recurse -Force
+            }
         }
     }
     return
@@ -44,6 +46,13 @@ $text = [IO.File]::ReadAllText($uiPath)
 $text = $text.Replace('[System.Windows.DragDrop]::DoDragDrop(', '[QotTestDrag]::DoDragDrop(')
 $text = $text.Replace('$window.Title = "Task Results"', '$window.ShowInTaskbar = $false; $window.ShowActivated = $false; $window.Opacity = 0; $window.Title = "Task Results"')
 $text = $text.Replace('Start-Process -FilePath "notepad.exe"', 'Open-TestLogEditor -FilePath "notepad.exe"')
+# Quarantine the real startup handoff to a virtual screen outside the desktop.
+$text = $text.Replace('[System.Windows.SystemParameters]::VirtualScreenLeft', '(-32000)').Replace('[System.Windows.SystemParameters]::VirtualScreenTop', '(-32000)')
+$text = $text.Replace('[System.Windows.WindowStartupLocation]::CenterScreen', '[System.Windows.WindowStartupLocation]::Manual')
+$text = $text.Replace('$Window.ShowInTaskbar = $true', '$Window.ShowInTaskbar = $false').Replace('$window.ShowInTaskbar = $true', '$window.ShowInTaskbar = $false')
+$viewPath = Join-Path $src 'UI/MainWindow.xaml'
+$viewText = [IO.File]::ReadAllText($viewPath).Replace('WindowStartupLocation="CenterScreen"', 'WindowStartupLocation="Manual" Left="-32000" Top="-32000" ShowActivated="False" ShowInTaskbar="False"')
+[IO.File]::WriteAllText($viewPath, $viewText)
 [IO.File]::WriteAllText($uiPath, $text, [Text.UTF8Encoding]::new($true))
 function global:Open-TestLogEditor($FilePath, $ArgumentList) { $global:QotTestEditorArguments = $ArgumentList }
 function Add-TestOverrides([string]$RelativePath, [string[]]$Functions) {
@@ -91,7 +100,57 @@ function Wait-For([scriptblock]$Ready) {
     $timer.Start()
     try { [Windows.Threading.Dispatcher]::PushFrame($frame) } finally { $timer.Stop() }
 }
+function Test-StartupHandoff {
+    param([switch]$CloseAtFirstRender)
+    # The splash closes only after the fully opaque main window has painted.
+    $splash = [Windows.Markup.XamlReader]::Parse('<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Left="-32000" Top="-32000" Width="30" Height="30" ShowActivated="False" ShowInTaskbar="False"/>')
+    $handoff = @{ Rendered = $false; ClosedAfterRender = $false; FirstOpacity = -1; MatchedBackground = $false; ClosedDuringFade = $false }
+    $rendered = [System.EventHandler]{
+        param($main,$eventArgs)
+        if ($handoff.Rendered) { return }
+        $handoff.FirstOpacity = $main.Opacity
+        $handoff.Rendered = $true
+        $source = [Windows.PresentationSource]::FromVisual($main)
+        $handoff.MatchedBackground = $source.CompositionTarget.BackgroundColor -eq $main.Background.Color
+        if ($CloseAtFirstRender) {
+            $handoff.ClosedDuringFade = $splash.IsVisible
+            Request-QOTMainWindowClose -Window $main
+        }
+    }.GetNewClosure()
+    $loaded = [Windows.RoutedEventHandler]{
+        param($sender,$e)
+        if ($sender -is [Windows.Window] -and $sender.Title -eq 'Quinn Optimiser Toolkit') {
+            $sender.Add_ContentRendered($rendered)
+        }
+    }.GetNewClosure()
+    [Windows.EventManager]::RegisterClassHandler([Windows.Window], [Windows.FrameworkElement]::LoadedEvent, $loaded)
+    $splash.Add_Closed({ $handoff.ClosedAfterRender = $handoff.Rendered }.GetNewClosure())
+    $splash.Show()
+    $timeout = [datetime]::UtcNow.AddSeconds(45)
+    $finish = [Windows.Threading.DispatcherTimer]::new()
+    $finish.Interval = [timespan]::FromMilliseconds(100)
+    $finish.Add_Tick({
+        $main = [Windows.Application]::Current.MainWindow
+        if (($handoff.Rendered -and !$splash.IsVisible) -or [datetime]::UtcNow -ge $timeout) {
+            $finish.Stop()
+            Request-QOTMainWindowClose -Window $main
+        }
+    }.GetNewClosure())
+    $finish.Start()
+    try { Start-QOTMainWindow -SplashWindow $splash } finally { $finish.Stop() }
+    Assert ($handoff.ClosedAfterRender -and $handoff.FirstOpacity -eq 1) "The first main window frame is opaque and appears before the splash closes (opacity=$($handoff.FirstOpacity), closed after render=$($handoff.ClosedAfterRender))"
+    if ($CloseAtFirstRender) {
+        Assert ($handoff.ClosedDuringFade -and !$splash.IsVisible) 'Closing the main window during handoff also closes the startup widget'
+    }
+    Assert $handoff.MatchedBackground 'Native painting surface starts with the main window background colour'
+}
 Import-Module (Join-Path $src 'UI/MainWindow.UI.psm1') -DisableNameChecking
+if ($Scenario -ne 'Normal') {
+    Add-Type -AssemblyName PresentationFramework
+    if ($Scenario -eq 'EarlyClose') { $null = [Windows.Application]::new() }
+    Test-StartupHandoff -CloseAtFirstRender
+    return
+}
 $window = @(Start-QOTMainWindow -WarmupOnly -PassThru) | Where-Object { $_ -is [Windows.Window] } | Select-Object -Last 1
 Assert ($window -and !$window.IsVisible) 'Full main window builds hidden'
 $tabs = $window.FindName('MainTabControl')
@@ -185,3 +244,5 @@ foreach ($count in @(1,2,11)) {
     $actual = if (Test-Path $calls) { @(Get-Content $calls).Count } else { 0 }
     Assert ($actual -eq $count -and $play.IsEnabled -and $quick.IsEnabled -and !$quick.IsChecked) "Play and Quick clean available after $count fixture calls"
 }
+
+Test-StartupHandoff

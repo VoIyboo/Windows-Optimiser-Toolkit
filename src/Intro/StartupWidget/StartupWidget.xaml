@@ -10,7 +10,7 @@
         ShowInTaskbar="False"
         Topmost="True"
         WindowStartupLocation="Manual"
-        ShowActivated="True">
+        ShowActivated="False">
 
     <Window.Resources>
         <Storyboard x:Key="FadeInAnimation">

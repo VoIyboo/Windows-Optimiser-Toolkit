@@ -11,55 +11,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Console window hide/show functions
-function Hide-ConsoleWindow {
-    try {
-        Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public class ConsoleHelper {
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetConsoleWindow();
-
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-}
-"@ -ErrorAction SilentlyContinue | Out-Null
-
-        $consolePtr = [ConsoleHelper]::GetConsoleWindow()
-        if ($consolePtr -ne [IntPtr]::Zero) {
-            [ConsoleHelper]::ShowWindow($consolePtr, 0) | Out-Null  # 0 = SW_HIDE
-        }
-    }
-    catch { }
-}
-
-function Show-ConsoleWindow {
-    if ($Quiet) { return }
-
-    try {
-        Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public class ConsoleHelper {
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetConsoleWindow();
-
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-}
-"@ -ErrorAction SilentlyContinue | Out-Null
-
-        $consolePtr = [ConsoleHelper]::GetConsoleWindow()
-        if ($consolePtr -ne [IntPtr]::Zero) {
-            [ConsoleHelper]::ShowWindow($consolePtr, 5) | Out-Null  # 5 = SW_SHOW
-        }
-    }
-    catch { }
-}
-
 # Keep startup noise out of interactive PowerShell; logs are written to file.
 [Environment]::SetEnvironmentVariable('QOT_QUIET_CONSOLE', '1', 'Process')
 [Environment]::SetEnvironmentVariable('QOT_APP_USER_MODEL_ID', 'StudioVoly.QuinnOptimiserToolkit', 'Process')
@@ -141,9 +92,6 @@ public static class QOTShellAppIdIntro {
 
 $oldWarningPreference = $WarningPreference
 $WarningPreference    = "SilentlyContinue"
-
-# Hide the console window for clean user experience
-Hide-ConsoleWindow
 
 try {
     Set-QOTProcessTaskbarIdentity
@@ -691,11 +639,7 @@ catch {
         Write-Host "Check logs for details" -ForegroundColor Red
     }
 
-    # Ensure console is visible for error messages
-    Show-ConsoleWindow
 }
 finally {
     $WarningPreference = $oldWarningPreference
-    # Ensure console is visible at the end for any final messages or errors
-    Show-ConsoleWindow
 }

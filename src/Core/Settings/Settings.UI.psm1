@@ -22,6 +22,32 @@ function Write-QOSettingsUILog {
     & $script:QOLog $Message
 }
 
+function New-QOTDesktopShortcut {
+    param([string]$ShortcutPath, [string]$ToolkitRoot)
+
+    $launcher = Join-Path $ToolkitRoot 'Open-Quinn.vbs'
+    $wscriptPath = Join-Path $env:WINDIR 'System32\wscript.exe'
+    if (!(Test-Path -LiteralPath $launcher)) { throw "GUI launcher missing: $launcher" }
+    if (!(Test-Path -LiteralPath $wscriptPath)) { throw 'Windows Script Host executable not found.' }
+
+    $icon = Join-Path $ToolkitRoot 'src\UI\QOT.ico'
+    if (!(Test-Path -LiteralPath $icon)) { $icon = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe' }
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $null
+    try {
+        $shortcut = $shell.CreateShortcut($ShortcutPath)
+        $shortcut.TargetPath = $wscriptPath
+        $shortcut.Arguments = ('"{0}"' -f $launcher)
+        $shortcut.WorkingDirectory = $ToolkitRoot
+        $shortcut.Description = 'Launch Quinn Optimiser Toolkit'
+        $shortcut.IconLocation = "$icon,0"
+        $shortcut.Save()
+    } finally {
+        if ($shortcut) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    }
+}
+
 function Resolve-QOSettingsInvokableCommand {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -1199,9 +1225,9 @@ public static class QOTShellRefresh {
         return $result
     }.GetNewClosure()
 
+    $createDesktopShortcutCmd = Resolve-QOSettingsInvokableCommand -Name 'New-QOTDesktopShortcut'
+    $toolkitRoot = (Get-Item -LiteralPath (Join-Path $PSScriptRoot '..\..\..')).FullName
     $script:QOSettings_InstallShortcutHandler = {
-        $shell = $null
-        $shortcut = $null
         try {
             $state = & $updateDesktopShortcutUiState
             if (-not $state -or [string]::IsNullOrWhiteSpace([string]$state.ShortcutPath)) {
@@ -1226,52 +1252,13 @@ public static class QOTShellRefresh {
                 return
             }
 
-            $repoRootPath = $null
-            try { $repoRootPath = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path } catch { $repoRootPath = $null }
-            if (-not $repoRootPath) { throw "Unable to resolve repository root path." }
-
-            $introScriptPath = $null
-            try { $introScriptPath = (Resolve-Path (Join-Path $PSScriptRoot "..\..\Intro\Intro.ps1")).Path } catch { $introScriptPath = $null }
-            if (-not $introScriptPath) { throw "Intro launcher script not found." }
-
-            $powerShellPath = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
-            if (-not (Test-Path -LiteralPath $powerShellPath)) { throw "Windows PowerShell executable not found." }
-            $wscriptPath = Join-Path $env:WINDIR "System32\wscript.exe"
-            if (-not (Test-Path -LiteralPath $wscriptPath)) { throw "Windows Script Host executable not found." }
-
-            $iconPath = Join-Path $repoRootPath "src\UI\QOT.ico"
-            $launcherScriptPath = Join-Path $repoRootPath "src\Intro\LaunchQuinnHidden.vbs"
-            $launcherContent = @"
-Option Explicit
-Dim shell, cmd
-Set shell = CreateObject("WScript.Shell")
-cmd = Chr(34) & "$($powerShellPath.Replace('"','""'))" & Chr(34) & " -NoProfile -ExecutionPolicy Bypass -STA -File " & Chr(34) & "$($introScriptPath.Replace('"','""'))" & Chr(34)
-shell.Run cmd, 0, False
-"@
-            Set-Content -LiteralPath $launcherScriptPath -Value $launcherContent -Encoding ASCII -Force
-
-            $shell = New-Object -ComObject WScript.Shell
-            $shortcut = $shell.CreateShortcut([string]$state.ShortcutPath)
-            $shortcut.TargetPath = $wscriptPath
-            $shortcut.Arguments = "`"$launcherScriptPath`""
-            $shortcut.WorkingDirectory = $repoRootPath
-            $shortcut.Description = "Launch Quinn Optimiser Toolkit"
-            if (Test-Path -LiteralPath $iconPath) {
-                $shortcut.IconLocation = "$iconPath,0"
-            } else {
-                $shortcut.IconLocation = "$powerShellPath,0"
-            }
-            $shortcut.Save()
-            if ($shortcut) { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
-            if ($shell) { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+            & $createDesktopShortcutCmd -ShortcutPath $state.ShortcutPath -ToolkitRoot $toolkitRoot
 
             & $refreshShellDesktop | Out-Null
             & $updateDesktopShortcutUiState | Out-Null
             if ($hint) { $hint.Text = "Desktop shortcut installed." }
             Write-QOSettingsUILog ("Desktop shortcut installed: {0}" -f $state.ShortcutPath)
         } catch {
-            try { if ($shortcut) { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) } } catch { }
-            try { if ($shell) { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) } } catch { }
             if ($lblDesktopShortcutStatus) {
                 $lblDesktopShortcutStatus.Text = ("Shortcut install failed: {0}" -f $_.Exception.Message)
             }

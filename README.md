@@ -169,7 +169,7 @@ src\
 irm 'https://raw.githubusercontent.com/VoIyboo/Windows-Optimiser-Toolkit/main/bootstrap.ps1' | iex
 ```
 
-For a downloaded ZIP, extract it and open `Launch-Quinn.bat` to run that copy.
+For a downloaded ZIP, extract it and double-click `Open-Quinn.vbs` to open the app without a command window. You can also run `.\run-local.ps1` from an existing PowerShell session.
 
 ## Running the tests
 

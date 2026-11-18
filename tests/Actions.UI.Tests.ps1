@@ -64,6 +64,44 @@ try {
     }
     $env:QOT_UI_TOGGLE_TEST_MODE = '1'
 
+    # The real async toggle and dispatcher run with a harmless command in place
+    # of each registry edit. Count shell restarts at the module boundary.
+    $savedShellChanges = [Collections.Generic.List[string]]::new()
+    & $tweaks {
+        param($saved)
+        $script:ShellRestartRequests = 0
+        function script:Get-Process($Name) {
+            if ($Name -eq 'explorer') { [pscustomobject]@{ Id = 1 } }
+        }
+        function script:Stop-Process { $script:ShellRestartRequests++ }
+        function script:Start-Process { throw 'Unexpected process launch from a shell setting' }
+        foreach ($name in 'CbClassicMoreOptions','CbDisableTaskbarNews','CbDisableMeetNow','CbDisableWidgets') {
+            $metadata = $script:QOTTweaksInstantToggleState.Metadata[$name]
+            $metadata.Apply = 'Get-Date'
+            $metadata.Undo = 'Get-Date'
+            $metadata.GetLiveStateCmd = $null
+            $metadata.SetToggleStateCmd = { param($ActionId,$IsEnabled) $saved.Add($ActionId) }.GetNewClosure()
+        }
+    } $savedShellChanges
+    $env:QOT_UI_TOGGLE_TEST_MODE = '0'
+    foreach ($name in 'CbClassicMoreOptions','CbSectionTaskbarWidgets') {
+        $control = $window.FindName($name)
+        $control.IsChecked = $true
+        $control.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+    }
+    $deadline = [datetime]::UtcNow.AddSeconds(10)
+    do {
+        $window.Dispatcher.Invoke([action]{}, [Windows.Threading.DispatcherPriority]::ApplicationIdle)
+        $pending = & $tweaks { $script:QOTTweaksInstantToggleState.Operations.Count }
+        if ($pending) { Start-Sleep -Milliseconds 25 }
+    } while ($pending -and [datetime]::UtcNow -lt $deadline)
+    Check (!$pending -and $savedShellChanges.Count -eq 4) 'Individual and section shell settings finish and save'
+    # Group toggles used to restart Explorer from a 350 ms dispatcher timer.
+    Start-Sleep -Milliseconds 500
+    $window.Dispatcher.Invoke([action]{}, [Windows.Threading.DispatcherPriority]::ApplicationIdle)
+    Check ((& $tweaks { $script:ShellRestartRequests }) -eq 0) 'Shell settings leave the desktop and open Explorer windows running'
+    $env:QOT_UI_TOGGLE_TEST_MODE = '1'
+
     foreach ($test in @(
         @{ Name='CbDisableAdvertisingId'; Module=$tweaks; Group='Tweaks' }
         @{ Name='CbAdvDisableFullscreenOptimizations'; Module=$advanced; Group='Advanced' }

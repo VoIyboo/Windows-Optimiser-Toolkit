@@ -6,7 +6,7 @@ $tempRoot = [IO.Path]::GetTempPath().TrimEnd('\')
 $fixture = Join-Path $tempRoot ('QOT bootstrap test ' + [guid]::NewGuid())
 $null = New-Item -Type Directory -Path $fixture
 $priorEnv = @{}
-foreach ($key in 'ProgramData','APPDATA','LOCALAPPDATA','TEMP','QOT_TEST_MARKER','QOT_BOOTSTRAP_HANDOFF_SIGNAL') {
+foreach ($key in 'ProgramData','APPDATA','LOCALAPPDATA','TEMP','QOT_TEST_MARKER','QOT_BOOTSTRAP_HANDOFF_SIGNAL','QOT_SETTINGS_PATH') {
     $priorEnv[$key] = [Environment]::GetEnvironmentVariable($key)
 }
 $env:QOT_TEST_MARKER = Join-Path $fixture 'child.json'
@@ -31,7 +31,8 @@ try {
     $intro = Join-Path $introDir.FullName 'Intro.ps1'
     Set-Content -LiteralPath $intro -Value @'
 param([string]$LogPath, [switch]$Quiet)
-@{ LogPath=$LogPath; Quiet=$Quiet.IsPresent } | ConvertTo-Json | Set-Content -LiteralPath $env:QOT_TEST_MARKER
+Add-Type -Name Console -Namespace QuinnTest -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();'
+@{ LogPath=$LogPath; Quiet=$Quiet.IsPresent; Console=[QuinnTest.Console]::GetConsoleWindow().ToInt64() } | ConvertTo-Json | Set-Content -LiteralPath $env:QOT_TEST_MARKER
 if ($env:QOT_BOOTSTRAP_HANDOFF_SIGNAL) { Set-Content -LiteralPath $env:QOT_BOOTSTRAP_HANDOFF_SIGNAL -Value 'ready' }
 '@
     Copy-Item -LiteralPath (Join-Path $root 'run-local.ps1') -Destination $pkg
@@ -63,15 +64,100 @@ if ($env:QOT_BOOTSTRAP_HANDOFF_SIGNAL) { Set-Content -LiteralPath $env:QOT_BOOTS
         while (!(Test-Path $env:QOT_TEST_MARKER) -and $timer.Elapsed.TotalSeconds -lt 3) { Start-Sleep -Milliseconds 50 }
         $child = Get-Content -LiteralPath $env:QOT_TEST_MARKER -Raw | ConvertFrom-Json
         if (!$child.Quiet -or $child.LogPath -notlike "$fixture\*") { throw 'Child received incorrect parameters' }
+        if ($child.Console -ne 0) { throw 'A console was allocated for the toolkit window' }
     }
-    Test-Case 'Batch launcher supports exclamation marks and returns the runner exit code' {
+    Test-Case 'Bootstrap can launch an older intro directly without allocating a console' {
+        $legacyRoot = Join-Path $fixture 'direct intro'
+        $legacyIntro = New-Item -ItemType Directory -Path (Join-Path $legacyRoot 'src\Intro') -Force
+        Copy-Item -LiteralPath $intro -Destination $legacyIntro.FullName
+        Remove-Item -LiteralPath $env:QOT_TEST_MARKER -ErrorAction SilentlyContinue
+        Start-QOTInstalledCopy -ToolkitRoot $legacyRoot -LogDir $fixture -VerboseStartup
+        $child = Get-Content -LiteralPath $env:QOT_TEST_MARKER -Raw | ConvertFrom-Json
+        if ($child.Quiet -or $child.Console -ne 0) { throw 'Verbose startup opened a console or lost its arguments' }
+    }
+    Test-Case 'Explorer launcher opens the runner hidden from a folder with literal shell characters' {
+        $guiDir = Join-Path $fixture 'helpdesk %TEMP% & support!'
+        $null = [IO.Directory]::CreateDirectory($guiDir)
+        $guiLauncher = Join-Path $guiDir 'Open-Quinn.vbs'
+        Copy-Item -LiteralPath (Join-Path $root 'Open-Quinn.vbs') -Destination $guiLauncher
+        Set-Content -LiteralPath (Join-Path $guiDir 'run-local.ps1') -Value @'
+Add-Type -Name Window -Namespace QuinnTest -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
+"@
+[QuinnTest.Window]::IsWindowVisible([QuinnTest.Window]::GetConsoleWindow()) | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'visible.txt')
+'@
+        $hostExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
+        $process = Start-Process -FilePath $hostExe -ArgumentList ('//B "{0}"' -f $guiLauncher) -WorkingDirectory $fixture -WindowStyle Hidden -PassThru -Wait
+        if ($process.ExitCode -ne 0 -or (Get-Content -LiteralPath (Join-Path $guiDir 'visible.txt')) -ne 'False') {
+            throw 'The hidden GUI handoff failed'
+        }
+    }
+    $env:ProgramData = $fixture
+    $env:QOT_SETTINGS_PATH = Join-Path $fixture 'settings.json'
+    Test-Case 'Settings desktop shortcut targets the packaged GUI launcher' {
+        $settingsUi = Import-Module (Join-Path $root 'src\Core\Settings\Settings.UI.psm1') -PassThru
+        $lnk = Join-Path $fixture 'Quinn Optimiser Toolkit.lnk'
+        & $settingsUi { param($path, $folder) New-QOTDesktopShortcut -ShortcutPath $path -ToolkitRoot $folder } $lnk $root
+        $shell = New-Object -ComObject WScript.Shell
+        try {
+            $shortcut = $shell.CreateShortcut($lnk)
+            if ($shortcut.TargetPath -ne (Join-Path $env:WINDIR 'System32\wscript.exe') -or
+                $shortcut.Arguments -ne ('"{0}"' -f (Join-Path $root 'Open-Quinn.vbs')) -or
+                $shortcut.WorkingDirectory -ne $root) { throw 'Unexpected shortcut target, arguments or working directory' }
+        } finally {
+            if ($shortcut) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+        }
+    }
+    Test-Case 'Command-prompt launcher preserves console visibility, literal paths and exit status' {
         $batchDir = Join-Path $fixture 'support! desk'
         $null = [IO.Directory]::CreateDirectory($batchDir)
         Copy-Item -LiteralPath (Join-Path $root 'Launch-Quinn.bat') -Destination $batchDir
-        Set-Content -LiteralPath (Join-Path $batchDir 'run-local.ps1') -Value 'Set-Content (Join-Path $PSScriptRoot "batch-result") launched; exit 17'
+        Set-Content -LiteralPath (Join-Path $batchDir 'run-local.ps1') -Value 'Set-Content (Join-Path $PSScriptRoot "batch-result") ([Environment]::GetCommandLineArgs()); exit 17'
         $process = Start-Process -FilePath $env:ComSpec -ArgumentList '/d /c Launch-Quinn.bat' -WorkingDirectory $batchDir -WindowStyle Hidden -PassThru -Wait
         if (!(Test-Path (Join-Path $batchDir 'batch-result')) -or $process.ExitCode -ne 17) {
             throw "Incorrect batch handoff or exit status ($($process.ExitCode))"
+        }
+        if ('-WindowStyle' -in (Get-Content -LiteralPath (Join-Path $batchDir 'batch-result'))) { throw 'Launcher changed the caller console visibility' }
+    }
+    Test-Case 'Bootstrap holds the logo through local and installed handoffs and closes it on launch failure' {
+        $main = $source.Substring($source.IndexOf('$logDir = Get-QOTBootstrapLogDir'))
+        $state = Read-QOTInstallState $layout.StatePath
+        $installedRoot = $state.InstallRoot
+        $ForceRemote = $false
+        $ForceRefresh = $false
+        $Branch = 'main'
+        $originalLocation = Get-Location
+        $steps = [Collections.Generic.List[string]]::new()
+        function Get-QOTInstallLayout { $layout }
+        function Get-QOTBootstrapLogDir { $fixture }
+        function Get-QOTLatestRemoteInfo { $remote }
+        function Get-QOTBootstrapLogoPath { }
+        function New-QOTBootstrapUi { $steps.Add('show'); return 'fixture logo' }
+        function Update-QOTBootstrapUi { }
+        function Close-QOTBootstrapUi($Ui,[switch]$Immediate) { if ($Ui) { $steps.Add("close-$Immediate") } }
+        function Add-Type { throw 'Modal errors disabled in fixture' }
+        function Start-QOTInstalledCopy($ToolkitRoot) {
+            if ($ToolkitRoot -ne $expectedRoot) { throw "Unexpected launch root: $ToolkitRoot" }
+            $steps.Add('launch')
+            if ($outcome -eq 'failure') { throw 'Fixture startup failed' }
+            $steps.Add($outcome)
+        }
+        foreach ($folder in $pkg,$fixture) {
+            # Only the package directory has src\Intro, as in a direct local launch.
+            $expectedRoot = if ($folder -eq $pkg) { $pkg } else { $installedRoot }
+            $driver = Join-Path $folder 'bootstrap-handoff.ps1'
+            Set-Content -LiteralPath $driver -Value $main
+            foreach ($outcome in 'ready','timeout','failure') {
+                $steps.Clear()
+                try { & $driver } catch {
+                    if ($outcome -ne 'failure' -or $_.Exception.Message -ne 'Fixture startup failed') { throw }
+                    $steps.Add('failure reported')
+                }
+                $expected = if ($outcome -eq 'failure') { 'show,launch,close-True,failure reported' } else { "show,launch,$outcome,close-True" }
+                if (($steps -join ',') -ne $expected) { throw "Expected $expected, saw $($steps -join ',')" }
+            }
         }
     }
     Test-Case 'A failed update launches the last working installation' {

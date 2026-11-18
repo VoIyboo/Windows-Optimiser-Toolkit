@@ -161,6 +161,65 @@ function Send-QOTicketOutlookEmail {
             Assert ($script:TicketsSyncRunCounter -eq 1) 'Manual sync request never reached worker launch'
         }
     }
+    Check 'configured background sync waits for classic Outlook in the current session' {
+        $ui = Import-Module (Join-Path $tickets 'Tickets.UI.psm1') -Force -PassThru -DisableNameChecking
+        & $ui {
+            function Get-QOTMonitoredMailboxAddresses { 'support@example.invalid' }
+            function Get-Process { param($Name); if ($Name -eq 'OUTLOOK') { $outlookInstances } }
+            function Test-QOTProcessElevated { return $elevated }
+            function Start-QOTLimitedScheduledProcess { throw 'Stopped at the test scheduler boundary.' }
+            function Start-Process { throw 'Stopped at the test process boundary.' }
+            $session = [Diagnostics.Process]::GetCurrentProcess().SessionId
+            $grid = [System.Windows.Controls.DataGrid]::new()
+            $status = [System.Windows.Controls.TextBlock]::new()
+            $arguments = @{Grid=$grid; StatusText=$status; GetTicketsCmd=(Get-Command Get-QOTickets); SyncCmd=(Get-Command Sync-QOTicketsFromEmail)}
+            $elevated = $false
+            $outlookInstances = @()
+            Invoke-QOTicketsEmailSyncAndRefresh @arguments
+            Assert ($script:TicketsSyncRunCounter -eq 0) 'A sync worker started while Outlook was closed'
+            $outlookInstances = @([pscustomobject]@{SessionId=$session + 1})
+            Invoke-QOTicketsEmailSyncAndRefresh @arguments
+            Assert ($script:TicketsSyncRunCounter -eq 0) 'Outlook in a different session triggered a worker'
+            $outlookInstances = @([pscustomobject]@{SessionId=$session})
+            $elevated = $true
+            Invoke-QOTicketsEmailSyncAndRefresh @arguments
+            Assert ($script:TicketsSyncRunCounter -eq 0 -and $script:TicketsLastSyncStatusMessage -match 'normally') 'Elevated unattended sync launched a worker or missed the explanation'
+            $elevated = $false
+            Invoke-QOTicketsEmailSyncAndRefresh @arguments
+            Assert ($script:TicketsSyncRunCounter -eq 1) 'Automatic sync did not resume when Outlook opened'
+            $elevated = $true
+            Invoke-QOTicketsEmailSyncAndRefresh @arguments -Force
+            Assert ($script:TicketsSyncRunCounter -eq 2) 'An explicit sync was blocked when running as administrator'
+        }
+    }
+    Check 'elevated ticket sync schedules the worker directly with the current limited user' {
+        $scheduler = New-Object -ComObject Schedule.Service
+        $scheduler.Connect()
+        $definition = $scheduler.NewTask(0)
+        $service = [pscustomobject]@{Definition=$definition}
+        $service | Add-Member ScriptMethod Connect {}
+        $service | Add-Member ScriptMethod NewTask {param($flags) $this.Definition}
+        $service | Add-Member ScriptMethod GetFolder {param($folder) $this}
+        $service | Add-Member ScriptMethod RegisterTaskDefinition {param($name,$definition,$flags,$user,$password,$logon,$acl) $this}
+        $service | Add-Member ScriptMethod Run {param($arguments)}
+        & (Get-Module Tickets.UI) {
+            param($fakeService,$fixtureDir)
+            function New-Object { param($ComObject); if ($ComObject -eq 'Schedule.Service') { $fakeService } }
+            $exe = Join-Path $PSHOME 'powershell.exe'
+            $argsText = '-NoProfile -File "C:\fixture with spaces\sync.ps1"'
+            $result = Start-QOTLimitedScheduledProcess -FilePath $exe -ArgumentString $argsText -WorkingDirectory $fixtureDir -TaskNamePrefix QOTSync
+            try {
+                $task = $fakeService.Definition
+                $action = $task.Actions.Item(1)
+                Assert ($task.Actions.Count -eq 1 -and $action.Path -eq $exe) 'Ticket sync starts an intermediate console'
+                Assert ($action.Arguments -ceq $argsText -and $action.WorkingDirectory -eq $fixtureDir) 'Worker arguments or working directory changed'
+                Assert ($task.Principal.LogonType -eq 3 -and $task.Principal.RunLevel -eq 0 -and $task.Principal.UserId -eq [Security.Principal.WindowsIdentity]::GetCurrent().Name) 'Worker must use the current interactive user at limited privileges'
+                Assert ($task.Triggers.Count -eq 1 -and -not $task.Triggers.Item(1).Enabled -and $task.Triggers.Item(1).EndBoundary -and $task.Settings.DeleteExpiredTaskAfter) 'On-demand registration needs expiry without a second launch'
+            } finally {
+                if ($result.CommandPath) { Remove-Item -LiteralPath $result.CommandPath -Force }
+            }
+        } $service $root
+    }
     Check 'ticket details preserve Unicode sender names from body files' {
         $senderName = 'Ren' + [char]0x00e9
         $bodyPath = Join-Path $root 'sender.txt'
@@ -202,6 +261,23 @@ function Send-QOTicketOutlookEmail {
             Assert ($first.Added -eq 2) "Distinct messages became $($first.Added) new tickets"
             $second = Sync-QOTicketsFromOutlook
             Assert ($second.Added -eq 0) 'Repeat sync duplicated a message'
+        }
+    }
+    Check 'a lost Outlook session produces a retryable send result without opening or minimizing Outlook' {
+        $path = Join-Path $tickets 'Disconnected.Outlook.psm1'
+        # The fixture must never attach to an Outlook instance on the test machine.
+        $source = [IO.File]::ReadAllText((Join-Path $repo 'src\Tickets\Tickets.Email.Outlook.psm1'))
+        $source = $source.Replace('[System.Runtime.InteropServices.Marshal]::GetActiveObject("Outlook.Application")', '$null')
+        [IO.File]::WriteAllText($path, $source)
+        $outlook = Import-Module $path -PassThru -DisableNameChecking
+        & $outlook {
+            function Initialize-QOTicketsCoreApi {}
+            function Get-QOTOutlookNamespace { [pscustomobject]@{Application=$null} }
+            $script:activations = 0
+            function New-Object { param($ComObject); if ($ComObject -eq 'Outlook.Application') { $script:activations++; return [pscustomobject]@{} } }
+            $result = Send-QOTicketOutlookEmail -To 'test@example.invalid' -Subject 'Fixture' -Body 'Fixture' -FromMailbox 'mail@example.invalid'
+            Assert ($script:activations -eq 0) 'Sending attempted to open or minimize an Outlook window after disconnect'
+            Assert (-not $result.Success -and $result.Note -match 'Classic Outlook is not open') 'The queue needs a retryable connection failure'
         }
     }
     Check 'ticket details never substitute or append another customer with the same subject' {

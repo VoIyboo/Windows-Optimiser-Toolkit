@@ -174,45 +174,6 @@ function Test-QOTCurrentProcessElevated {
     }
 }
 
-function New-QOTOutlookComApplication {
-    param(
-        [int]$RetryCount = 1,
-        [int]$RetryDelayMilliseconds = 1000
-    )
-
-    if ($RetryCount -lt 1) { $RetryCount = 1 }
-    if ($RetryDelayMilliseconds -lt 0) { $RetryDelayMilliseconds = 0 }
-
-    $lastError = $null
-    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
-        try {
-            $outlookApp = New-Object -ComObject Outlook.Application
-
-            # Minimize Outlook window to prevent focus-stealing
-            try {
-                $outlookApp.ActiveExplorer().WindowState = 1  # 1 = olMinimized
-            } catch {
-                # If minimizing fails, that's OK - Outlook is still running in background
-            }
-
-            return $outlookApp
-        } catch {
-            $lastError = $_.Exception
-            $message = ""
-            try { $message = [string]$lastError.Message } catch { $message = "" }
-            if ($message -match '(?i)class not registered|invalid class string') {
-                throw $lastError
-            }
-            if ($attempt -lt $RetryCount) {
-                Start-Sleep -Milliseconds $RetryDelayMilliseconds
-            }
-        }
-    }
-
-    if ($lastError) { throw $lastError }
-    throw "Unable to create Outlook COM application."
-}
-
 function Get-QOTOutlookNamespace {
     param(
         [switch]$AllowStartOutlook
@@ -268,7 +229,7 @@ function Get-QOTOutlookApplication {
         if ($activeOutlook) { return $activeOutlook }
     } catch { }
 
-    return (New-QOTOutlookComApplication -RetryCount 3 -RetryDelayMilliseconds 1200)
+    throw "Classic Outlook is not open. Open Outlook and sign in to resume sending."
 }
 
 function Get-QOTConfiguredMailboxAddresses {

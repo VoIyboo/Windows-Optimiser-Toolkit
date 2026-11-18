@@ -60,7 +60,6 @@ $script:TicketsSyncRunnerStdOutPath = ""
 $script:TicketsSyncRunnerStdErrPath = ""
 $script:TicketsSyncRunnerResultPath = ""
 $script:TicketsSyncRunnerTaskName = ""
-$script:TicketsSyncRunnerCommandPath = ""
 $script:TicketsSyncMode = ""
 $script:TicketsReplySendInProgress = $false
 $script:TicketsReplyTimeoutSeconds = 300
@@ -78,7 +77,6 @@ $script:TicketsReplyRunnerStdOutPath = ""
 $script:TicketsReplyRunnerStdErrPath = ""
 $script:TicketsReplyRunnerResultPath = ""
 $script:TicketsReplyRunnerTaskName = ""
-$script:TicketsReplyRunnerCommandPath = ""
 $script:TicketsReplyMode = ""
 $script:TicketsReplyRetryDraftId = ""
 $script:TicketsReplyQueuedSends = New-Object System.Collections.Queue
@@ -6209,35 +6207,15 @@ function ConvertTo-QOTProcessArgumentString {
     return ('-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -EncodedCommand {0}' -f $encodedCommand)
 }
 
-function ConvertTo-QOTBatchQuotedPath {
-    param([AllowNull()][string]$Value)
-
-    $pathValue = ([string]($Value + "")).Trim()
-    if ([string]::IsNullOrWhiteSpace($pathValue)) { return '""' }
-    return '"' + $pathValue.Replace('"', '') + '"'
-}
-
 function Remove-QOTLimitedScheduledProcessArtifacts {
-    param(
-        [AllowNull()][string]$TaskName,
-        [AllowNull()][string]$CommandPath
-    )
+    param([AllowNull()][string]$TaskName)
 
-    $taskValue = ([string]($TaskName + "")).Trim()
-    if (-not [string]::IsNullOrWhiteSpace($taskValue)) {
-        try {
-            $null = & schtasks.exe /Delete /TN $taskValue /F 2>$null
-        } catch { }
-    }
-
-    $commandValue = ([string]($CommandPath + "")).Trim()
-    if (-not [string]::IsNullOrWhiteSpace($commandValue)) {
-        try {
-            if (Test-Path -LiteralPath $commandValue) {
-                Remove-Item -LiteralPath $commandValue -Force -ErrorAction SilentlyContinue
-            }
-        } catch { }
-    }
+    if ([string]::IsNullOrWhiteSpace($TaskName)) { return }
+    try {
+        $service = New-Object -ComObject Schedule.Service
+        $service.Connect()
+        $service.GetFolder("\").DeleteTask($TaskName, 0)
+    } catch { }
 }
 
 function Start-QOTLimitedScheduledProcess {
@@ -6262,33 +6240,8 @@ function Start-QOTLimitedScheduledProcess {
     if ([string]::IsNullOrWhiteSpace($prefixValue)) { $prefixValue = "QOTRunner" }
 
     $taskName = "{0}-{1}" -f $prefixValue, ([guid]::NewGuid().ToString("N"))
-    $commandPath = Join-Path $env:TEMP ("{0}_{1}.cmd" -f $prefixValue, ([guid]::NewGuid().ToString("N")))
-    $exitPath = Join-Path $env:TEMP ("{0}_{1}.exit" -f $prefixValue, ([guid]::NewGuid().ToString("N")))
-
-    $quotedExe = ConvertTo-QOTBatchQuotedPath -Value $exeValue
-    $quotedWorkDir = ConvertTo-QOTBatchQuotedPath -Value $workDirValue
-    $quotedExitPath = ConvertTo-QOTBatchQuotedPath -Value $exitPath
-    $argumentValue = ([string]($ArgumentString + "")).Trim()
-    $argumentSuffix = ""
-    if (-not [string]::IsNullOrWhiteSpace($argumentValue)) {
-        $argumentSuffix = " " + $argumentValue
-    }
-    $runLine = $quotedExe + $argumentSuffix
-
-    $batchLines = @(
-        "@echo off",
-        ("cd /d " + $quotedWorkDir),
-        $runLine,
-        'set "QOT_EXIT=%ERRORLEVEL%"',
-        ("echo %QOT_EXIT%>" + $quotedExitPath),
-        ("schtasks.exe /Delete /TN " + (ConvertTo-QOTBatchQuotedPath -Value $taskName) + " /F >nul 2>&1"),
-        'del "%~f0" >nul 2>&1',
-        'exit /b %QOT_EXIT%'
-    )
 
     try {
-        $batchLines | Set-Content -LiteralPath $commandPath -Encoding ASCII -Force
-
         $service = New-Object -ComObject Schedule.Service
         $service.Connect()
         $rootFolder = $service.GetFolder("\")
@@ -6298,28 +6251,30 @@ function Start-QOTLimitedScheduledProcess {
         $taskDefinition.Principal.LogonType = 3
         $taskDefinition.Principal.RunLevel = 0
         $taskDefinition.Settings.Enabled = $true
-        $taskDefinition.Settings.Hidden = $true
         $taskDefinition.Settings.ExecutionTimeLimit = "PT10M"
         $taskDefinition.Settings.DisallowStartIfOnBatteries = $false
         $taskDefinition.Settings.StopIfGoingOnBatteries = $false
 
+        # Run only on demand. An end boundary lets Scheduler clean up if Quinn closes.
+        $now = [datetime]::UtcNow
+        $expiry = $taskDefinition.Triggers.Create(1)
+        $expiry.Enabled = $false
+        $expiry.StartBoundary = $now.ToString("s") + "Z"
+        $expiry.EndBoundary = $now.AddMinutes(11).ToString("s") + "Z"
+        $taskDefinition.Settings.DeleteExpiredTaskAfter = "PT1M"
+
         $action = $taskDefinition.Actions.Create(0)
-        $action.Path = $env:ComSpec
-        $action.Arguments = ('/d /c ' + (ConvertTo-QOTBatchQuotedPath -Value $commandPath))
+        $action.Path = $exeValue
+        $action.Arguments = [string]$ArgumentString
         $action.WorkingDirectory = $workDirValue
 
         $registeredTask = $rootFolder.RegisterTaskDefinition($taskName, $taskDefinition, 6, $null, $null, 3, $null)
         $null = $registeredTask.Run($null)
 
-        return [pscustomobject]@{
-            TaskName    = $taskName
-            CommandPath = $commandPath
-            ExitPath    = $exitPath
-        }
+        return [pscustomobject]@{ TaskName = $taskName }
     } catch {
         $failureMessage = $_.Exception.Message
-        Remove-QOTLimitedScheduledProcessArtifacts -TaskName $taskName -CommandPath $commandPath
-        try { if (Test-Path -LiteralPath $exitPath) { Remove-Item -LiteralPath $exitPath -Force -ErrorAction SilentlyContinue } } catch { }
+        Remove-QOTLimitedScheduledProcessArtifacts -TaskName $taskName
         throw ("Limited scheduled runner launch failed: " + $failureMessage)
     }
 }
@@ -6610,7 +6565,7 @@ function Clear-QOTicketsSyncExecutionState {
     )
 
     if ($RemoveRunnerFiles) {
-        foreach ($path in @($script:TicketsSyncRunnerStdOutPath, $script:TicketsSyncRunnerStdErrPath, $script:TicketsSyncRunnerResultPath, $script:TicketsSyncRunnerCommandPath)) {
+        foreach ($path in @($script:TicketsSyncRunnerStdOutPath, $script:TicketsSyncRunnerStdErrPath, $script:TicketsSyncRunnerResultPath)) {
             if ([string]::IsNullOrWhiteSpace([string]$path)) { continue }
             try {
                 if (Test-Path -LiteralPath $path) {
@@ -6618,7 +6573,7 @@ function Clear-QOTicketsSyncExecutionState {
                 }
             } catch { }
         }
-        try { Remove-QOTLimitedScheduledProcessArtifacts -TaskName $script:TicketsSyncRunnerTaskName -CommandPath $script:TicketsSyncRunnerCommandPath } catch { }
+        try { Remove-QOTLimitedScheduledProcessArtifacts -TaskName $script:TicketsSyncRunnerTaskName } catch { }
     }
 
     $script:TicketsSyncProcess = $null
@@ -6626,7 +6581,6 @@ function Clear-QOTicketsSyncExecutionState {
     $script:TicketsSyncRunnerStdErrPath = ""
     $script:TicketsSyncRunnerResultPath = ""
     $script:TicketsSyncRunnerTaskName = ""
-    $script:TicketsSyncRunnerCommandPath = ""
     $script:TicketsSyncMode = ""
     $script:TicketsSyncPowerShell = $null
     $script:TicketsSyncRunspace = $null
@@ -6713,6 +6667,26 @@ function Start-TicketsEmailSyncAsync {
         $script:TicketsSyncNextAttemptUtc = [datetime]::UtcNow.AddMinutes(1)
         Set-QOTicketsSyncStatus -StatusText $StatusText -Message "Add a monitored mailbox in Settings to enable automatic sync."
         return
+    }
+
+    if ($Automatic) {
+        # The sync worker can only attach to classic Outlook in this Windows session.
+        $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+        $outlook = Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue | Where-Object SessionId -eq $sessionId | Select-Object -First 1
+        if (-not $outlook) {
+            $script:TicketsSyncNextAttemptUtc = [datetime]::UtcNow.AddMinutes(1)
+            $script:TicketsSyncFailureCount = 0
+            $script:TicketsSyncLastFailureNote = ""
+            Set-QOTicketsSyncStatus -StatusText $StatusText -Message "Classic Outlook is not open. Automatic sync will resume when it opens."
+            return
+        }
+        if (Test-QOTProcessElevated) {
+            $script:TicketsSyncNextAttemptUtc = [datetime]::UtcNow.AddMinutes(5)
+            $script:TicketsSyncFailureCount = 0
+            $script:TicketsSyncLastFailureNote = ""
+            Set-QOTicketsSyncStatus -StatusText $StatusText -Message "Background sync requires opening Quinn normally. Click to sync now."
+            return
+        }
     }
 
     $script:TicketsEmailSyncInProgress = $true
@@ -6805,7 +6779,6 @@ function Start-TicketsEmailSyncAsync {
                 $script:TicketsSyncProcess = $null
                 $script:TicketsSyncMode = "result-file"
                 try { $script:TicketsSyncRunnerTaskName = [string]$limitedLaunch.TaskName } catch { $script:TicketsSyncRunnerTaskName = "" }
-                try { $script:TicketsSyncRunnerCommandPath = [string]$limitedLaunch.CommandPath } catch { $script:TicketsSyncRunnerCommandPath = "" }
                 Write-QOTicketsUILog ("Tickets: Elevated sync run #{0} launched as limited scheduled task for Outlook COM access." -f $runId)
             } else {
                 $script:TicketsSyncProcess = Start-Process -FilePath $exePath -ArgumentList $argumentString -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
@@ -8994,9 +8967,8 @@ function Initialize-QOTicketsUI {
     $script:TicketsReplyCompletionTickHandler = $null
     $script:TicketsReplyWatchdogTickHandler = $null
     $script:TicketsReplyQueueKickTickHandler = $null
-    try { Remove-QOTLimitedScheduledProcessArtifacts -TaskName $script:TicketsReplyRunnerTaskName -CommandPath $script:TicketsReplyRunnerCommandPath } catch { }
+    try { Remove-QOTLimitedScheduledProcessArtifacts -TaskName $script:TicketsReplyRunnerTaskName } catch { }
     $script:TicketsReplyRunnerTaskName = ""
-    $script:TicketsReplyRunnerCommandPath = ""
     $script:TicketsReplySendInProgress = $false
     $script:TicketsReplyStartUtc = [datetime]::MinValue
     try {
@@ -12451,7 +12423,7 @@ function Initialize-QOTicketsUI {
                                 }
                             } catch { }
                         }
-                        foreach ($path in @($script:TicketsReplyRunnerPayloadPath, $script:TicketsReplyRunnerStdOutPath, $script:TicketsReplyRunnerStdErrPath, $script:TicketsReplyRunnerResultPath, $script:TicketsReplyRunnerCommandPath)) {
+                        foreach ($path in @($script:TicketsReplyRunnerPayloadPath, $script:TicketsReplyRunnerStdOutPath, $script:TicketsReplyRunnerStdErrPath, $script:TicketsReplyRunnerResultPath)) {
                             if ([string]::IsNullOrWhiteSpace([string]$path)) { continue }
                             try {
                                 if (Test-Path -LiteralPath $path) {
@@ -12459,7 +12431,7 @@ function Initialize-QOTicketsUI {
                                 }
                             } catch { }
                         }
-                        try { Remove-QOTLimitedScheduledProcessArtifacts -TaskName $script:TicketsReplyRunnerTaskName -CommandPath $script:TicketsReplyRunnerCommandPath } catch { }
+                        try { Remove-QOTLimitedScheduledProcessArtifacts -TaskName $script:TicketsReplyRunnerTaskName } catch { }
                     } elseif ($script:TicketsReplyPowerShell) {
                         try { $script:TicketsReplyPowerShell.Stop() } catch { }
                         try { $script:TicketsReplyPowerShell.Dispose() } catch { }
@@ -12478,7 +12450,6 @@ function Initialize-QOTicketsUI {
                 $script:TicketsReplyRunnerStdErrPath = ""
                 $script:TicketsReplyRunnerResultPath = ""
                 $script:TicketsReplyRunnerTaskName = ""
-                $script:TicketsReplyRunnerCommandPath = ""
                 $script:TicketsReplyMode = ""
                 $script:TicketsReplyRetryDraftId = ""
                 $script:TicketsReplyAsyncResult = $null
@@ -12643,7 +12614,6 @@ function Initialize-QOTicketsUI {
             $script:TicketsReplyRunnerStdErrPath = ""
             $script:TicketsReplyRunnerResultPath = ""
             $script:TicketsReplyRunnerTaskName = ""
-            $script:TicketsReplyRunnerCommandPath = ""
             $script:TicketsReplyMode = ""
             $script:TicketsReplyPowerShell = $null
             $script:TicketsReplyRunspace = $null
@@ -12698,12 +12668,10 @@ function Initialize-QOTicketsUI {
                     $limitedLaunch = & $replySendStartLimitedProcessCmd -FilePath $replyWorkerExePath -ArgumentString $argumentString -WorkingDirectory $workingDirectory -TaskNamePrefix "QOTReply"
                     $script:TicketsReplyProcess = $null
                     try { $script:TicketsReplyRunnerTaskName = [string]$limitedLaunch.TaskName } catch { $script:TicketsReplyRunnerTaskName = "" }
-                    try { $script:TicketsReplyRunnerCommandPath = [string]$limitedLaunch.CommandPath } catch { $script:TicketsReplyRunnerCommandPath = "" }
                     try { & $replySendWriteLogCmd ("Tickets: Elevated reply worker launched as limited scheduled task. Ticket='{0}'." -f $ticketId) } catch { }
                 } else {
                     $script:TicketsReplyProcess = Start-Process -FilePath $replyWorkerExePath -ArgumentList $argumentString -WorkingDirectory $workingDirectory -WindowStyle Hidden -PassThru
                     $script:TicketsReplyRunnerTaskName = ""
-                    $script:TicketsReplyRunnerCommandPath = ""
                     try { & $replySendWriteLogCmd ("Tickets: Hidden reply worker launched. Ticket='{0}'." -f $ticketId) } catch { }
                 }
 
@@ -13104,7 +13072,7 @@ function Initialize-QOTicketsUI {
                 } catch { }
                 try {
                     if ([string]::Equals([string]$script:TicketsReplyMode, "result-file", [System.StringComparison]::OrdinalIgnoreCase)) {
-                        try { Remove-QOTLimitedScheduledProcessArtifacts -TaskName $script:TicketsReplyRunnerTaskName -CommandPath $script:TicketsReplyRunnerCommandPath } catch { }
+                        try { Remove-QOTLimitedScheduledProcessArtifacts -TaskName $script:TicketsReplyRunnerTaskName } catch { }
                     }
                 } catch { }
                 $script:TicketsReplyCompletionTimer = $null
@@ -13120,7 +13088,6 @@ function Initialize-QOTicketsUI {
                 $script:TicketsReplyRunnerStdErrPath = ""
                 $script:TicketsReplyRunnerResultPath = ""
                 $script:TicketsReplyRunnerTaskName = ""
-                $script:TicketsReplyRunnerCommandPath = ""
                 $script:TicketsReplyMode = ""
                 $script:TicketsReplyRetryDraftId = ""
                 $script:TicketsReplySendInProgress = $false

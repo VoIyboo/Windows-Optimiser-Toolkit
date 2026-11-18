@@ -3563,9 +3563,7 @@ function Set-QOTWindowSafetyDefaults {
 
     $Window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterScreen
     $Window.WindowState = [System.Windows.WindowState]::Normal
-    $Window.Visibility = [System.Windows.Visibility]::Visible
     $Window.ShowInTaskbar = $true
-    $Window.Opacity = 1
 
     $virtualLeft = [System.Windows.SystemParameters]::VirtualScreenLeft
     $virtualTop = [System.Windows.SystemParameters]::VirtualScreenTop
@@ -3582,137 +3580,6 @@ function Set-QOTWindowSafetyDefaults {
         $height = if ($Window.Height -gt 0) { $Window.Height } else { 800 }
         $Window.Left = $virtualLeft + (($virtualWidth - $width) / 2)
         $Window.Top = $virtualTop + (($virtualHeight - $height) / 2)
-    }
-}
-
-function Invoke-QOTSplashFadeOut {
-    param(
-        [Parameter(Mandatory)]
-        [System.Windows.Window]$SplashWindow,
-
-        [int]$DurationMs = 350,
-        [switch]$Wait
-    )
-
-    $startupTraceSafe = {
-        param(
-            [string]$Message,
-            [string]$Level = "INFO"
-        )
-
-        try {
-            Write-QOTStartupTrace $Message $Level
-            return
-        } catch { }
-
-        try { Write-QLog ("[STARTUP] {0}" -f $Message) $Level } catch { }
-    }.GetNewClosure()
-
-    try {
-        if (-not $SplashWindow.Dispatcher.CheckAccess()) {
-            $SplashWindow.Dispatcher.Invoke([action]{
-                Invoke-QOTSplashFadeOut -SplashWindow $SplashWindow -DurationMs $DurationMs -Wait:$Wait
-            }.GetNewClosure())
-            return
-        }
-
-        & $startupTraceSafe ("Fading out splash window over {0} ms" -f $DurationMs)
-
-        $fadeCompleted = $false
-        $waitFrame = $null
-        $waitTimer = $null
-
-        $animation = New-Object System.Windows.Media.Animation.DoubleAnimation
-        $animation.From = if ($SplashWindow.Opacity -gt 0) { [double]$SplashWindow.Opacity } else { 1.0 }
-        $animation.To = 0.0
-        $animation.Duration = [System.Windows.Duration]::new([System.TimeSpan]::FromMilliseconds([Math]::Max(50, $DurationMs)))
-        $animation.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::Stop
-
-        $animation.Add_Completed({
-            try {
-                $SplashWindow.Opacity = 0
-                $SplashWindow.Close()
-                & $startupTraceSafe "Splash window fade-out completed and window closed"
-            }
-            catch {
-                & $startupTraceSafe ("Splash close after fade failed: {0}" -f $_.Exception.Message) 'WARN'
-            }
-            finally {
-                $fadeCompleted = $true
-                if ($waitFrame) {
-                    try { $waitFrame.Continue = $false } catch { }
-                }
-                if ($waitTimer) {
-                    try { $waitTimer.Stop() } catch { }
-                }
-            }
-        }.GetNewClosure())
-
-        $SplashWindow.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $animation)
-
-        if ($Wait) {
-            $waitFrame = New-Object System.Windows.Threading.DispatcherFrame
-            $waitTimer = [System.Windows.Threading.DispatcherTimer]::new()
-            $waitTimer.Interval = [System.TimeSpan]::FromMilliseconds([Math]::Max(500, ($DurationMs + 1000)))
-            $waitTimer.Add_Tick({
-                param($sender, $args)
-                try { $sender.Stop() } catch { }
-                if (-not $fadeCompleted) {
-                    & $startupTraceSafe "Splash fade wait timed out; forcing close." 'WARN'
-                    try {
-                        $SplashWindow.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
-                    } catch { }
-                    try { $SplashWindow.Opacity = 0 } catch { }
-                    try { $SplashWindow.Close() } catch { }
-                    $fadeCompleted = $true
-                }
-                try { $waitFrame.Continue = $false } catch { }
-            }.GetNewClosure())
-            try { Register-QOTMainWindowTimer -Timer $waitTimer } catch { }
-            $waitTimer.Start()
-            [System.Windows.Threading.Dispatcher]::PushFrame($waitFrame)
-        }
-    }
-    catch {
-        & $startupTraceSafe ("Splash fade-out failed, closing immediately: {0}" -f $_.Exception.Message) 'WARN'
-        try { $SplashWindow.Close() } catch { }
-    }
-}
-
-function Invoke-QOTMainWindowFadeIn {
-    param(
-        [Parameter(Mandatory)]
-        [System.Windows.Window]$Window,
-
-        [int]$DurationMs = 260,
-        [double]$StartOpacity = 0.0
-    )
-
-    try {
-        if (-not $Window.Dispatcher.CheckAccess()) {
-            $Window.Dispatcher.Invoke([action]{
-                Invoke-QOTMainWindowFadeIn -Window $Window -DurationMs $DurationMs -StartOpacity $StartOpacity
-            }.GetNewClosure())
-            return
-        }
-
-        $safeStart = [Math]::Max(0.0, [Math]::Min(1.0, [double]$StartOpacity))
-        $Window.Opacity = $safeStart
-
-        $animation = New-Object System.Windows.Media.Animation.DoubleAnimation
-        $animation.From = $safeStart
-        $animation.To = 1.0
-        $animation.Duration = [System.Windows.Duration]::new([System.TimeSpan]::FromMilliseconds([Math]::Max(80, $DurationMs)))
-        $animation.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::Stop
-        $animation.Add_Completed({
-            try {
-                $Window.Opacity = 1.0
-            } catch { }
-        })
-        $Window.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $animation)
-    }
-    catch {
-        try { $Window.Opacity = 1.0 } catch { }
     }
 }
 
@@ -3878,6 +3745,14 @@ function Start-QOTMainWindow {
     Initialize-QOTTaskbarIdentity -Window $window
     try {
         $window.Add_SourceInitialized({
+            param($sender,$eventArgs)
+            # Match the native surface clear to the theme before WPF paints.
+            if ($sender.Background -is [System.Windows.Media.SolidColorBrush]) {
+                $source = [System.Windows.PresentationSource]::FromVisual($sender)
+                if ($source -and $source.CompositionTarget) {
+                    $source.CompositionTarget.BackgroundColor = $sender.Background.Color
+                }
+            }
             try {
                 Initialize-QOTTaskbarIdentity -Window $window
             } catch { }
@@ -4250,22 +4125,6 @@ function Start-QOTMainWindow {
         }
 
         & $syncRailNavigationSafe
-    }
-
-    if (-not $WarmupOnly -and $appCreatedHere -and (-not $SplashWindow)) {
-        try {
-            Write-QOTStartupTrace "Early MainWindow reveal before feature module wiring"
-            Set-QOTWindowSafetyDefaults -Window $window
-            if (-not $window.IsVisible -or $window.Visibility -ne [System.Windows.Visibility]::Visible) {
-                $window.Show()
-                # Don't activate - let user continue working
-                # $window.Activate() | Out-Null
-                Write-QOTWindowVisibilityDiagnostics -Window $window -Prefix "MainWindow early-show"
-            }
-        }
-        catch {
-            Write-QOTStartupTrace ("Early MainWindow reveal failed: {0}" -f $_.Exception.Message) 'WARN'
-        }
     }
 
     # ------------------------------------------------------------
@@ -4817,61 +4676,9 @@ function Start-QOTMainWindow {
         return
     }
     try {
-        $shouldFadeInMainWindow = [bool]$SplashWindow
-        if ($shouldFadeInMainWindow) {
-            try { $window.Opacity = 0.0 } catch { }
-        }
-
+        Set-QOTWindowSafetyDefaults -Window $window
         Write-QOTWindowVisibilityDiagnostics -Window $window -Prefix "MainWindow pre-show"
-        
-        if ($appCreatedHere) {
-            if ($shouldFadeInMainWindow) {
-                Write-QOTStartupTrace "Deferring MainWindow.Show() until splash fade-out completes"
-                Set-QOTWindowSafetyDefaults -Window $window
-                try { $window.Opacity = 0.0 } catch { }
-            }
-            else {
-                Write-QOTStartupTrace "Calling MainWindow.Show()"
-                $window.Show()
-                # Don't activate - let user continue working
-                # $window.Activate() | Out-Null
-                Write-QOTWindowVisibilityDiagnostics -Window $window -Prefix "MainWindow post-show"
-                Set-QOTWindowSafetyDefaults -Window $window
-                if (-not $window.IsVisible -or $window.Visibility -ne [System.Windows.Visibility]::Visible) {
-                    Write-QOTStartupTrace "MainWindow not visible after Show; re-showing with safety defaults" 'WARN'
-                    $window.Show()
-                    # Don't activate - let user continue working
-                    # $window.Activate() | Out-Null
-                    Write-QOTWindowVisibilityDiagnostics -Window $window -Prefix "MainWindow post-safety-show"
-                }
-            }
-        }
-        else {
-            Write-QOTStartupTrace "Skipping pre-show because existing WPF application path uses MainWindow.ShowDialog()"
-            # Keep the window hidden for ShowDialog(); only apply safe geometry/state.
-            $window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterScreen
-            $window.WindowState = [System.Windows.WindowState]::Normal
-            $window.ShowInTaskbar = $true
-            $virtualLeft = [System.Windows.SystemParameters]::VirtualScreenLeft
-            $virtualTop = [System.Windows.SystemParameters]::VirtualScreenTop
-            $virtualWidth = [System.Windows.SystemParameters]::VirtualScreenWidth
-            $virtualHeight = [System.Windows.SystemParameters]::VirtualScreenHeight
-            $hasInvalidLeft = [double]::IsNaN($window.Left) -or [double]::IsInfinity($window.Left)
-            $hasInvalidTop = [double]::IsNaN($window.Top) -or [double]::IsInfinity($window.Top)
-            $hasOffscreenLeft = ($window.Left -lt $virtualLeft) -or ($window.Left -gt ($virtualLeft + $virtualWidth))
-            $hasOffscreenTop = ($window.Top -lt $virtualTop) -or ($window.Top -gt ($virtualTop + $virtualHeight))
-            if ($hasInvalidLeft -or $hasInvalidTop -or $hasOffscreenLeft -or $hasOffscreenTop) {
-                $width = if ($window.Width -gt 0) { $window.Width } else { 1200 }
-                $height = if ($window.Height -gt 0) { $window.Height } else { 800 }
-                $window.Left = $virtualLeft + (($virtualWidth - $width) / 2)
-                $window.Top = $virtualTop + (($virtualHeight - $height) / 2)
-            }
-            try { $window.Visibility = [System.Windows.Visibility]::Hidden } catch { }
-            if ($shouldFadeInMainWindow) {
-                try { $window.Opacity = 0.0 } catch { }
-            }
-            Write-QOTWindowVisibilityDiagnostics -Window $window -Prefix "MainWindow pre-dialog"
-        }
+
         if (-not $app) {
             throw "WPF Application instance is null before Run()."
         }
@@ -4915,24 +4722,21 @@ function Start-QOTMainWindow {
                 Write-QOTStartupTrace ("Failed to attach main window native close hook: {0}" -f $_.Exception.Message) 'WARN'
             }
         })
-        $window.Add_ContentRendered({
-            Write-QOTStartupTrace "MainWindow lifecycle event fired: ContentRendered"
-            if ($shouldFadeInMainWindow) {
-                try {
-                    $startOpacity = 0.0
-                    try { $startOpacity = [double]$window.Opacity } catch { $startOpacity = 0.0 }
-                    Invoke-QOTMainWindowFadeIn -Window $window -DurationMs 260 -StartOpacity $startOpacity
-                    Write-QOTStartupTrace "MainWindow fade-in started after splash."
-                }
-                catch {
-                    Write-QOTStartupTrace ("MainWindow fade-in failed: {0}" -f $_.Exception.Message) 'WARN'
-                    try { $window.Opacity = 1.0 } catch { }
-                }
-                finally {
-                    $shouldFadeInMainWindow = $false
-                }
-            }
-        })
+        # Keep the startup widget in place until the first full main-window
+        # frame is on screen. Run() and ShowDialog() each show the window once.
+        if ($SplashWindow) {
+            $closeSplash = [System.EventHandler]{ if ($SplashWindow.IsVisible) { $SplashWindow.Close() } }.GetNewClosure()
+            $window.Add_Closed($closeSplash)
+            $fade = [System.Windows.Media.Animation.DoubleAnimation]::new()
+            $fade.To = 0
+            $fade.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(350))
+            $fade.Add_Completed($closeSplash)
+            $window.Add_ContentRendered({
+                if (-not $SplashWindow.IsVisible) { return }
+                try { $SplashWindow.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fade) }
+                catch { $SplashWindow.Close() }
+            }.GetNewClosure())
+        }
         $window.Add_Closing({
             param($sender, $eventArgs)
             $closeReason = if ($script:MainWindowCloseReason) { $script:MainWindowCloseReason } else { "User/System close request" }
@@ -5008,44 +4812,6 @@ function Start-QOTMainWindow {
             }
         })
 
-        if ($appCreatedHere -and -not $shouldFadeInMainWindow) {
-            Write-QOTStartupTrace "Forcing MainWindow.Show() immediately before Run"
-            $window.Show()
-            # Don't activate - let user continue working
-            # $window.Activate() | Out-Null
-            Write-QOTWindowVisibilityDiagnostics -Window $window -Prefix "MainWindow pre-run forced-show"
-        }
-        elseif ($appCreatedHere -and $shouldFadeInMainWindow) {
-            Write-QOTStartupTrace "Skipping pre-run forced-show; waiting for splash fade-out first"
-        }
-
-        if ($SplashWindow) {
-            try {
-                Write-QOTStartupTrace "Starting splash fade-out before main window reveal"
-                Invoke-QOTSplashFadeOut -SplashWindow $SplashWindow -DurationMs 350 -Wait
-            }
-            catch {
-                Write-QOTStartupTrace ("Failed to fade splash window cleanly: {0}" -f $_.Exception.Message) 'WARN'
-                try { $SplashWindow.Close() } catch { }
-            }
-        }
-
-        if ($appCreatedHere -and $shouldFadeInMainWindow) {
-            Write-QOTStartupTrace "Showing MainWindow after splash fade-out"
-            $window.Show()
-            # Don't activate - let user continue working
-            # $window.Activate() | Out-Null
-            Write-QOTWindowVisibilityDiagnostics -Window $window -Prefix "MainWindow post-splash-show"
-            try {
-                Invoke-QOTMainWindowFadeIn -Window $window -DurationMs 260 -StartOpacity 0.0
-                Write-QOTStartupTrace "MainWindow fade-in started."
-            } catch {
-                Write-QOTStartupTrace ("MainWindow fade-in start failed: {0}" -f $_.Exception.Message) 'WARN'
-                try { $window.Opacity = 1.0 } catch { }
-            }
-            $shouldFadeInMainWindow = $false
-        }
-
         if ($appCreatedHere) {
             Write-QOTStartupTrace "Entering app.Run(mainWindow)"
             try {
@@ -5061,12 +4827,6 @@ function Start-QOTMainWindow {
         }
         else {
             Write-QOTStartupTrace "Using existing WPF application run loop; attempting MainWindow.ShowDialog()"
-            try {
-                if ($window.IsVisible -or $window.Visibility -ne [System.Windows.Visibility]::Hidden) {
-                    try { $window.Hide() } catch { $window.Visibility = [System.Windows.Visibility]::Hidden }
-                }
-            } catch { }
-
             $showDialogCompleted = $false
             $showDialogStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             try {
@@ -5122,6 +4882,10 @@ function Start-QOTMainWindow {
         Write-QOTStartupTrace ("MainWindow show failed.`n{0}" -f $errorDetail) 'ERROR'
         try { Write-QLog ("MainWindow show failed.`n{0}" -f $errorDetail) "ERROR" } catch { }
         throw
+    }
+    finally {
+        # ShowDialog can return before the splash fade has completed.
+        if ($SplashWindow -and $SplashWindow.IsVisible) { $SplashWindow.Close() }
     }
 
     if ($PassThru) { return $window }

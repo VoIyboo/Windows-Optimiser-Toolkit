@@ -44,9 +44,10 @@ if (-not $VerboseStartup) {
 
 Write-Host ("Launching local toolkit from: {0}" -f $root)
 Write-Host ("Intro log: {0}" -f $introLog)
-$startedProcess = Start-Process -FilePath $psExe -ArgumentList $args -WorkingDirectory $root -WindowStyle Hidden -PassThru
-if (-not $startedProcess) {
-    throw "Failed to start the intro process."
-}
+$startInfo = [Diagnostics.ProcessStartInfo]::new($psExe, ($args -join ' '))
+$startInfo.WorkingDirectory = $root
+$startInfo.UseShellExecute = $false
+$startInfo.CreateNoWindow = $true
+[Diagnostics.Process]::Start($startInfo).Dispose()
 
 

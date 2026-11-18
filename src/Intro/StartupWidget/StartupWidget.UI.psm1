@@ -109,22 +109,13 @@ function Show-QOTStartupWidget {
     if (-not $Window) { return }
 
     try {
-        # Show fully rendered right away so it can cleanly replace the bootstrap
-        # loader without a second half-fade or visual blink.
-        $Window.Opacity = 1
+        # WPF measures the auto-sized window on Show. Keep that first layout
+        # transparent until the widget is at its final screen position.
+        $Window.Opacity = 0
         $Window.Show()
-        try {
-            $Window.Topmost = $true
-            $Window.Activate() | Out-Null
-            $Window.Focus() | Out-Null
-        }
-        catch { }
-
-        # Position widget in bottom-right corner before fading in
-        $Window.Dispatcher.Invoke({
-            Move-QOTStartupWidgetToBottomRight -Window $Window
-        }, [System.Windows.Threading.DispatcherPriority]::Input) | Out-Null
         $Window.UpdateLayout()
+        Move-QOTStartupWidgetToBottomRight -Window $Window
+        $Window.Opacity = 1
         $Window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render) | Out-Null
 
         # Auto-disable Topmost after 3 seconds

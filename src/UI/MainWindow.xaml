@@ -1786,6 +1786,9 @@
                                         </GroupBox.Header>
                                         <StackPanel Margin="4">
 
+                                            <TextBlock Text="Some Start menu, taskbar and right-click menu changes take effect at your next sign-in."
+                                                       Foreground="{StaticResource TextSubtle}"
+                                                       TextWrapping="Wrap" Margin="4,0,4,6" />
                                             <CheckBox x:Name="CbSectionStartMenuRecommendations"
                                                       Tag="SectionSelector"
                                                       Style="{StaticResource SectionHeaderCheckBoxStyle}"
