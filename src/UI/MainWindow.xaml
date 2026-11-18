@@ -904,6 +904,7 @@
             <Grid Grid.Row="1" Margin="10">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="56" />
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="10" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
@@ -914,7 +915,6 @@
                     BorderThickness="1"
                     CornerRadius="10"
                     Padding="4,6">
-                <Grid x:Name="RailShellGrid">
                     <ScrollViewer VerticalScrollBarVisibility="Disabled"
                                   HorizontalScrollBarVisibility="Disabled"
                                   Focusable="False">
@@ -1044,14 +1044,14 @@
                         </Border>
                         </StackPanel>
                     </ScrollViewer>
+            </Border>
 
-                    <Border x:Name="TicketsRailSubmenu"
+                    <Border Grid.Column="1"
+                            x:Name="TicketsRailSubmenu"
                             Visibility="Collapsed"
-                            Width="38"
-                            HorizontalAlignment="Center"
+                            Width="40"
                             VerticalAlignment="Top"
-                            Margin="0,0,0,0"
-                            Panel.ZIndex="30"
+                            Margin="4,6,0,0"
                             Background="#08111F"
                             BorderBrush="#20314B"
                             BorderThickness="1"
@@ -1093,10 +1093,8 @@
                             </Button>
                         </StackPanel>
                     </Border>
-                </Grid>
-            </Border>
 
-            <ContentControl Grid.Column="2" x:Name="MainContentHost">
+            <ContentControl Grid.Column="3" x:Name="MainContentHost">
             <TabControl x:Name="MainTabControl"
                         Background="#0F172A"
                         BorderBrush="#111827"
@@ -3107,6 +3105,28 @@
                         </DataGridTemplateColumn>
                     </DataGrid.Columns>
                 </DataGrid>
+
+                <TextBlock x:Name="TicketsEmptyText"
+                           Grid.Row="0" Margin="24" Text="Loading tickets..."
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextAlignment="Center" TextWrapping="Wrap"
+                           Foreground="{StaticResource TextSubtle}" IsHitTestVisible="False">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Visibility" Value="Collapsed" />
+                            <Style.Triggers>
+                                <MultiDataTrigger>
+                                    <MultiDataTrigger.Conditions>
+                                        <Condition Binding="{Binding ElementName=TicketsGrid, Path=HasItems}" Value="False" />
+                                        <Condition Binding="{Binding ElementName=TicketsGrid, Path=Visibility}" Value="Visible" />
+                                        <Condition Binding="{Binding ElementName=TicketsStartupErrorPanel, Path=Visibility}" Value="Collapsed" />
+                                    </MultiDataTrigger.Conditions>
+                                    <Setter Property="Visibility" Value="Visible" />
+                                </MultiDataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
 
                 <Border x:Name="TicketsStartupErrorPanel"
                         Grid.Row="0"

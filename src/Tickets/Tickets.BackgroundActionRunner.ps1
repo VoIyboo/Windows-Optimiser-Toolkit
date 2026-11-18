@@ -80,7 +80,7 @@ try {
 
     Import-Module -Name $coreModulePath -Global -Force -ErrorAction Stop -WarningAction SilentlyContinue
 
-    $payloadRaw = [string](Get-Content -LiteralPath $PayloadPath -Raw -ErrorAction Stop)
+    $payloadRaw = [IO.File]::ReadAllText($PayloadPath)
     if ([string]::IsNullOrWhiteSpace($payloadRaw)) {
         throw "Background action payload was empty."
     }
@@ -112,7 +112,9 @@ try {
                 if ($ticket.Count -gt 0) { $ticket = $ticket[0] } else { $ticket = $null }
             }
 
-            $queueResult = Queue-QOTTicketPendingReply -TicketId $ticketId -Subject $subject -Body $body -DraftId $draftId -Ticket $ticket
+            $queueParams = @{ TicketId = $ticketId; Subject = $subject; Body = $body; DraftId = $draftId; Ticket = $ticket }
+            if ($payload.PSObject.Properties['ExpectedRoute']) { $queueParams.ExpectedRoute = $payload.ExpectedRoute }
+            $queueResult = Queue-QOTTicketPendingReply @queueParams
             $note = "Reply queued."
             $duplicateSuppressed = $false
             try { if ($queueResult.PSObject.Properties.Name -contains "DuplicateSuppressed") { $duplicateSuppressed = [bool]$queueResult.DuplicateSuppressed } } catch { $duplicateSuppressed = $false }

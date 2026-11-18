@@ -136,7 +136,6 @@ $script:TicketsDeleteNoteHandler = $null
 $script:TicketsComposeModeInternalHandler = $null
 $script:TicketsComposeModeReplyHandler = $null
 $script:TicketsFilterButtonHandler = $null
-$script:TicketsSyncStatusClickHandler = $null
 $script:TicketsSyncWorkerTickHandler = $null
 $script:TicketsOpenPulseTimer = $null
 $script:TicketsUndeleteHandler = $null
@@ -151,7 +150,6 @@ $script:TicketsOpenMenuItemHandler = $null
 $script:TicketsOpenFromContextCmd = $null
 $script:TicketsActiveTicketId = ""
 $script:TicketsOptimisticRepliesByTicketId = @{}
-$script:TicketsComposeModeByTicketId = @{}
 
 $script:TicketsFileWatcher = $null
 $script:TicketsFileWatcherEvents = @()
@@ -175,15 +173,11 @@ $script:TicketsFilterSortPriorityMenuItem = $null
 $script:TicketsFilterSortNewestMenuItem = $null
 $script:TicketsFilterSortOldestMenuItem = $null
 $script:TicketsFilterAssigneeMenuItem = $null
-$script:TicketsFilterAssigneeAllMenuItem = $null
-$script:TicketsFilterAssigneeUnassignedMenuItem = $null
-$script:TicketsFilterAssigneeDynamicMenuItems = @()
 $script:TicketsFilterCheckboxHandler = $null
 $script:TicketsFilterStatusCheckedHandler = $null
 $script:TicketsFilterStatusUncheckedHandler = $null
-$script:TicketsFilterStatusClickHandler = $null
 $script:TicketsFilterMenuClosedHandler = $null
-$script:TicketsWindowClosingHandler = $null
+$script:TicketsWindowClosedHandler = $null
 $script:AllTickets = $null
 $script:TicketsFilteredItems = $null
 $script:TicketsLoadedStoreWriteUtc = [datetime]::MinValue
@@ -200,7 +194,7 @@ $script:ShowClosed = $true
 $script:ShowDeleted = $false
 $script:TicketsSortMode = "Priority"
 $script:TicketsAssigneeFilter = "All"
-$script:TicketsComposeMode = "Reply"
+$script:TicketsComposeState = @{ Mode = "Reply"; ByTicketId = @{} }
 
 function Write-QOTicketsUILog {
     param(
@@ -303,7 +297,7 @@ function Unregister-QOTicketEventHandlers {
     }
 
     $removedCount = 0
-    foreach ($entry in @($script:TicketsRegisteredHandlers)) {
+    foreach ($entry in $script:TicketsRegisteredHandlers) {
         if (-not $entry -or -not $entry.Target -or -not $entry.Handler) { continue }
 
         try {
@@ -1620,18 +1614,6 @@ function Get-QOTicketContactInitials {
     return "--"
 }
 
-function Get-QOTicketFirstEmailFromText {
-    param([AllowNull()][string]$Value)
-
-    $text = ([string]($Value + "")).Trim()
-    if ([string]::IsNullOrWhiteSpace($text)) { return "" }
-
-    $match = [regex]::Match($text, '(?i)([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})')
-    if (-not $match.Success) { return "" }
-
-    return ([string]$match.Groups[1].Value).Trim()
-}
-
 function Resolve-QOTicketBodyPath {
     param(
         [AllowNull()]$Ticket,
@@ -1841,13 +1823,13 @@ function Get-QOTicketDisplayBodyInfo {
 function Test-QOTicketEmailIsMonitoredMailbox {
     param([AllowNull()][string]$EmailAddress)
 
-    $email = (Get-QOTicketFirstEmailFromText -Value $EmailAddress).Trim().ToLowerInvariant()
+    $email = Resolve-QOTicketEmailAddress -Value $EmailAddress
     if ([string]::IsNullOrWhiteSpace($email)) { return $false }
 
     try {
         if (-not (Get-Command Get-QOTMonitoredMailboxAddresses -ErrorAction SilentlyContinue)) { return $false }
         foreach ($mailbox in @(Get-QOTMonitoredMailboxAddresses)) {
-            $candidate = (Get-QOTicketFirstEmailFromText -Value ([string]($mailbox + ""))).Trim().ToLowerInvariant()
+            $candidate = Resolve-QOTicketEmailAddress -Value $mailbox
             if (-not [string]::IsNullOrWhiteSpace($candidate) -and $candidate -eq $email) {
                 return $true
             }
@@ -1888,39 +1870,14 @@ function Get-QOTicketSenderFallbackInfo {
         }
     }
 
-    $emailMatches = @(
-        [regex]::Match($bodyText, '(?im)^\s*From:\s*(?<name>[^<\r\n]+?)\s*<(?<email>[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})>'),
-        [regex]::Match($bodyText, '(?im)^\s*From:\s*(?<email>[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})\b'),
-        [regex]::Match($bodyText, '(?im)^\s*Email:\s*(?<email>[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})\b')
-    )
-
-    foreach ($match in $emailMatches) {
-        if (-not $match.Success) { continue }
-        try {
-            $email = ([string]$match.Groups['email'].Value).Trim()
-            if (-not [string]::IsNullOrWhiteSpace($email)) {
-                $result.SenderEmail = $email
-                break
-            }
-        } catch { }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($result.SenderEmail)) {
-        $anyEmail = Get-QOTicketFirstEmailFromText -Value $bodyText
-        if (-not [string]::IsNullOrWhiteSpace($anyEmail)) {
-            $result.SenderEmail = $anyEmail
+    foreach ($header in [regex]::Matches($bodyText, '(?im)^[ \t]*(?:From|Email):[ \t]*(?<value>[^\r\n]+)')) {
+        $value = $header.Groups['value'].Value.Trim()
+        $address = Resolve-QOTicketEmailAddress -Value $value
+        if ($address) {
+            $result.SenderEmail = $address
+            $result.SenderName = [Net.Mail.MailAddress]::new($value).DisplayName
+            break
         }
-    }
-
-    foreach ($match in $emailMatches) {
-        if (-not $match.Success) { continue }
-        try {
-            $name = ([string]$match.Groups['name'].Value).Trim(' ', '"', "'", '<', '>')
-            if (-not [string]::IsNullOrWhiteSpace($name)) {
-                $result.SenderName = $name
-                break
-            }
-        } catch { }
     }
 
     if ([string]::IsNullOrWhiteSpace($result.SenderName)) {
@@ -1939,7 +1896,7 @@ function Get-QOTicketSenderFallbackInfo {
         foreach ($propName in @("RequesterEmail", "RequestEmail", "CustomerEmail", "ContactEmail", "EmailAddress", "EmailTo")) {
             try {
                 if (-not ($Ticket.PSObject.Properties.Name -contains $propName)) { continue }
-                $candidate = Get-QOTicketFirstEmailFromText -Value ([string]($Ticket.$propName + ""))
+                $candidate = Resolve-QOTicketEmailAddress -Value $Ticket.$propName
                 if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
                 if ($propName -eq "EmailTo" -and (Test-QOTicketEmailIsMonitoredMailbox -EmailAddress $candidate)) { continue }
                 $result.SenderEmail = $candidate
@@ -2192,15 +2149,6 @@ function Get-QOTicketsFilterState {
         $script:TicketsFilterState = Get-QOTicketsDefaultFilterState
     }
 
-    foreach ($prop in @("ShowOpen", "ShowClosed", "ShowDeleted", "SortMode", "AssigneeFilter")) {
-        if ($script:TicketsFilterState.PSObject.Properties.Name -notcontains $prop) {
-            $script:TicketsFilterState | Add-Member -NotePropertyName $prop -NotePropertyValue (Get-QOTicketsDefaultFilterState.$prop) -Force
-        }
-        if ($null -eq $script:TicketsFilterState.$prop) {
-            $script:TicketsFilterState.$prop = Get-QOTicketsDefaultFilterState.$prop
-        }
-    }
-
     # Backward compatibility with older persisted setting.
     if ($script:TicketsFilterState.PSObject.Properties.Name -contains "SortPriorityHighToLow" -and
         $script:TicketsFilterState.PSObject.Properties.Name -notcontains "SortMode") {
@@ -2209,6 +2157,16 @@ function Get-QOTicketsFilterState {
         $legacySortMode = if ($legacyPrioritySort) { "Priority" } else { "Newest" }
         $script:TicketsFilterState | Add-Member -NotePropertyName SortMode -NotePropertyValue $legacySortMode -Force
     }
+
+    foreach ($prop in @("ShowOpen", "ShowClosed", "ShowDeleted", "SortMode", "AssigneeFilter")) {
+        if ($script:TicketsFilterState.PSObject.Properties.Name -notcontains $prop) {
+            $script:TicketsFilterState | Add-Member -NotePropertyName $prop -NotePropertyValue ($script:TicketsFilterDefaults.$prop) -Force
+        }
+        if ($null -eq $script:TicketsFilterState.$prop) {
+            $script:TicketsFilterState.$prop = $script:TicketsFilterDefaults.$prop
+        }
+    }
+
 
     try {
         if (-not (Get-Command Get-QOTicketListViewSettings -ErrorAction SilentlyContinue)) {
@@ -2300,6 +2258,70 @@ function Set-QOTicketsFilterRuntimeState {
     $script:TicketsAssigneeFilter = Normalize-QOTicketsAssigneeFilterValue -Value $AssigneeFilter
     if ($Grid) {
         $script:TicketsGrid = $Grid
+    }
+}
+
+function Update-QOTicketsFilterSelection {
+    param([bool]$Save = $false, [string]$SortMode, [string]$Assignee)
+
+    $open = $script:TicketsFilterOpenCheckbox
+    $closed = $script:TicketsFilterClosedCheckbox
+    $deleted = $script:TicketsFilterDeletedCheckbox
+    if (!($open.IsChecked -or $closed.IsChecked -or $deleted.IsChecked)) {
+        $open.IsChecked = $true
+        return
+    }
+    if (!$SortMode) { $SortMode = $script:TicketsSortMode }
+    if (!$Assignee) { $Assignee = $script:TicketsAssigneeFilter }
+    $previousSort = $script:TicketsSortMode
+    Set-QOTicketsFilterRuntimeState -ShowOpen $open.IsChecked -ShowClosed $closed.IsChecked -ShowDeleted $deleted.IsChecked -SortMode $SortMode -AssigneeFilter $Assignee
+    $state = $script:TicketsFilterState
+    $state.ShowOpen = $script:ShowOpen
+    $state.ShowClosed = $script:ShowClosed
+    $state.ShowDeleted = $script:ShowDeleted
+    $state.SortMode = $script:TicketsSortMode
+    $state.AssigneeFilter = $script:TicketsAssigneeFilter
+
+    $sortItems = $script:TicketsFilterSortPriorityMenuItem,$script:TicketsFilterSortNewestMenuItem,$script:TicketsFilterSortOldestMenuItem
+    foreach ($item in $sortItems) { $item.IsChecked = $item.Tag -eq $state.SortMode }
+    foreach ($item in $script:TicketsFilterAssigneeMenuItem.Items) {
+        $item.IsChecked = $item.Tag -eq ("Assignee:" + $state.AssigneeFilter)
+    }
+    $statuses = @($open,$closed,$deleted | Where-Object IsChecked | ForEach-Object Header)
+    $sortLabel = ($sortItems | Where-Object IsChecked).Header -replace '^Sort: ', ''
+    $tooltip = "Filter tickets (Status: $($statuses -join ', ') | Assignee: $($state.AssigneeFilter) | Sort: $sortLabel)"
+    foreach ($name in 'BtnTicketsFilterMenu','BtnRailTicketFilter') {
+        $button = $script:TicketsWindow.FindName($name)
+        if ($button) { $button.ToolTip = $tooltip }
+    }
+
+    if ($Save) {
+        $null = Save-QOTicketsFilterState -ShowOpen $state.ShowOpen -ShowClosed $state.ShowClosed -ShowDeleted $state.ShowDeleted -SortMode $state.SortMode -AssigneeFilter $state.AssigneeFilter
+    }
+    $null = Invoke-QOTicketsFilterSafely -ForceRefresh
+    if ($previousSort -ne $state.SortMode -and $script:TicketsGrid.Items.Count) {
+        $script:TicketsGrid.ScrollIntoView($script:TicketsGrid.Items[0])
+    }
+}
+
+function Update-QOTicketsAssigneeFilterMenu {
+    $menu = $script:TicketsFilterAssigneeMenuItem
+    foreach ($item in $menu.Items) { $item.Remove_Click($script:TicketsFilterCheckboxHandler) }
+    $menu.Items.Clear()
+    $names = @('Unassigned', $script:TicketsAssigneeFilter)
+    try { $names += @(Get-QOTicketAssignees) } catch { }
+    try { $names += Get-QOTCurrentAssigneeValue } catch { }
+    $names += @($script:AllTickets | ForEach-Object { $_.AssignedTo })
+    $assignees = @($names | ForEach-Object { Normalize-QOTicketsAssigneeFilterValue $_ } | Where-Object { $_ -ne 'All' } | Sort-Object -Unique)
+    foreach ($name in (@('All') + $assignees)) {
+        $item = [Windows.Controls.MenuItem]::new()
+        $item.Header = if ($name -eq 'All') { 'All assignees' } else { $name }
+        $item.Tag = 'Assignee:' + $name
+        $item.IsCheckable = $true
+        $item.IsChecked = $name -eq $script:TicketsAssigneeFilter
+        Apply-QOTTicketsMenuItemTheme -MenuItem $item -Window $script:TicketsWindow | Out-Null
+        $item.Add_Click($script:TicketsFilterCheckboxHandler)
+        $null = $menu.Items.Add($item)
     }
 }
 
@@ -2827,7 +2849,7 @@ function Get-QOTicketsAllItems {
             $items = & $getTicketsCmd
         }
 
-        if ($null -eq $items) { return @() }
+        if ($null -eq $items) { throw "The ticket store returned no database." }
 
         if ($items.PSObject.Properties.Name -contains "Tickets") {
             $tickets = @($items.Tickets)
@@ -2854,15 +2876,7 @@ function Get-QOTicketsAllItems {
         if ($inner) { Write-QOTicketsUILog ("Tickets: InnerException: " + $inner) "ERROR" }
         if ($stack) { Write-QOTicketsUILog ("Tickets: StackTrace: " + $stack) "ERROR" }
 
-        $popupMessage = "Tickets failed to load.`n`nError: " + $msg
-        if ($inner) { $popupMessage += "`nInner: " + $inner }
-        [System.Windows.MessageBox]::Show(
-            $popupMessage,
-            "Quinn Optimiser Toolkit",
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Error
-        ) | Out-Null
-        return @()
+        throw
     }
 }
 
@@ -2906,7 +2920,7 @@ function Get-QOTicketsVisibleItems {
 
                 $assignedTo = "Unassigned"
                 try {
-                    if ($_.PSObject.Properties.Name -contains "AssignedTo") {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$_.AssignedTo)) {
                         $assignedTo = Normalize-QOTicketsAssigneeFilterValue -Value ([string]$_.AssignedTo)
                     }
                 } catch { $assignedTo = "Unassigned" }
@@ -2977,7 +2991,7 @@ function Set-QOTicketsVisibleItemsSource {
 
     $itemsArray = @($Items)
     $collection = $script:TicketsFilteredItems
-    if (-not $collection -or $collection -isnot [System.Collections.ObjectModel.ObservableCollection[object]]) {
+    if ($collection -isnot [System.Collections.ObjectModel.ObservableCollection[object]]) {
         $collection = New-Object System.Collections.ObjectModel.ObservableCollection[object]
         $script:TicketsFilteredItems = $collection
     }
@@ -3018,16 +3032,14 @@ function Set-QOTicketsVisibleItemsSource {
 }
 
 function Apply-TicketsFilter {
+    param([switch]$ForceRefresh)
+
     if (-not $script:TicketsGrid) { return }
 
     if ($null -eq $script:AllTickets) {
         $script:AllTickets = @()
     }
 
-    if (@($script:AllTickets).Count -eq 0 -and $script:TicketsGrid.ItemsSource) {
-        try { $script:AllTickets = @($script:TicketsGrid.ItemsSource) } catch { }
-    }
-    
     $filterState = [pscustomobject]@{
         ShowOpen             = [bool]$script:ShowOpen
         ShowClosed           = [bool]$script:ShowClosed
@@ -3037,6 +3049,16 @@ function Apply-TicketsFilter {
     }
 
     $filtered = @(Get-QOTicketsVisibleItems -Items $script:AllTickets -FilterState $filterState)
+    if ($filtered.Count -eq 0 -and $script:TicketsWindow) {
+        $emptyText = $script:TicketsWindow.FindName("TicketsEmptyText")
+        if ($emptyText) {
+            $emptyText.Text = if ($script:AllTickets.Count) {
+                "No tickets match the current filters. Use Filter tickets to change the view."
+            } else {
+                "No tickets yet. Choose New ticket (+) to create one."
+            }
+        }
+    }
     if ($filtered.Count -gt 1) {
         switch (([string]($script:TicketsSortMode + "")).Trim().ToLowerInvariant()) {
             "newest" {
@@ -3061,62 +3083,46 @@ function Apply-TicketsFilter {
             }
         }
     }
-    $previousSelectionId = ""
-    $previousSelection = $null
-    $detailsWasOpen = $false
-    try {
-        $previousSelection = $script:TicketsGrid.SelectedItem
-        if (-not $previousSelection) { $previousSelection = $script:TicketsGrid.CurrentItem }
-    } catch { $previousSelection = $null }
-    try {
-        if ($previousSelection -and $previousSelection.PSObject.Properties.Name -contains "Id") {
-            $previousSelectionId = ([string]($previousSelection.Id + "")).Trim()
-        }
-    } catch { $previousSelectionId = "" }
-    try {
-        if ($script:TicketsDetailsPanel) {
-            $detailsWasOpen = ($script:TicketsDetailsPanel.Visibility -eq "Visible")
-        }
-    } catch { $detailsWasOpen = $false }
+    $grid = $script:TicketsGrid
+    $selectedBefore = @($grid.SelectedItems)
+    $currentBefore = $grid.CurrentItem
+    $detailsWasOpen = $script:TicketsDetailsPanel -and $script:TicketsDetailsPanel.Visibility -eq "Visible"
+    $activeId = $script:TicketsActiveTicketId
 
-    $newItemsSource = Set-QOTicketsVisibleItemsSource -Grid $script:TicketsGrid -Items $filtered
-
-    $restoredSelection = $null
-    if (-not [string]::IsNullOrWhiteSpace($previousSelectionId)) {
-        foreach ($candidate in @($filtered)) {
-            if (-not $candidate) { continue }
-            $candidateId = ""
-            try {
-                if ($candidate.PSObject.Properties.Name -contains "Id") {
-                    $candidateId = ([string]($candidate.Id + "")).Trim()
-                }
-            } catch { $candidateId = "" }
-            if ($candidateId -eq $previousSelectionId) {
-                $restoredSelection = $candidate
-                break
+    $null = Set-QOTicketsVisibleItemsSource -Grid $grid -Items $filtered
+    if ($ForceRefresh -and !$grid.Items.IsEditingItem -and !$grid.Items.IsAddingNew) {
+        $grid.Items.Refresh()
+    }
+    if ($selectedBefore.Count -or $detailsWasOpen) {
+        $byId = @{}
+        foreach ($row in $filtered) {
+            if ($row.Id) { $byId[[string]$row.Id] = $row }
+        }
+        foreach ($previous in $selectedBefore) {
+            $match = if ($previous.Id) {
+                $byId[[string]$previous.Id]
+            } else {
+                Find-QOTTicketMatchInCollection -Ticket $previous -Items $filtered
+            }
+            if ($match -and !$grid.SelectedItems.Contains($match)) {
+                $null = $grid.SelectedItems.Add($match)
             }
         }
-    }
-
-    if ($restoredSelection) {
-        try {
-            $script:TicketsGrid.SelectedItem = $restoredSelection
-            $script:TicketsGrid.CurrentItem = $restoredSelection
-            $script:TicketsGrid.ScrollIntoView($restoredSelection)
-        } catch { }
-    }
-
-    if ($detailsWasOpen -and $restoredSelection -and (-not $script:TicketsDetailsForceClosed)) {
-        try {
+        if ($currentBefore -and $currentBefore.Id) {
+            $current = $byId[[string]$currentBefore.Id]
+            $grid.CurrentItem = $current
+        }
+        if ($detailsWasOpen -and (-not $script:TicketsDetailsForceClosed)) {
+            $detailsTicket = if ($activeId) { $byId[[string]$activeId] } else { $grid.SelectedItem }
             Update-QOTicketDetailsView `
-                -Ticket $restoredSelection `
+                -Ticket $detailsTicket `
                 -DetailsPanel $script:TicketsDetailsPanel `
                 -BodyText $script:TicketsBodyText `
                 -ReplySubject $script:TicketsReplySubject `
                 -ReplyText $script:TicketsReplyText `
                 -ReplyButton $script:TicketsReplyButton `
                 -Chevron $script:TicketsDetailsChevron
-        } catch { }
+        }
     }
 }
 
@@ -3133,7 +3139,7 @@ function Invoke-QOTicketsFilterSafely {
     try {
         # Always invoke the function from this module scope.
         # Resolving via Get-Command can hit another imported module instance and no-op.
-        Apply-TicketsFilter
+        Apply-TicketsFilter -ForceRefresh:$ForceRefresh
         return $true
     }
     catch {
@@ -3200,14 +3206,6 @@ function Refresh-QOTicketsAfterLocalMutation {
         }
     }
 
-    # Avoid immediate self-triggered file auto-refresh after local write.
-    try {
-        if (-not [string]::IsNullOrWhiteSpace([string]$script:TicketsStorePath) -and (Test-Path -LiteralPath $script:TicketsStorePath)) {
-            $latestWriteUtc = [System.IO.File]::GetLastWriteTimeUtc($script:TicketsStorePath)
-            $script:TicketsStoreLastWriteUtc = $latestWriteUtc
-            $script:TicketsLoadedStoreWriteUtc = $latestWriteUtc
-        }
-    } catch { }
     try { Write-QOTicketsUILog ("Tickets: Ticket refresh duration {0} ms." -f [int]$refreshStopwatch.Elapsed.TotalMilliseconds) } catch { }
 }
 
@@ -3224,12 +3222,13 @@ function Refresh-QOTicketsGrid {
         $loadedTickets = @(Get-QOTicketsAllItems)
         $script:AllTickets = $loadedTickets
         Update-QOTicketDisplayFields -Tickets $script:AllTickets
-        try {
-            if (-not [string]::IsNullOrWhiteSpace([string]$script:TicketsStorePath) -and (Test-Path -LiteralPath $script:TicketsStorePath)) {
-                $script:TicketsLoadedStoreWriteUtc = [System.IO.File]::GetLastWriteTimeUtc($script:TicketsStorePath)
-            }
-        } catch { }
-        Invoke-QOTicketsFilterSafely -ForceRefresh -Grid $Grid
+        if (-not (Invoke-QOTicketsFilterSafely -ForceRefresh -Grid $Grid)) {
+            throw "The ticket list could not be displayed."
+        }
+        if ($script:TicketsWindow) {
+            $errorPanel = $script:TicketsWindow.FindName("TicketsStartupErrorPanel")
+            if ($errorPanel) { $errorPanel.Visibility = "Collapsed" }
+        }
         $sourceType = "<null>"
         $itemsSource = $null
         try {
@@ -3261,14 +3260,14 @@ function Refresh-QOTicketsGrid {
         if ($inner) { Write-QOTicketsUILog ("Tickets: InnerException: " + $inner) "ERROR" }
         if ($stack) { Write-QOTicketsUILog ("Tickets: StackTrace: " + $stack) "ERROR" }
 
-        $popupMessage = "Load tickets failed.`n`nError: " + $msg
-        if ($inner) { $popupMessage += "`nInner: " + $inner }
-        [System.Windows.MessageBox]::Show(
-            $popupMessage,
-            "Quinn Optimiser Toolkit",
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Error
-        ) | Out-Null
+        if ($script:TicketsWindow) {
+            $errorPanel = $script:TicketsWindow.FindName("TicketsStartupErrorPanel")
+            $errorText = $script:TicketsWindow.FindName("TicketsStartupErrorText")
+            if ($errorPanel -and $errorText) {
+                $errorText.Text = $msg
+                $errorPanel.Visibility = "Visible"
+            }
+        }
     }
 }
 
@@ -4843,14 +4842,14 @@ function Update-QOTicketDetailsView {
         return
     }
     $composeModeBeforeRefresh = ""
-    try { $composeModeBeforeRefresh = ([string]($script:TicketsComposeMode + "")).Trim() } catch { $composeModeBeforeRefresh = "" }
+    try { $composeModeBeforeRefresh = ([string]($script:TicketsComposeState.Mode + "")).Trim() } catch { $composeModeBeforeRefresh = "" }
     try {
-        if (($script:TicketsComposeModeByTicketId -is [hashtable]) -and
+        if (($script:TicketsComposeState.ByTicketId -is [hashtable]) -and
             (-not [string]::IsNullOrWhiteSpace($refreshTicketId)) -and
-            $script:TicketsComposeModeByTicketId.ContainsKey($refreshTicketId)) {
-            $rememberedComposeMode = ([string]($script:TicketsComposeModeByTicketId[$refreshTicketId] + "")).Trim()
+            $script:TicketsComposeState.ByTicketId.ContainsKey($refreshTicketId)) {
+            $rememberedComposeMode = ([string]($script:TicketsComposeState.ByTicketId[$refreshTicketId] + "")).Trim()
             if ($rememberedComposeMode -match '^(?i)(Reply|Note)$') {
-                $script:TicketsComposeMode = $rememberedComposeMode
+                $script:TicketsComposeState.Mode = $rememberedComposeMode
             }
         }
     } catch { }
@@ -4999,7 +4998,7 @@ function Update-QOTicketDetailsView {
         } catch { $canReply = $false }
 
         $currentComposeMode = ""
-        try { $currentComposeMode = ([string]($script:TicketsComposeMode + "")).Trim() } catch { $currentComposeMode = "" }
+        try { $currentComposeMode = ([string]($script:TicketsComposeState.Mode + "")).Trim() } catch { $currentComposeMode = "" }
         if ([string]::Equals($currentComposeMode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) {
             $ReplyButton.IsEnabled = $true
             try { $ReplyButton.Content = "Save internal note" } catch { }
@@ -5009,7 +5008,7 @@ function Update-QOTicketDetailsView {
         }
     }
     Set-QOTicketDetailsVisibility -DetailsPanel $DetailsPanel -Chevron $Chevron -IsOpen:$true
-    try { Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='{1}'." -f $refreshTicketId, ([string]($script:TicketsComposeMode + "")).Trim()) } catch { }
+    try { Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='{1}'." -f $refreshTicketId, ([string]($script:TicketsComposeState.Mode + "")).Trim()) } catch { }
     try { Write-QOTicketsUILog ("Tickets: Timeline refresh end. TicketId='{0}'." -f $refreshTicketId) } catch { }
 }
 
@@ -5807,9 +5806,7 @@ function Merge-QOTicketsIntoGridCollection {
 
     if (-not $Grid -or -not $IncomingTickets -or $IncomingTickets.Count -eq 0) { return 0 }
 
-    if (-not $script:AllTickets) {
-        $script:AllTickets = @(Get-QOTicketsAllItems)
-    }
+    if ($null -eq $script:AllTickets) { $script:AllTickets = @() }
 
     $localExistingKeys = $ExistingKeys
     if (-not $localExistingKeys) {
@@ -5835,6 +5832,7 @@ function Merge-QOTicketsIntoGridCollection {
             ShowClosed           = [bool]$script:ShowClosed
             ShowDeleted          = [bool]$script:ShowDeleted
             SortMode             = [string]$script:TicketsSortMode
+            AssigneeFilter       = [string]$script:TicketsAssigneeFilter
         }))
 
         if ($visible.Count -gt 0) {
@@ -5922,26 +5920,24 @@ function Start-QOTicketsIncrementalMerge {
 
     $script:TicketsIncrementalMergeTimer = [System.Windows.Threading.DispatcherTimer]::new()
     $script:TicketsIncrementalMergeTimer.Interval = [TimeSpan]::FromMilliseconds(85)
-    $refreshFilter = Get-Command Invoke-QOTicketsFilterSafely -CommandType Function -ErrorAction Stop
-    $writeLog = Get-Command Write-QOTicketsUILog -CommandType Function -ErrorAction Stop
-    $setSyncStatus = Get-Command Set-QOTicketsSyncStatus -CommandType Function -ErrorAction Stop
-    $getLastSyncLabel = Get-Command Get-QOTicketsLastSuccessfulSyncLabel -CommandType Function -ErrorAction Stop
-    $stopIncrementalMerge = Get-Command Stop-QOTicketsIncrementalMerge -CommandType Function -ErrorAction Stop
-    $mergeIntoGrid = Get-Command Merge-QOTicketsIntoGridCollection -CommandType Function -ErrorAction Stop
-
-    $script:TicketsIncrementalMergeTickHandler = {
+    $script:TicketsIncrementalMergeTimer.Tag = @{ Grid = $Grid; StatusText = $StatusText }
+    $script:TicketsIncrementalMergeTickHandler = [System.EventHandler]{
+        param($sender,$eventArgs)
+        if ($sender -ne $script:TicketsIncrementalMergeTimer) { return }
+        $Grid = $sender.Tag.Grid
+        $StatusText = $sender.Tag.StatusText
         try {
             if (-not $script:TicketsIncrementalMergeQueue -or $script:TicketsIncrementalMergeQueue.Count -le 0) {
                 if ($script:TicketsIncrementalMergeNeedsRefresh) {
-                    try { & $refreshFilter -ForceRefresh -Grid $Grid } catch { }
+                    try { Invoke-QOTicketsFilterSafely -ForceRefresh -Grid $Grid } catch { }
                     $script:TicketsIncrementalMergeNeedsRefresh = $false
                 }
 
                 $processed = [int]$script:TicketsIncrementalMergeProcessed
                 $added = [int]$script:TicketsIncrementalMergeAdded
-                & $writeLog ("Tickets: Incremental merge completed. Processed={0} Added={1}" -f $processed, $added)
-                & $setSyncStatus -StatusText $StatusText -Message (& $getLastSyncLabel)
-                & $stopIncrementalMerge
+                Write-QOTicketsUILog ("Tickets: Incremental merge completed. Processed={0} Added={1}" -f $processed, $added)
+                Set-QOTicketsSyncStatus -StatusText $StatusText -Message (Get-QOTicketsLastSuccessfulSyncLabel)
+                Stop-QOTicketsIncrementalMerge
                 return
             }
 
@@ -5951,7 +5947,7 @@ function Start-QOTicketsIncrementalMerge {
 
             $merged = 0
             try {
-                $merged = [int](& $mergeIntoGrid -Grid $Grid -IncomingTickets @($nextTicket) -ExistingKeys $script:TicketsIncrementalMergeExistingKeys -SkipFilterRefresh)
+                $merged = [int](Merge-QOTicketsIntoGridCollection -Grid $Grid -IncomingTickets @($nextTicket) -ExistingKeys $script:TicketsIncrementalMergeExistingKeys -SkipFilterRefresh)
             } catch { $merged = 0 }
 
             $script:TicketsIncrementalMergeProcessed = [int]$script:TicketsIncrementalMergeProcessed + 1
@@ -5965,19 +5961,19 @@ function Start-QOTicketsIncrementalMerge {
             $processedNow = [int]$script:TicketsIncrementalMergeProcessed
 
             if ($script:TicketsIncrementalMergeNeedsRefresh -and (($processedNow % 4 -eq 0) -or ($queueRemaining -eq 0))) {
-                try { & $refreshFilter -ForceRefresh -Grid $Grid } catch { }
+                try { Invoke-QOTicketsFilterSafely -ForceRefresh -Grid $Grid } catch { }
                 $script:TicketsIncrementalMergeNeedsRefresh = $false
             }
 
             if ($queueRemaining -gt 0) {
                 $total = $processedNow + $queueRemaining
-                & $setSyncStatus -StatusText $StatusText -Message ("Updating tickets {0}/{1}..." -f $processedNow, $total)
+                Set-QOTicketsSyncStatus -StatusText $StatusText -Message ("Updating tickets {0}/{1}..." -f $processedNow, $total)
             }
         } catch {
-            & $writeLog ("Tickets: Incremental merge tick failed. " + $_.Exception.Message) "WARN"
-            & $stopIncrementalMerge
+            Write-QOTicketsUILog ("Tickets: Incremental merge tick failed. " + $_.Exception.Message) "WARN"
+            Stop-QOTicketsIncrementalMerge
         }
-    }.GetNewClosure()
+    }
 
     $script:TicketsIncrementalMergeTimer.Add_Tick($script:TicketsIncrementalMergeTickHandler)
     $script:TicketsIncrementalMergeTimer.Start()
@@ -6049,7 +6045,7 @@ function Convert-QOTicketsSyncResultObject {
         return [pscustomobject]@{
             TimedOut    = $true
             Success     = $false
-            Note        = (if ([string]::IsNullOrWhiteSpace($DefaultNote)) { "Outlook sync timed out." } else { $DefaultNote })
+            Note        = if ([string]::IsNullOrWhiteSpace($DefaultNote)) { "Outlook sync timed out." } else { $DefaultNote }
             Added       = 0
             Updated     = 0
             AddedTickets = @()
@@ -6291,7 +6287,7 @@ function Read-QOTicketsReplyRunnerResult {
 
     try {
         if (-not [string]::IsNullOrWhiteSpace($ResultPath) -and (Test-Path -LiteralPath $ResultPath)) {
-            $rawOutput = [string](Get-Content -LiteralPath $ResultPath -Raw -ErrorAction SilentlyContinue)
+            $rawOutput = [string](Get-Content -LiteralPath $ResultPath -Encoding UTF8 -Raw -ErrorAction SilentlyContinue)
         }
     } catch { $rawOutput = "" }
     try {
@@ -6360,7 +6356,7 @@ function Read-QOTicketsBackgroundActionRunnerResult {
 
     try {
         if (-not [string]::IsNullOrWhiteSpace($ResultPath) -and (Test-Path -LiteralPath $ResultPath)) {
-            $rawOutput = [string](Get-Content -LiteralPath $ResultPath -Raw -ErrorAction SilentlyContinue)
+            $rawOutput = [string](Get-Content -LiteralPath $ResultPath -Encoding UTF8 -Raw -ErrorAction SilentlyContinue)
         }
     } catch { $rawOutput = "" }
     try {
@@ -6454,7 +6450,7 @@ function Read-QOTicketsSyncRunnerResult {
 
     try {
         if (-not [string]::IsNullOrWhiteSpace($ResultPath) -and (Test-Path -LiteralPath $ResultPath)) {
-            $rawOutput = [string](Get-Content -LiteralPath $ResultPath -Raw -ErrorAction SilentlyContinue)
+            $rawOutput = [string](Get-Content -LiteralPath $ResultPath -Encoding UTF8 -Raw -ErrorAction SilentlyContinue)
         }
     } catch { $rawOutput = "" }
     try {
@@ -6849,11 +6845,15 @@ function Start-TicketsEmailSyncAsync {
 
     $syncTimer = [System.Windows.Threading.DispatcherTimer]::new()
     $syncTimer.Interval = [TimeSpan]::FromMilliseconds(150)
-    $syncStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-    $syncTimer.Add_Tick({
+    # Keep per-run arguments on the timer. The delegate stays in Tickets.UI's
+    # module scope so it reads the active worker and can update the header.
+    $syncTimer.Tag = @{ Grid=$Grid; GetTicketsCmd=$GetTicketsCmd; StatusText=$StatusText; RunId=$runId; Stopwatch=[Diagnostics.Stopwatch]::StartNew() }
+    $syncTimer.Add_Tick([System.EventHandler]{
+        param($sender,$eventArgs)
+        $runId = $sender.Tag.RunId
+        $syncStopwatch = $sender.Tag.Stopwatch
         if ($script:TicketsSyncActiveRunId -ne $runId) {
-            $syncTimer.Stop()
+            $sender.Stop()
             $syncStopwatch.Stop()
             return
         }
@@ -6872,8 +6872,8 @@ function Start-TicketsEmailSyncAsync {
             return
         }
 
-        Complete-TicketsEmailSyncAsyncRun -Grid $Grid -GetTicketsCmd $GetTicketsCmd -StatusText $StatusText -RunId $runId -TimedOut:$timedOut | Out-Null
-    }.GetNewClosure())
+        Complete-TicketsEmailSyncAsyncRun -Grid $sender.Tag.Grid -GetTicketsCmd $sender.Tag.GetTicketsCmd -StatusText $sender.Tag.StatusText -RunId $runId -TimedOut:$timedOut | Out-Null
+    })
 
     $script:TicketsSyncCompletionTimer = $syncTimer
     $script:TicketsSyncCompletionTimer.Start()
@@ -6972,6 +6972,9 @@ function Complete-TicketsEmailSyncAsyncRun {
     try { if ($result -and $result.PSObject.Properties.Name -contains "AddedTickets") { $addedTickets = @($result.AddedTickets) } } catch { }
 
     if ($outTimedOut -or (-not $success) -or $completionError) {
+        if ($added -gt 0 -or $updated -gt 0) {
+            Invoke-QOTicketsGridRefresh -Grid $Grid -GetTicketsCmd $GetTicketsCmd
+        }
         $script:TicketsSyncFailureCount = [int]$script:TicketsSyncFailureCount + 1
         $backoff = Get-QOTicketsSyncBackoffSeconds -FailureCount $script:TicketsSyncFailureCount
         $script:TicketsSyncNextAttemptUtc = (Get-Date).ToUniversalTime().AddSeconds($backoff)
@@ -6997,14 +7000,14 @@ function Complete-TicketsEmailSyncAsyncRun {
     $script:TicketsSyncNextAttemptUtc = $script:TicketsLastSuccessfulSyncUtc.AddSeconds($nextPollSeconds)
 
     $incomingTickets = @($addedTickets | Where-Object { $null -ne $_ })
-    if ($incomingTickets.Count -gt 0) {
+    if ($updated -gt 0 -or $added -gt $incomingTickets.Count) {
+        Invoke-QOTicketsGridRefresh -Grid $Grid -GetTicketsCmd $GetTicketsCmd
+        Write-QOTicketsUILog ("Tickets: Background email sync run #{0} refreshed the store. Added={1} Updated={2}." -f $RunId, $added, $updated)
+        Set-QOTicketsSyncStatus -StatusText $StatusText -Message (Get-QOTicketsLastSuccessfulSyncLabel)
+    }
+    elseif ($incomingTickets.Count -gt 0) {
         $queuedCount = Start-QOTicketsIncrementalMerge -Grid $Grid -IncomingTickets $incomingTickets -StatusText $StatusText
         Write-QOTicketsUILog ("Tickets: Background email sync run #{0} finished in {1}s. Added={2} Updated={3} QueuedForMerge={4}. Note={5}" -f $RunId, [math]::Round($elapsedSeconds, 1), $added, $updated, $queuedCount, $note)
-    }
-    elseif ($updated -gt 0) {
-        try { Invoke-QOTicketsGridRefresh -Grid $Grid -GetTicketsCmd $GetTicketsCmd } catch { }
-        Write-QOTicketsUILog ("Tickets: Background email sync run #{0} finished in {1}s. Added=0 Updated={2}. Note={3}" -f $RunId, [math]::Round($elapsedSeconds, 1), $updated, $note)
-        Set-QOTicketsSyncStatus -StatusText $StatusText -Message (Get-QOTicketsLastSuccessfulSyncLabel)
     }
     else {
         Write-QOTicketsUILog ("Tickets: Background email sync run #{0} finished in {1}s. Added={2} Updated=0 Merged=0. Note={3}" -f $RunId, [math]::Round($elapsedSeconds, 1), $added, $note)
@@ -7057,7 +7060,14 @@ function Start-QOTicketsAutoSyncWorker {
     if ($script:TicketsSyncNextAttemptUtc -eq [datetime]::MinValue) {
         $script:TicketsSyncNextAttemptUtc = (Get-Date).ToUniversalTime().AddSeconds((Get-QOTicketsSyncSuccessPollSeconds))
     }
-    $script:TicketsSyncWorkerTickHandler = {
+    $script:TicketsSyncTimer.Tag = @{ Grid=$Grid; GetTicketsCmd=$GetTicketsCmd; StatusText=$StatusText; SyncCmd=$SyncCmd }
+    $script:TicketsSyncWorkerTickHandler = [System.EventHandler]{
+        param($sender,$eventArgs)
+        if ($sender -ne $script:TicketsSyncTimer) { return }
+        $Grid = $sender.Tag.Grid
+        $GetTicketsCmd = $sender.Tag.GetTicketsCmd
+        $StatusText = $sender.Tag.StatusText
+        $SyncCmd = $sender.Tag.SyncCmd
         if ($script:TicketsEmailSyncInProgress) {
             try {
                 if ($script:TicketsSyncActiveRunId -gt 0) {
@@ -7095,11 +7105,12 @@ function Start-QOTicketsAutoSyncWorker {
                     $shouldForceReset = $true
                     $resetReason = "missing runspace sync handles"
                 }
-                elseif (-not $lastStart -or $lastStart -eq [datetime]::MinValue) {
+
+                if (-not $shouldForceReset -and (-not $lastStart -or $lastStart -eq [datetime]::MinValue)) {
                     $shouldForceReset = $true
                     $resetReason = "missing sync start timestamp"
                 }
-                else {
+                elseif (-not $shouldForceReset) {
                     $elapsed = ((Get-Date).ToUniversalTime() - $lastStart).TotalSeconds
                     $maxAllowed = [math]::Max(120, [int]$script:TicketsSyncActiveTimeoutSeconds + 30)
                     if ($elapsed -ge $maxAllowed) {
@@ -7159,11 +7170,12 @@ function Start-QOTicketsAutoSyncWorker {
 
             $script:TicketsSyncFailureCount = 0
             $script:TicketsSyncLastFailureNote = ""
+            $sender.Tag.SyncCmd = $SyncCmd
             Write-QOTicketsUILog "Tickets: Sync command became available; starting auto-sync."
         }
 
         Start-TicketsEmailSyncAsync -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $script:TicketsBackgroundBatchSize -Automatic -RespectNextAttempt
-    }.GetNewClosure()
+    }
 
     $script:TicketsSyncTimer.Add_Tick($script:TicketsSyncWorkerTickHandler)
     $script:TicketsSyncTimer.Start()
@@ -7199,7 +7211,6 @@ function Invoke-QOTicketsManualSyncRequest {
         [Parameter(Mandatory)]$GetTicketsCmd,
         [AllowNull()]$SyncCmd,
         [AllowNull()][System.Windows.Controls.TextBlock]$StatusText,
-        [AllowNull()]$InvokeSyncCmd,
         [int]$MaxPerMailbox = 0
     )
 
@@ -7233,12 +7244,7 @@ function Invoke-QOTicketsManualSyncRequest {
         Write-QOTicketsUILog "Tickets: Header sync click requested manual email sync."
         Set-QOTicketsSyncStatus -StatusText $StatusText -Message "Manual sync requested..."
 
-        if ($InvokeSyncCmd) {
-            & $InvokeSyncCmd -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $requestedMax -Force
-        }
-        else {
-            Invoke-QOTicketsEmailSyncAndRefresh -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $requestedMax -Force
-        }
+        Invoke-QOTicketsEmailSyncAndRefresh -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $requestedMax -Force
 
         return $true
     } catch {
@@ -7248,6 +7254,20 @@ function Invoke-QOTicketsManualSyncRequest {
     }
 }
 
+function Register-QOTicketsSyncStatusClick {
+    param($Grid,$StatusText,$GetTicketsCmd,$SyncCmd)
+
+    $StatusText.Cursor = [System.Windows.Input.Cursors]::Hand
+    $manualSync = Get-Command Invoke-QOTicketsManualSyncRequest -CommandType Function
+    $handler = [System.Windows.Input.MouseButtonEventHandler]{
+        param($sender,$eventArgs)
+        if ($eventArgs.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) { return }
+        $eventArgs.Handled = $true
+        $null = & $manualSync -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $sender
+    }.GetNewClosure()
+    Register-QOTicketEventHandler -Target $StatusText -RoutedEvent ([System.Windows.UIElement]::MouseLeftButtonUpEvent) -Handler $handler
+}
+
 function Invoke-QOTicketsGridRefresh {
     param(
         [Parameter(Mandatory)][System.Windows.Controls.DataGrid]$Grid,
@@ -7255,92 +7275,7 @@ function Invoke-QOTicketsGridRefresh {
         [string]$View
     )
 
-    $selectedTicketBefore = $null
-    $selectedIdBefore = ""
-    $selectedSubjectBefore = ""
-    $selectedCreatedBefore = ""
-    $detailsWasOpen = $false
-    try { $selectedTicketBefore = $Grid.SelectedItem } catch { $selectedTicketBefore = $null }
-    if (-not $selectedTicketBefore) {
-        try { $selectedTicketBefore = $Grid.CurrentItem } catch { $selectedTicketBefore = $null }
-    }
-    try {
-        if ($selectedTicketBefore -and ($selectedTicketBefore.PSObject.Properties.Name -contains "Id")) {
-            $selectedIdBefore = ([string]($selectedTicketBefore.Id + "")).Trim()
-        }
-    } catch { $selectedIdBefore = "" }
-    try {
-        if ($selectedTicketBefore -and ($selectedTicketBefore.PSObject.Properties.Name -contains "Subject")) {
-            $selectedSubjectBefore = ([string]($selectedTicketBefore.Subject + "")).Trim()
-        }
-    } catch { $selectedSubjectBefore = "" }
-    try {
-        if ($selectedTicketBefore -and ($selectedTicketBefore.PSObject.Properties.Name -contains "CreatedAt")) {
-            $selectedCreatedBefore = ([string]($selectedTicketBefore.CreatedAt + "")).Trim()
-        }
-    } catch { $selectedCreatedBefore = "" }
-    try {
-        if ($script:TicketsDetailsPanel) {
-            $detailsWasOpen = ($script:TicketsDetailsPanel.Visibility -eq "Visible")
-        }
-    } catch { $detailsWasOpen = $false }
-
     Refresh-QOTicketsGrid -Grid $Grid -GetTicketsCmd $GetTicketsCmd -View $View
-
-    $view = $null
-    try { $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($Grid.ItemsSource) } catch { $view = $null }
-    if ($view -and $view -is [System.ComponentModel.ICollectionView]) {
-        try { $view.Refresh() } catch { }
-    }
-
-    $selectedTicketAfter = $null
-    $itemsAfter = @()
-    try { $itemsAfter = @($Grid.ItemsSource) } catch { $itemsAfter = @() }
-    if (-not $selectedTicketAfter -and -not [string]::IsNullOrWhiteSpace($selectedIdBefore)) {
-        foreach ($item in $itemsAfter) {
-            if (-not $item) { continue }
-            $idValue = ""
-            try {
-                if ($item.PSObject.Properties.Name -contains "Id") {
-                    $idValue = ([string]($item.Id + "")).Trim()
-                }
-            } catch { $idValue = "" }
-            if ($idValue -eq $selectedIdBefore) { $selectedTicketAfter = $item; break }
-        }
-    }
-    if (-not $selectedTicketAfter -and -not [string]::IsNullOrWhiteSpace($selectedSubjectBefore)) {
-        foreach ($item in $itemsAfter) {
-            if (-not $item) { continue }
-            $subjectValue = ""
-            $createdValue = ""
-            try { if ($item.PSObject.Properties.Name -contains "Subject") { $subjectValue = ([string]($item.Subject + "")).Trim() } } catch { $subjectValue = "" }
-            try { if ($item.PSObject.Properties.Name -contains "CreatedAt") { $createdValue = ([string]($item.CreatedAt + "")).Trim() } } catch { $createdValue = "" }
-            if ($subjectValue -eq $selectedSubjectBefore) {
-                if ([string]::IsNullOrWhiteSpace($selectedCreatedBefore) -or $createdValue -eq $selectedCreatedBefore) {
-                    $selectedTicketAfter = $item
-                    break
-                }
-            }
-        }
-    }
-
-    if ($selectedTicketAfter) {
-        try { $Grid.SelectedItem = $selectedTicketAfter } catch { }
-        try { $Grid.CurrentItem = $selectedTicketAfter } catch { }
-        try { $Grid.ScrollIntoView($selectedTicketAfter) } catch { }
-    }
-
-    if ($detailsWasOpen -and $script:TicketsDetailsPanel) {
-        $detailsTicket = $selectedTicketAfter
-        if (-not $detailsTicket) {
-            try { $detailsTicket = $Grid.SelectedItem } catch { $detailsTicket = $null }
-        }
-        if ($detailsTicket) {
-            try {
-                Update-QOTicketDetailsView -Ticket $detailsTicket -DetailsPanel $script:TicketsDetailsPanel -BodyText $script:TicketsBodyText -ReplySubject $script:TicketsReplySubject -ReplyText $script:TicketsReplyText -ReplyButton $script:TicketsReplyButton -Chevron $script:TicketsDetailsChevron
-            } catch { }
-        }
-    }
 }
 
 function Start-QOTicketsStoreAutoRefresh {
@@ -7387,7 +7322,14 @@ function Start-QOTicketsStoreAutoRefresh {
 
     $script:TicketsFileRefreshTimer = [System.Windows.Threading.DispatcherTimer]::new()
     $script:TicketsFileRefreshTimer.Interval = [TimeSpan]::FromSeconds(2)
-    $script:TicketsFileRefreshTickHandler = {
+    $script:TicketsFileRefreshTimer.Tag = @{ Grid=$Grid; GetTicketsCmd=$GetTicketsCmd; GetStorePathCmd=$GetStorePathCmd; RefreshCmd=$effectiveRefreshCmd }
+    $script:TicketsFileRefreshTickHandler = [System.EventHandler]{
+        param($sender,$eventArgs)
+        if ($sender -ne $script:TicketsFileRefreshTimer) { return }
+        $Grid = $sender.Tag.Grid
+        $GetStorePathCmd = $sender.Tag.GetStorePathCmd
+        $GetTicketsCmd = $sender.Tag.GetTicketsCmd
+        $effectiveRefreshCmd = $sender.Tag.RefreshCmd
         try {
             if ($script:TicketsEmailSyncInProgress) { return }
             if ($script:TicketsIncrementalMergeTimer -and $script:TicketsIncrementalMergeTimer.IsEnabled) { return }
@@ -7404,12 +7346,7 @@ function Start-QOTicketsStoreAutoRefresh {
             $currentWriteUtc = [System.IO.File]::GetLastWriteTimeUtc($storePath)
             if ($currentWriteUtc -eq [datetime]::MinValue) { return }
 
-            if ($script:TicketsStoreLastWriteUtc -eq [datetime]::MinValue) {
-                $script:TicketsStoreLastWriteUtc = $currentWriteUtc
-                return
-            }
-
-            if ($currentWriteUtc -le $script:TicketsStoreLastWriteUtc) { return }
+            if ($currentWriteUtc -eq $script:TicketsStoreLastWriteUtc) { return }
 
             $script:TicketsStoreLastWriteUtc = $currentWriteUtc
             $preferLightweightRefresh = $false
@@ -7447,7 +7384,7 @@ function Start-QOTicketsStoreAutoRefresh {
                 try { Refresh-QOTicketsGrid -Grid $Grid -GetTicketsCmd $GetTicketsCmd -View $script:TicketsCurrentView } catch { }
             }
         } catch { }
-    }.GetNewClosure()
+    }
 
     $script:TicketsFileRefreshTimer.Add_Tick($script:TicketsFileRefreshTickHandler)
     $script:TicketsFileRefreshTimer.Start()
@@ -7523,7 +7460,11 @@ function Close-QOTicketsUI {
         Stop-QOTicketsSyncExecution -StopActiveOperation
         Clear-QOTicketsSyncExecutionState -RemoveRunnerFiles
         $script:TicketsEmailSyncInProgress = $false
+        $script:TicketsSyncActiveRunId = 0
+        $script:TicketsSyncActiveTimeoutSeconds = 0
+        $script:TicketsSyncLastStartUtc = [datetime]::MinValue
     }
+    Stop-QOTicketsIncrementalMerge
     Unregister-QOTicketEventHandlers
     $null = Stop-QOTicketsFileWatcher
 }
@@ -7598,10 +7539,7 @@ function Initialize-QOTicketsUI {
     $getPrioritiesCmd = Resolve-QOTInvokable -Candidate $getPrioritiesCmd -CommandName "Get-QOTicketPriorities"
     $getAssigneesCmd = Resolve-QOTInvokable -Candidate $getAssigneesCmd -CommandName "Get-QOTicketAssignees"
     $getStorePathCmd = Resolve-QOTInvokable -Candidate $getStorePathCmd -CommandName "Get-QOTicketsStorePath"
-    $setTicketListViewCmd = Resolve-QOTicketsLocalFunction -Name "Set-QOTicketListViewSettings"
-    if (-not $setTicketListViewCmd) {
-        $setTicketListViewCmd = Resolve-QOTInvokable -Candidate (Get-Command Set-QOTicketListViewSettings -ErrorAction SilentlyContinue) -CommandName "Set-QOTicketListViewSettings"
-    }
+
     $syncCmd = Resolve-QOTInvokable -Candidate $syncCmd -CommandName "Sync-QOTicketsFromEmail"
     if ($syncCmd) {
         $syncCmdNameResolved = ""
@@ -7613,10 +7551,6 @@ function Initialize-QOTicketsUI {
     $invokeGridRefreshCmd = Resolve-QOTInvokable -Candidate (Get-Command Invoke-QOTicketsGridRefresh -ErrorAction SilentlyContinue) -CommandName "Invoke-QOTicketsGridRefresh"
     if (-not $invokeGridRefreshCmd) {
         try { $invokeGridRefreshCmd = ${function:Invoke-QOTicketsGridRefresh} } catch { $invokeGridRefreshCmd = $null }
-    }
-    $invokeEmailSyncRefreshCmd = Resolve-QOTInvokable -Candidate (Get-Command Invoke-QOTicketsEmailSyncAndRefresh -ErrorAction SilentlyContinue) -CommandName "Invoke-QOTicketsEmailSyncAndRefresh"
-    if (-not $invokeEmailSyncRefreshCmd) {
-        try { $invokeEmailSyncRefreshCmd = ${function:Invoke-QOTicketsEmailSyncAndRefresh} } catch { $invokeEmailSyncRefreshCmd = $null }
     }
     $invokeTicketStatusChangeCmd = Resolve-QOTInvokable -Candidate (Get-Command Invoke-QOTicketStatusChangeForItems -ErrorAction SilentlyContinue) -CommandName "Invoke-QOTicketStatusChangeForItems"
     if (-not $invokeTicketStatusChangeCmd) {
@@ -7837,27 +7771,8 @@ function Initialize-QOTicketsUI {
         }
     }.GetNewClosure()
 
-    $getPrimaryTicketEmailAddress = {
-        param([AllowNull()]$Ticket)
-        if (-not $Ticket) { return "" }
-
-        foreach ($propName in @("EmailTo", "SenderEmail", "ContactEmail", "EmailFrom")) {
-            $rawValue = ""
-            try {
-                if ($Ticket.PSObject.Properties.Name -contains $propName) {
-                    $rawValue = ([string]($Ticket.$propName + "")).Trim()
-                }
-            } catch { $rawValue = "" }
-            if ([string]::IsNullOrWhiteSpace($rawValue)) { continue }
-
-            $match = [regex]::Match($rawValue, '(?i)([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})')
-            if ($match.Success) {
-                return ([string]$match.Groups[1].Value).Trim()
-            }
-        }
-
-        return ""
-    }.GetNewClosure()
+    $getPrimaryTicketEmailAddress = Get-Command Get-QOTicketPrimaryEmailAddress -ErrorAction SilentlyContinue
+    $getTicketReplyRoute = Get-Command Get-QOTTicketPendingReplyMetadataFromTicket -ErrorAction SilentlyContinue
 
     $ticketHasReplyReference = {
         param([AllowNull()]$Ticket)
@@ -7913,13 +7828,14 @@ function Initialize-QOTicketsUI {
         return $false
     }.GetNewClosure()
 
+    $isDetailsViewActive = Get-Command Test-QOTicketDetailsViewActive
     $isTicketVisibleInDetails = {
         param([AllowNull()][string]$TicketIdValue)
 
         $targetTicketId = ([string]($TicketIdValue + "")).Trim()
         if ([string]::IsNullOrWhiteSpace($targetTicketId)) { return $false }
 
-        return [bool](Test-QOTicketDetailsViewActive -TicketId $targetTicketId)
+        return [bool](& $isDetailsViewActive -TicketId $targetTicketId)
     }.GetNewClosure()
 
     $resolveVisibleTicketById = {
@@ -7975,6 +7891,7 @@ function Initialize-QOTicketsUI {
         return $resolvedTicket
     }.GetNewClosure()
 
+    $composeState = $script:TicketsComposeState
     $updateReplyComposeFeedback = {
         param([AllowNull()]$Ticket)
 
@@ -8075,7 +7992,7 @@ function Initialize-QOTicketsUI {
             }
             if ($btnSendReply) {
                 try {
-                    $btnSendReply.Content = if ([string]::Equals([string]$script:TicketsComposeMode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
+                    $btnSendReply.Content = if ([string]::Equals([string]$composeState.Mode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
                 } catch { }
             }
             if ($btnRetryFailedReply) {
@@ -8101,7 +8018,7 @@ function Initialize-QOTicketsUI {
                     $ticketReplyStatusText.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#93C5FD")
                     $ticketReplyStatusText.Visibility = "Visible"
                 }
-                if ($btnSendReply -and [string]::Equals([string]$script:TicketsComposeMode, "Reply", [System.StringComparison]::OrdinalIgnoreCase)) {
+                if ($btnSendReply -and [string]::Equals([string]$composeState.Mode, "Reply", [System.StringComparison]::OrdinalIgnoreCase)) {
                     try { $btnSendReply.IsEnabled = $true } catch { }
                     try { $btnSendReply.Content = "Send reply" } catch { }
                 }
@@ -8115,7 +8032,7 @@ function Initialize-QOTicketsUI {
                     $ticketReplyStatusText.Visibility = "Visible"
                 }
             }
-            if ($btnSendReply -and [string]::Equals([string]$script:TicketsComposeMode, "Reply", [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($btnSendReply -and [string]::Equals([string]$composeState.Mode, "Reply", [System.StringComparison]::OrdinalIgnoreCase)) {
                 try { $btnSendReply.IsEnabled = $true } catch { }
             }
         } catch {
@@ -8132,16 +8049,7 @@ function Initialize-QOTicketsUI {
 
         try {
             $normalizedMode = if ([string]::Equals([string]$Mode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Note" } else { "Reply" }
-            $script:TicketsComposeMode = $normalizedMode
-            try {
-                $composeTicketId = ([string]($script:TicketsActiveTicketId + "")).Trim()
-                if (-not [string]::IsNullOrWhiteSpace($composeTicketId)) {
-                    if ($script:TicketsComposeModeByTicketId -isnot [hashtable]) {
-                        $script:TicketsComposeModeByTicketId = @{}
-                    }
-                    $script:TicketsComposeModeByTicketId[$composeTicketId] = $normalizedMode
-                }
-            } catch { }
+            $composeState.Mode = $normalizedMode
             $isNoteMode = ($normalizedMode -eq "Note")
 
             if ($btnComposeInternalNote) {
@@ -8473,27 +8381,26 @@ function Initialize-QOTicketsUI {
 
             $targetMode = ""
             $composeModeBeforeOpenRefresh = ""
-            try { $composeModeBeforeOpenRefresh = ([string]($script:TicketsComposeMode + "")).Trim() } catch { $composeModeBeforeOpenRefresh = "" }
+            try { $composeModeBeforeOpenRefresh = ([string]($composeState.Mode + "")).Trim() } catch { $composeModeBeforeOpenRefresh = "" }
             try {
-                $modeTicketId = Get-QOTicketIdValue -Ticket $detailsTicket
-                if (($script:TicketsComposeModeByTicketId -is [hashtable]) -and
+                $modeTicketId = & $getTicketIdValueCmd -Ticket $detailsTicket
+                if (($composeState.ByTicketId -is [hashtable]) -and
                     (-not [string]::IsNullOrWhiteSpace($modeTicketId)) -and
-                    $script:TicketsComposeModeByTicketId.ContainsKey($modeTicketId)) {
-                    $targetMode = ([string]($script:TicketsComposeModeByTicketId[$modeTicketId] + "")).Trim()
+                    $composeState.ByTicketId.ContainsKey($modeTicketId)) {
+                    $targetMode = ([string]($composeState.ByTicketId[$modeTicketId] + "")).Trim()
                 }
             } catch { $targetMode = "" }
-            if ([string]::IsNullOrWhiteSpace($targetMode)) { $targetMode = [string]$script:TicketsComposeMode }
             if ([string]::IsNullOrWhiteSpace($targetMode)) { $targetMode = "Reply" }
             if (([string]::Equals($targetMode, "Reply", [System.StringComparison]::OrdinalIgnoreCase)) -and (-not $canReply)) {
                 $targetMode = "Note"
             }
             try { Write-QOTicketsUILog ("Tickets: Compose mode before refresh. TicketId='{0}' Mode='{1}' Target='{2}'." -f (Get-QOTicketIdValue -Ticket $detailsTicket), $composeModeBeforeOpenRefresh, $targetMode) } catch { }
             try { & $setComposeMode -Mode $targetMode -PreserveText -SkipFocus } catch { }
-            try { Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='{1}'." -f (Get-QOTicketIdValue -Ticket $detailsTicket), ([string]($script:TicketsComposeMode + "")).Trim()) } catch { }
+            try { Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='{1}'." -f (Get-QOTicketIdValue -Ticket $detailsTicket), ([string]($composeState.Mode + "")).Trim()) } catch { }
 
             try {
                 if ($btnSendReply) {
-                    if ([string]::Equals([string]$script:TicketsComposeMode, "Reply", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    if ([string]::Equals([string]$composeState.Mode, "Reply", [System.StringComparison]::OrdinalIgnoreCase)) {
                         $btnSendReply.IsEnabled = $canReply
                     } else {
                         $btnSendReply.IsEnabled = $true
@@ -8692,19 +8599,6 @@ function Initialize-QOTicketsUI {
         $invokeTicketsFilterLocal = "Invoke-QOTicketsFilterSafely"
     }
 
-    $setFilterRuntimeStateLocal = Resolve-QOTInvokable -Candidate (Get-Command Set-QOTicketsFilterRuntimeState -ErrorAction SilentlyContinue) -CommandName "Set-QOTicketsFilterRuntimeState"
-    if (-not $setFilterRuntimeStateLocal) {
-        $setFilterRuntimeStateLocal = "Set-QOTicketsFilterRuntimeState"
-    }
-    $normalizeAssigneeFilterCmd = Resolve-QOTInvokable -Candidate (Get-Command Normalize-QOTicketsAssigneeFilterValue -ErrorAction SilentlyContinue) -CommandName "Normalize-QOTicketsAssigneeFilterValue"
-    if (-not $normalizeAssigneeFilterCmd) {
-        try { $normalizeAssigneeFilterCmd = ${function:Normalize-QOTicketsAssigneeFilterValue} } catch { $normalizeAssigneeFilterCmd = $null }
-    }
-    if (-not $normalizeAssigneeFilterCmd) {
-        # Keep Tickets UI startup resilient; fallback to command-name resolution at call sites.
-        $normalizeAssigneeFilterCmd = "Normalize-QOTicketsAssigneeFilterValue"
-    }
-
     # Remove previous handlers safely (now that handlers are typed delegates, Remove_ should match)
 
     try { if ($script:TicketsNewHandler)     { $btnNew.Remove_Click($script:TicketsNewHandler) } } catch { }
@@ -8750,17 +8644,6 @@ function Initialize-QOTicketsUI {
             }
         }
     } catch { }
-    try {
-        if ($script:TicketsFilterStatusClickHandler) {
-            foreach ($checkbox in @(
-                    $script:TicketsFilterOpenCheckbox,
-                    $script:TicketsFilterClosedCheckbox,
-                    $script:TicketsFilterDeletedCheckbox)) {
-                if (-not $checkbox) { continue }
-                try { $checkbox.Remove_Click($script:TicketsFilterStatusClickHandler) } catch { }
-            }
-        }
-    } catch { }
     try { if ($script:TicketsFilterButtonHandler) { $btnFilterMenu.Remove_Click($script:TicketsFilterButtonHandler) } } catch { }
     try { if ($script:TicketsFilterMenuClosedHandler -and $script:TicketsFilterMenu) { $script:TicketsFilterMenu.Remove_Closed($script:TicketsFilterMenuClosedHandler) } } catch { }
 
@@ -8796,37 +8679,16 @@ function Initialize-QOTicketsUI {
             $script:TicketsSetAssignedToMenuItem.Items.Clear()
         }
     } catch { }
-    try {
-        if ($script:TicketsFilterAssigneeAllMenuItem) {
-            if ($script:TicketsFilterCheckboxHandler) {
-                try { $script:TicketsFilterAssigneeAllMenuItem.Remove_Click($script:TicketsFilterCheckboxHandler) } catch { }
-            }
-            $script:TicketsFilterAssigneeAllMenuItem = $null
+    if ($script:TicketsFilterAssigneeMenuItem -and $script:TicketsFilterCheckboxHandler) {
+        foreach ($item in $script:TicketsFilterAssigneeMenuItem.Items) {
+            $item.Remove_Click($script:TicketsFilterCheckboxHandler)
         }
-        if ($script:TicketsFilterAssigneeUnassignedMenuItem) {
-            if ($script:TicketsFilterCheckboxHandler) {
-                try { $script:TicketsFilterAssigneeUnassignedMenuItem.Remove_Click($script:TicketsFilterCheckboxHandler) } catch { }
-            }
-            $script:TicketsFilterAssigneeUnassignedMenuItem = $null
-        }
-        foreach ($item in @($script:TicketsFilterAssigneeDynamicMenuItems)) {
-            if ($item -and $script:TicketsFilterCheckboxHandler) {
-                try { $item.Remove_Click($script:TicketsFilterCheckboxHandler) } catch { }
-            }
-        }
-        $script:TicketsFilterAssigneeDynamicMenuItems = @()
-    } catch { }
+        $script:TicketsFilterAssigneeMenuItem.Items.Clear()
+    }
 
     try {
-        if ($script:TicketsSyncStatusClickHandler) {
-            try { $syncStatusText.RemoveHandler([System.Windows.UIElement]::MouseLeftButtonUpEvent, $script:TicketsSyncStatusClickHandler) } catch { }
-            try { $syncStatusText.Remove_MouseLeftButtonUp($script:TicketsSyncStatusClickHandler) } catch { }
-        }
-    } catch { }
-    $script:TicketsSyncStatusClickHandler = $null
-    try {
-        if ($script:TicketsWindowClosingHandler) {
-            $Window.Remove_Closing($script:TicketsWindowClosingHandler)
+        if ($script:TicketsWindowClosedHandler) {
+            $Window.Remove_Closed($script:TicketsWindowClosedHandler)
         }
     } catch { }
 
@@ -9024,21 +8886,7 @@ function Initialize-QOTicketsUI {
     try { [System.Windows.Controls.VirtualizingPanel]::SetVirtualizationMode($grid, [System.Windows.Controls.VirtualizationMode]::Recycling) } catch { }
     try { [System.Windows.Controls.ScrollViewer]::SetCanContentScroll($grid, $true) } catch { }
 
-    try {
-        $syncStatusText.Cursor = [System.Windows.Input.Cursors]::Hand
-    } catch { }
-    $script:TicketsSyncStatusClickHandler = [System.Windows.Input.MouseButtonEventHandler]{
-        param($sender, $eventArgs)
-        try {
-            if ($eventArgs -and $eventArgs.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) {
-                return
-            }
-        } catch { }
-        try { if ($eventArgs) { $eventArgs.Handled = $true } } catch { }
-
-        Invoke-QOTicketsManualSyncRequest -Grid $grid -GetTicketsCmd $getTicketsCmd -SyncCmd $syncCmd -StatusText $syncStatusText -InvokeSyncCmd $invokeEmailSyncRefreshCmd -MaxPerMailbox $script:TicketsBackgroundBatchSize | Out-Null
-    }.GetNewClosure()
-    $syncStatusText.AddHandler([System.Windows.UIElement]::MouseLeftButtonUpEvent, $script:TicketsSyncStatusClickHandler, $true)
+    Register-QOTicketsSyncStatusClick -Grid $grid -StatusText $syncStatusText -GetTicketsCmd $getTicketsCmd -SyncCmd $syncCmd
     try { $grid.IsReadOnly = $true } catch { }
 
     if ($grid.ContextMenu) {
@@ -9098,9 +8946,6 @@ function Initialize-QOTicketsUI {
     $script:TicketsFilterAssigneeMenuItem.Header = "Assigned to"
     if ($applyTicketsMenuItemThemeCmd) { & $applyTicketsMenuItemThemeCmd -MenuItem $script:TicketsFilterAssigneeMenuItem -Window $Window | Out-Null }
     $script:TicketsFilterMenu.Items.Add($script:TicketsFilterAssigneeMenuItem) | Out-Null
-    $script:TicketsFilterAssigneeAllMenuItem = $null
-    $script:TicketsFilterAssigneeUnassignedMenuItem = $null
-    $script:TicketsFilterAssigneeDynamicMenuItems = @()
 
     $script:TicketsFilterMenu.Items.Add($(if ($newTicketsStyledSeparatorCmd) { & $newTicketsStyledSeparatorCmd -Window $Window } else { New-Object System.Windows.Controls.Separator })) | Out-Null
     $script:TicketsFilterSortPriorityMenuItem = New-Object System.Windows.Controls.MenuItem
@@ -9133,314 +8978,18 @@ function Initialize-QOTicketsUI {
     $filterOpenMenuItem = $script:TicketsFilterOpenCheckbox
     $filterClosedMenuItem = $script:TicketsFilterClosedCheckbox
     $filterDeletedMenuItem = $script:TicketsFilterDeletedCheckbox
-    $filterAssigneeMenuItem = $script:TicketsFilterAssigneeMenuItem
-    $sortPriorityMenuItem = $script:TicketsFilterSortPriorityMenuItem
-    $sortNewestMenuItem = $script:TicketsFilterSortNewestMenuItem
-    $sortOldestMenuItem = $script:TicketsFilterSortOldestMenuItem
 
-    $updateFilterTooltip = {
-        $statusLabels = @()
-        if ($script:ShowOpen) { $statusLabels += "Open" }
-        if ($script:ShowClosed) { $statusLabels += "Closed" }
-        if ($script:ShowDeleted) { $statusLabels += "Deleted" }
-        $statusSummary = if ($statusLabels.Count -gt 0) { $statusLabels -join ", " } else { "None" }
-
-        $sortSummary = switch ($script:TicketsSortMode) {
-            "Newest" { "Newest first" }
-            "Oldest" { "Oldest first" }
-            default { "Priority High -> Low" }
-        }
-        $assigneeSummary = & $normalizeAssigneeFilterCmd -Value $script:TicketsAssigneeFilter
-        if ([string]::IsNullOrWhiteSpace($assigneeSummary)) { $assigneeSummary = "All" }
-        $btnFilterMenu.ToolTip = ("Filter tickets (Status: {0} | Assignee: {1} | Sort: {2})" -f $statusSummary, $assigneeSummary, $sortSummary)
-    }.GetNewClosure()
-
-    $applyFilterSelection = {
-        param(
-            [bool]$LogChange = $false,
-            [AllowNull()][string]$SortModeHint = "",
-            [AllowNull()][string]$AssigneeFilterHint = ""
-        )
-        $previousSortMode = [string]$script:TicketsSortMode
-
-        $script:ShowOpen = [bool]$filterOpenMenuItem.IsChecked
-        $script:ShowClosed = [bool]$filterClosedMenuItem.IsChecked
-        $script:ShowDeleted = [bool]$filterDeletedMenuItem.IsChecked
-
-        $requestedSortMode = ([string]($SortModeHint + "")).Trim()
-        if (-not [string]::IsNullOrWhiteSpace($requestedSortMode)) {
-            $script:TicketsSortMode = $requestedSortMode
-        } else {
-            $checkedSortMode = ""
-            try {
-                if ($sortNewestMenuItem -and [bool]$sortNewestMenuItem.IsChecked) {
-                    $checkedSortMode = "Newest"
-                }
-                elseif ($sortOldestMenuItem -and [bool]$sortOldestMenuItem.IsChecked) {
-                    $checkedSortMode = "Oldest"
-                }
-                elseif ($sortPriorityMenuItem -and [bool]$sortPriorityMenuItem.IsChecked) {
-                    $checkedSortMode = "Priority"
-                }
-            } catch { $checkedSortMode = "" }
-
-            if (-not [string]::IsNullOrWhiteSpace($checkedSortMode)) {
-                $script:TicketsSortMode = $checkedSortMode
-            }
-            elseif ([string]::IsNullOrWhiteSpace([string]$script:TicketsSortMode)) {
-                $script:TicketsSortMode = "Priority"
-            }
-        }
-        switch ($script:TicketsSortMode.ToLowerInvariant()) {
-            "newest" { $script:TicketsSortMode = "Newest" }
-            "oldest" { $script:TicketsSortMode = "Oldest" }
-            default { $script:TicketsSortMode = "Priority" }
-        }
-        $requestedAssigneeFilter = ([string]($AssigneeFilterHint + "")).Trim()
-        if (-not [string]::IsNullOrWhiteSpace($requestedAssigneeFilter)) {
-            $script:TicketsAssigneeFilter = & $normalizeAssigneeFilterCmd -Value $requestedAssigneeFilter
-        } else {
-            $checkedAssigneeFilter = ""
-            foreach ($assigneeItem in @(
-                    $script:TicketsFilterAssigneeAllMenuItem,
-                    $script:TicketsFilterAssigneeUnassignedMenuItem
-                ) + @($script:TicketsFilterAssigneeDynamicMenuItems)) {
-                if (-not $assigneeItem) { continue }
-                $isCheckedAssignee = $false
-                try { $isCheckedAssignee = [bool]$assigneeItem.IsChecked } catch { $isCheckedAssignee = $false }
-                if (-not $isCheckedAssignee) { continue }
-
-                $assigneeTag = ""
-                try { $assigneeTag = [string]($assigneeItem.Tag + "") } catch { $assigneeTag = "" }
-                if ($assigneeTag.StartsWith("Assignee:", [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $checkedAssigneeFilter = $assigneeTag.Substring(9)
-                    break
-                }
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($checkedAssigneeFilter)) {
-                $script:TicketsAssigneeFilter = & $normalizeAssigneeFilterCmd -Value $checkedAssigneeFilter
-            } else {
-                $script:TicketsAssigneeFilter = & $normalizeAssigneeFilterCmd -Value $script:TicketsAssigneeFilter
-            }
-        }
-
-        if ($setFilterRuntimeStateLocal) {
-            & $setFilterRuntimeStateLocal -ShowOpen $script:ShowOpen -ShowClosed $script:ShowClosed -ShowDeleted $script:ShowDeleted -SortMode $script:TicketsSortMode -AssigneeFilter $script:TicketsAssigneeFilter -Grid $grid
-        }
-
-        # Sort options are mutually exclusive (radio-style): only one can be checked.
-        try { $script:TicketsFilterSortPriorityMenuItem.IsChecked = ($script:TicketsSortMode -eq "Priority") } catch { }
-        try { $script:TicketsFilterSortNewestMenuItem.IsChecked = ($script:TicketsSortMode -eq "Newest") } catch { }
-        try { $script:TicketsFilterSortOldestMenuItem.IsChecked = ($script:TicketsSortMode -eq "Oldest") } catch { }
-
-        # Keep at least one status filter active so Tickets never reopens as a blank list by accident.
-        if (-not ($script:ShowOpen -or $script:ShowClosed -or $script:ShowDeleted)) {
-            $script:ShowOpen = $true
-            try { $filterOpenMenuItem.IsChecked = $true } catch { }
-        }
-
-        # Keep checkbox visuals and internal state aligned.
-        try { $filterOpenMenuItem.IsChecked = [bool]$script:ShowOpen } catch { }
-        try { $filterClosedMenuItem.IsChecked = [bool]$script:ShowClosed } catch { }
-        try { $filterDeletedMenuItem.IsChecked = [bool]$script:ShowDeleted } catch { }
-        foreach ($assigneeItem in @(
-                $script:TicketsFilterAssigneeAllMenuItem,
-                $script:TicketsFilterAssigneeUnassignedMenuItem
-            ) + @($script:TicketsFilterAssigneeDynamicMenuItems)) {
-            if (-not $assigneeItem) { continue }
-            $assigneeTag = ""
-            try { $assigneeTag = [string]($assigneeItem.Tag + "") } catch { $assigneeTag = "" }
-            $assigneeValue = ""
-            if ($assigneeTag.StartsWith("Assignee:", [System.StringComparison]::OrdinalIgnoreCase)) {
-                $assigneeValue = $assigneeTag.Substring(9)
-            }
-            $assigneeValue = & $normalizeAssigneeFilterCmd -Value $assigneeValue
-            try { $assigneeItem.IsChecked = ($assigneeValue -ieq $script:TicketsAssigneeFilter) } catch { }
-        }
-
-        if (-not $script:TicketsFilterState) {
-            $script:TicketsFilterState = [pscustomobject]@{
-                ShowOpen             = [bool]$script:TicketsFilterDefaults.ShowOpen
-                ShowClosed           = [bool]$script:TicketsFilterDefaults.ShowClosed
-                ShowDeleted          = [bool]$script:TicketsFilterDefaults.ShowDeleted
-                SortMode             = [string]$script:TicketsFilterDefaults.SortMode
-                AssigneeFilter       = [string]$script:TicketsFilterDefaults.AssigneeFilter
-            }
-        }
-
-        foreach ($prop in @("ShowOpen", "ShowClosed", "ShowDeleted", "SortMode", "AssigneeFilter")) {
-            if ($script:TicketsFilterState.PSObject.Properties.Name -notcontains $prop) {
-                $script:TicketsFilterState | Add-Member -NotePropertyName $prop -NotePropertyValue ($script:TicketsFilterDefaults.$prop) -Force
-            }
-            if ($null -eq $script:TicketsFilterState.$prop) {
-                $script:TicketsFilterState.$prop = $script:TicketsFilterDefaults.$prop
-            }
-        }
-
-        $state = $script:TicketsFilterState
-        $state.ShowOpen = $script:ShowOpen
-        $state.ShowClosed = $script:ShowClosed
-        $state.ShowDeleted = $script:ShowDeleted
-        $state.SortMode = $script:TicketsSortMode
-        $state.AssigneeFilter = $script:TicketsAssigneeFilter
-
-        & $updateFilterTooltip
-
-        if ($LogChange) {
-            Write-QOTicketsUILog ("Tickets filter updated: Open={0}, Closed={1}, Deleted={2}, Assignee={3}, SortMode={4}" -f $script:ShowOpen, $script:ShowClosed, $script:ShowDeleted, $script:TicketsAssigneeFilter, $script:TicketsSortMode)
-        }
-        $persisted = $false
-        try {
-            $persisted = [bool](Save-QOTicketsFilterState -ShowOpen $script:ShowOpen -ShowClosed $script:ShowClosed -ShowDeleted $script:ShowDeleted -SortMode $script:TicketsSortMode -AssigneeFilter $script:TicketsAssigneeFilter)
-        } catch { $persisted = $false }
-        if ((-not $persisted) -and $setTicketListViewCmd) {
-            try {
-                $null = & $setTicketListViewCmd -ShowOpen $script:ShowOpen -ShowClosed $script:ShowClosed -ShowDeleted $script:ShowDeleted -SortMode $script:TicketsSortMode -AssigneeFilter $script:TicketsAssigneeFilter
-            } catch {
-                Write-QOTicketsUILog ("Tickets: Persisting filter/sort settings failed. " + $_.Exception.Message) "WARN"
-            }
-        }
-        if ($invokeTicketsFilterLocal) {
-            & $invokeTicketsFilterLocal -ForceRefresh -Grid $grid
-        } else {
-            Invoke-QOTicketsFilterSafely -ForceRefresh -Grid $grid
-        }
-        if ($LogChange -and $grid) {
-            try {
-                if ($grid.Items.Count -gt 0) {
-                    $topTicket = $grid.Items[0]
-                    $topSubject = ""
-                    $topCreated = ""
-                    try { if ($topTicket -and $topTicket.PSObject.Properties.Name -contains "Subject") { $topSubject = [string]$topTicket.Subject } } catch { }
-                    try { if ($topTicket -and $topTicket.PSObject.Properties.Name -contains "CreatedAtDisplay") { $topCreated = [string]$topTicket.CreatedAtDisplay } } catch { }
-                    if ([string]::IsNullOrWhiteSpace($topCreated)) {
-                        try { if ($topTicket -and $topTicket.PSObject.Properties.Name -contains "CreatedAt") { $topCreated = [string]$topTicket.CreatedAt } } catch { }
-                    }
-                    Write-QOTicketsUILog ("Tickets sort preview: Top='{0}', Created='{1}', SortMode={2}" -f $topSubject, $topCreated, $script:TicketsSortMode)
-                }
-            } catch { }
-        }
-
-        $sortModeChanged = (([string]($previousSortMode + "")).Trim().ToLowerInvariant() -ne ([string]($script:TicketsSortMode + "")).Trim().ToLowerInvariant())
-        if ($sortModeChanged -and $grid) {
-            try {
-                # Make sort changes visibly obvious: clear sticky selection and jump to the first row.
-                $grid.UnselectAll()
-            } catch { }
-            try {
-                if ($grid.Items.Count -gt 0) {
-                    $firstItem = $grid.Items[0]
-                    $grid.ScrollIntoView($firstItem)
-                }
-            } catch { }
-        }
-    }.GetNewClosure()
-
+    $applyFilterSelection = ${function:Update-QOTicketsFilterSelection}
     $script:TicketsFilterCheckboxHandler = [System.Windows.RoutedEventHandler]{
         param($sender, $args)
-        try {
-            $eventSource = $sender
-            try {
-                if ($eventSource -is [System.Collections.IEnumerable] -and $eventSource -isnot [string]) {
-                    foreach ($candidate in @($eventSource)) {
-                        if ($null -eq $candidate) { continue }
-                        $hasTag = $false
-                        try { $hasTag = ($candidate.PSObject.Properties.Name -contains "Tag") } catch { $hasTag = $false }
-                        if ($hasTag) { $eventSource = $candidate; break }
-                    }
-                }
-            } catch { $eventSource = $sender }
-
-            $tagValue = ""
-            try {
-                if ($eventSource -and ($eventSource.PSObject.Properties.Name -contains "Tag")) {
-                    $tagValue = ([string]($eventSource.Tag + "")).Trim()
-                }
-            } catch { $tagValue = "" }
-
-            if ($tagValue.StartsWith("Assignee:", [System.StringComparison]::OrdinalIgnoreCase)) {
-                $assigneeFilterHint = & $normalizeAssigneeFilterCmd -Value $tagValue.Substring(9)
-                & $applyFilterSelection $true "" $assigneeFilterHint
-                return
-            }
-
-            $sortModeHint = $tagValue
-
-            if ($sortModeHint -ne "Priority" -and $sortModeHint -ne "Newest" -and $sortModeHint -ne "Oldest") {
-                return
-            }
-
-            try {
-                if ($sortPriorityMenuItem) { $sortPriorityMenuItem.IsChecked = ($sortModeHint -eq "Priority") }
-                if ($sortNewestMenuItem) { $sortNewestMenuItem.IsChecked = ($sortModeHint -eq "Newest") }
-                if ($sortOldestMenuItem) { $sortOldestMenuItem.IsChecked = ($sortModeHint -eq "Oldest") }
-            } catch { }
-
-            & $applyFilterSelection $true $sortModeHint
-        } catch {
-            Write-QOTicketsUILog ("Tickets: Filter change failed: " + $_.Exception.Message) "ERROR"
+        $tag = [string]$sender.Tag
+        if ($tag.StartsWith('Assignee:')) {
+            Update-QOTicketsFilterSelection -Save $true -Assignee $tag.Substring(9)
+        } elseif ($tag -in 'Priority','Newest','Oldest') {
+            Update-QOTicketsFilterSelection -Save $true -SortMode $tag
         }
-    }.GetNewClosure()
-
-    $resolveFilterAssigneeValues = {
-        $rawItems = @()
-        if ($getAssigneesCmd) {
-            try { $rawItems = @(& $getAssigneesCmd) } catch { $rawItems = @() }
-        }
-
-        $valueSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-        [void]$valueSet.Add("Unassigned")
-        foreach ($raw in @($rawItems)) {
-            $normalized = & $normalizeAssigneeFilterCmd -Value ([string]$raw)
-            if ([string]::IsNullOrWhiteSpace($normalized) -or $normalized -eq "All") { continue }
-            [void]$valueSet.Add($normalized)
-        }
-
-        $currentAssignee = ""
-        try { $currentAssignee = [string](& $getCurrentAssigneeCmd) } catch { $currentAssignee = "" }
-        $currentAssignee = & $normalizeAssigneeFilterCmd -Value $currentAssignee
-        if (-not [string]::IsNullOrWhiteSpace($currentAssignee) -and $currentAssignee -ne "All") {
-            [void]$valueSet.Add($currentAssignee)
-        }
-
-        $sorted = @($valueSet | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and $_ -ne "All" } | Sort-Object)
-        return @("All") + @($sorted)
-    }.GetNewClosure()
-
-    $rebuildFilterAssigneeMenu = {
-        if (-not $filterAssigneeMenuItem) { return }
-
-        try { $filterAssigneeMenuItem.Items.Clear() } catch { }
-        $script:TicketsFilterAssigneeAllMenuItem = $null
-        $script:TicketsFilterAssigneeUnassignedMenuItem = $null
-        $script:TicketsFilterAssigneeDynamicMenuItems = @()
-
-        $selectedAssigneeFilter = & $normalizeAssigneeFilterCmd -Value $script:TicketsAssigneeFilter
-        $assigneeValues = @(& $resolveFilterAssigneeValues)
-        foreach ($assigneeValue in @($assigneeValues)) {
-            $normalizedAssignee = & $normalizeAssigneeFilterCmd -Value $assigneeValue
-            if ([string]::IsNullOrWhiteSpace($normalizedAssignee)) { continue }
-
-            $item = New-Object System.Windows.Controls.MenuItem
-            $item.IsCheckable = $true
-            $item.IsEnabled = $true
-            $item.Tag = ("Assignee:{0}" -f $normalizedAssignee)
-            $item.IsChecked = ($normalizedAssignee -ieq $selectedAssigneeFilter)
-            $item.Header = if ($normalizedAssignee -eq "All") { "All assignees" } else { $normalizedAssignee }
-            if ($applyTicketsMenuItemThemeCmd) { & $applyTicketsMenuItemThemeCmd -MenuItem $item -Window $Window | Out-Null }
-            try { $item.Add_Click($script:TicketsFilterCheckboxHandler) } catch { }
-            $filterAssigneeMenuItem.Items.Add($item) | Out-Null
-
-            if ($normalizedAssignee -eq "All") {
-                $script:TicketsFilterAssigneeAllMenuItem = $item
-            } elseif ($normalizedAssignee -eq "Unassigned") {
-                $script:TicketsFilterAssigneeUnassignedMenuItem = $item
-            } else {
-                $script:TicketsFilterAssigneeDynamicMenuItems += @($item)
-            }
-        }
-    }.GetNewClosure()
+    }
+    $rebuildFilterAssigneeMenu = ${function:Update-QOTicketsAssigneeFilterMenu}
     & $rebuildFilterAssigneeMenu
 
     $script:TicketsFilterStatusCheckedHandler = [System.Windows.RoutedEventHandler]{
@@ -9454,13 +9003,6 @@ function Initialize-QOTicketsUI {
         param($sender, $args)
         try { & $applyFilterSelection $true } catch {
             Write-QOTicketsUILog ("Tickets: Status filter (unchecked) failed: " + $_.Exception.Message) "ERROR"
-        }
-    }.GetNewClosure()
-
-    $script:TicketsFilterStatusClickHandler = [System.Windows.RoutedEventHandler]{
-        param($sender, $args)
-        try { & $applyFilterSelection $true } catch {
-            Write-QOTicketsUILog ("Tickets: Status filter (click) failed: " + $_.Exception.Message) "ERROR"
         }
     }.GetNewClosure()
 
@@ -9520,8 +9062,8 @@ function Initialize-QOTicketsUI {
     }.GetNewClosure()
     try { $script:TicketsFilterMenu.Add_Closed($script:TicketsFilterMenuClosedHandler) } catch { }
 
-    $script:TicketsWindowClosingHandler = [System.ComponentModel.CancelEventHandler]${function:Close-QOTicketsUI}
-    try { $Window.Add_Closing($script:TicketsWindowClosingHandler) } catch { }
+    $script:TicketsWindowClosedHandler = [System.EventHandler]${function:Close-QOTicketsUI}
+    $Window.Add_Closed($script:TicketsWindowClosedHandler)
 
     try {
         $loadedSortMode = ([string]($script:TicketsSortMode + "")).Trim()
@@ -9630,17 +9172,13 @@ function Initialize-QOTicketsUI {
             $selectedItems = @(& $getSelectedTicketsCmd -Grid $grid -AllowContextFallback)
             if ($selectedItems.Count -eq 0) { return }
 
-            $ids = @(
-                $selectedItems |
-                    Where-Object { $_ -and ($_.PSObject.Properties.Name -contains "Id") } |
-                    ForEach-Object { $_.Id }
-            )
-            if ($ids.Count -eq 0) { return }
-
+            $ids = @($selectedItems | Where-Object { $_.Id -and ($_.IsDeleted -or $_.Folder -eq 'Deleted') } | ForEach-Object Id)
+            if (!$ids.Count) { return }
             $null = & $restoreCmd -Id $ids
             & $invokeGridRefresh
         } catch {
             Write-QOTicketsUILog ("Tickets: Undelete failed: " + $_.Exception.Message) "ERROR"
+            [System.Windows.MessageBox]::Show($_.Exception.Message, 'Could not restore ticket') | Out-Null
         }
     }.GetNewClosure()
     $script:TicketsUndeleteMenuItem.Add_Click($script:TicketsUndeleteHandler)
@@ -10154,12 +9692,13 @@ function Initialize-QOTicketsUI {
         }
     }.GetNewClosure()
 
+    $assignMenu = $script:TicketsSetAssignedToMenuItem
+    $assignClick = $script:TicketsAssignMenuItemHandler
+    $customAssignClick = $script:TicketsAssignCustomMenuItemHandler
     $rebuildAssignSubmenu = {
         param([AllowNull()][string]$SelectedAssignee)
 
-        if (-not $script:TicketsSetAssignedToMenuItem) { return }
-
-        $script:TicketsSetAssignedToMenuItem.Items.Clear()
+        $assignMenu.Items.Clear()
 
         $dynamicAssignees = @(& $resolveAssigneeMenuItems)
         $selectedValue = ([string]($SelectedAssignee + "")).Trim()
@@ -10183,16 +9722,16 @@ function Initialize-QOTicketsUI {
             $menuItem.IsCheckable = $true
             $menuItem.IsChecked = ($selectedValue -and ($assigneeValue -eq $selectedValue))
             if ($applyTicketsMenuItemThemeCmd) { & $applyTicketsMenuItemThemeCmd -MenuItem $menuItem -Window $Window | Out-Null }
-            $script:TicketsSetAssignedToMenuItem.Items.Add($menuItem) | Out-Null
-            try { $menuItem.Add_Click($script:TicketsAssignMenuItemHandler) } catch { }
+            $assignMenu.Items.Add($menuItem) | Out-Null
+            $menuItem.Add_Click($assignClick)
         }
 
-        $script:TicketsSetAssignedToMenuItem.Items.Add($(if ($newTicketsStyledSeparatorCmd) { & $newTicketsStyledSeparatorCmd -Window $Window } else { New-Object System.Windows.Controls.Separator })) | Out-Null
+        $assignMenu.Items.Add($(if ($newTicketsStyledSeparatorCmd) { & $newTicketsStyledSeparatorCmd -Window $Window } else { New-Object System.Windows.Controls.Separator })) | Out-Null
         $customAssignMenuItem = New-Object System.Windows.Controls.MenuItem
         $customAssignMenuItem.Header = "Set assignee..."
         if ($applyTicketsMenuItemThemeCmd) { & $applyTicketsMenuItemThemeCmd -MenuItem $customAssignMenuItem -Window $Window | Out-Null }
-        $script:TicketsSetAssignedToMenuItem.Items.Add($customAssignMenuItem) | Out-Null
-        try { $customAssignMenuItem.Add_Click($script:TicketsAssignCustomMenuItemHandler) } catch { }
+        $assignMenu.Items.Add($customAssignMenuItem) | Out-Null
+        $customAssignMenuItem.Add_Click($customAssignClick)
     }.GetNewClosure()
 
     $openStatusQuickMenu = {
@@ -10453,29 +9992,10 @@ function Initialize-QOTicketsUI {
         return $true
     }.GetNewClosure()
 
-    $resolveMenuItem = {
-        param([AllowNull()]$Candidate)
-
-        if ($Candidate -is [System.Windows.Controls.MenuItem]) { return $Candidate }
-        if ($Candidate -is [System.Array]) {
-            foreach ($entry in @($Candidate)) {
-                if ($entry -is [System.Windows.Controls.MenuItem]) { return $entry }
-            }
-        }
-        return $null
-    }.GetNewClosure()
-
-    $resolveContextMenu = {
-        param([AllowNull()]$Candidate)
-
-        if ($Candidate -is [System.Windows.Controls.ContextMenu]) { return $Candidate }
-        if ($Candidate -is [System.Array]) {
-            foreach ($entry in @($Candidate)) {
-                if ($entry -is [System.Windows.Controls.ContextMenu]) { return $entry }
-            }
-        }
-        return $null
-    }.GetNewClosure()
+    $rowContextMenu = $script:TicketsRowContextMenu
+    $menuUndelete = $script:TicketsUndeleteMenuItem
+    $menuRename = $script:TicketsRenameMenuItem
+    $setContextSelection = { param($items) $script:TicketsContextMenuSelection = @($items) }
 
     & $rebuildAssignSubmenu -SelectedAssignee $null
 
@@ -10572,7 +10092,19 @@ function Initialize-QOTicketsUI {
                 try { if ($grid.SelectedItem) { $selectedItems = @($grid.SelectedItem) } } catch { $selectedItems = @() }
             }
             if ($selectedItems.Count -eq 0) { $selectedItems = @($row.Item) }
-            $script:TicketsContextMenuSelection = @($selectedItems)
+            & $setContextSelection $selectedItems
+            $hasDeleted = @($selectedItems | Where-Object { $_.IsDeleted -or $_.Folder -eq 'Deleted' }).Count -gt 0
+            $menuUndelete.IsEnabled = $hasDeleted
+            foreach ($entry in $rowContextMenu.Items) {
+                if ($entry -ne $menuUndelete) { $entry.IsEnabled = !$hasDeleted }
+            }
+            if ($hasDeleted) {
+                $rowContextMenu.PlacementTarget = $placementTarget
+                $rowContextMenu.IsOpen = $true
+                $eventArgs.Handled = $true
+                return
+            }
+            $menuRename.IsEnabled = $selectedItems.Count -eq 1
 
             if (-not $clickedStatusText -and -not $clickedAssigneeText -and $clickedTextValue) {
                 if ($clickedTextValue.StartsWith("@")) { $clickedAssigneeText = $true }
@@ -10590,7 +10122,7 @@ function Initialize-QOTicketsUI {
                     try { $grid.SelectedItems.Clear() } catch { }
                     try { $grid.SelectedItem = $renameTarget } catch { }
                     try { if ($row) { $row.IsSelected = $true } } catch { }
-                    $script:TicketsContextMenuSelection = @($renameTarget)
+                    & $setContextSelection @($renameTarget)
 
                     $renameSucceeded = $false
                     try { $renameSucceeded = [bool](& $startInlineRenameTicket -Ticket $renameTarget) } catch { $renameSucceeded = $false }
@@ -10613,27 +10145,6 @@ function Initialize-QOTicketsUI {
                     }
                 } catch { $selectedAssignee = "" }
             }
-
-            $menuUndelete = & $resolveMenuItem $script:TicketsUndeleteMenuItem
-            $menuOpen = & $resolveMenuItem $script:TicketsOpenMenuItem
-            $menuClose = & $resolveMenuItem $script:TicketsCloseMenuItem
-            $menuClaim = & $resolveMenuItem $script:TicketsClaimMenuItem
-            $menuAddNote = & $resolveMenuItem $script:TicketsAddNoteMenuItem
-            $menuRename = & $resolveMenuItem $script:TicketsRenameMenuItem
-            $menuSetStatus = & $resolveMenuItem $script:TicketsSetStatusMenuItem
-            $menuSetPriority = & $resolveMenuItem $script:TicketsSetPriorityMenuItem
-            $menuSetAssigned = & $resolveMenuItem $script:TicketsSetAssignedToMenuItem
-            $rowContextMenu = & $resolveContextMenu $script:TicketsRowContextMenu
-
-            if ($menuUndelete) { $menuUndelete.IsEnabled = $false }
-            if ($menuOpen) { $menuOpen.IsEnabled = ($selectedItems.Count -gt 0) }
-            if ($menuClose) { $menuClose.IsEnabled = ($selectedItems.Count -gt 0) }
-            if ($menuClaim) { $menuClaim.IsEnabled = ($selectedItems.Count -gt 0) }
-            if ($menuAddNote) { $menuAddNote.IsEnabled = ($selectedItems.Count -gt 0) }
-            if ($menuRename) { $menuRename.IsEnabled = ($selectedItems.Count -eq 1) }
-            if ($menuSetStatus) { $menuSetStatus.IsEnabled = ($selectedItems.Count -gt 0) }
-            if ($menuSetPriority) { $menuSetPriority.IsEnabled = ($selectedItems.Count -gt 0) }
-            if ($menuSetAssigned) { $menuSetAssigned.IsEnabled = ($selectedItems.Count -gt 0) }
 
             & $rebuildAssignSubmenu -SelectedAssignee $selectedAssignee
             & $updateStatusMenuState -SelectedItems $selectedItems
@@ -11466,10 +10977,9 @@ function Initialize-QOTicketsUI {
             }
             & $setComposeMode -Mode "Note" -PreserveText -SkipFocus
             try {
-                $composeTicketId = Get-QOTicketIdValue -Ticket $ticket
+                $composeTicketId = & $getTicketIdValueCmd -Ticket $ticket
                 if (-not [string]::IsNullOrWhiteSpace($composeTicketId)) {
-                    if ($script:TicketsComposeModeByTicketId -isnot [hashtable]) { $script:TicketsComposeModeByTicketId = @{} }
-                    $script:TicketsComposeModeByTicketId[$composeTicketId] = "Note"
+                    $composeState.ByTicketId[$composeTicketId] = "Note"
                 }
                 Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='Note'." -f $composeTicketId)
             } catch { }
@@ -11503,10 +11013,9 @@ function Initialize-QOTicketsUI {
 
             & $setComposeMode -Mode "Reply" -PreserveText -SkipFocus
             try {
-                $composeTicketId = Get-QOTicketIdValue -Ticket $ticket
+                $composeTicketId = & $getTicketIdValueCmd -Ticket $ticket
                 if (-not [string]::IsNullOrWhiteSpace($composeTicketId)) {
-                    if ($script:TicketsComposeModeByTicketId -isnot [hashtable]) { $script:TicketsComposeModeByTicketId = @{} }
-                    $script:TicketsComposeModeByTicketId[$composeTicketId] = "Reply"
+                    $composeState.ByTicketId[$composeTicketId] = "Reply"
                 }
                 Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='Reply'." -f $composeTicketId)
             } catch { }
@@ -11548,6 +11057,7 @@ function Initialize-QOTicketsUI {
         }
     } catch { $backgroundActionRunnerPath = "" }
     $readBackgroundActionRunnerResultCmd = Get-Command Read-QOTicketsBackgroundActionRunnerResult -CommandType Function -ErrorAction Stop
+    $backgroundActions = $script:TicketsBackgroundActionTimers
     $cleanupBackgroundActionArtifacts = {
         param(
             [AllowNull()]$TimerRecord,
@@ -11560,18 +11070,6 @@ function Initialize-QOTicketsUI {
             if ($TimerRecord.Timer -and $TimerRecord.TickHandler) {
                 try { $TimerRecord.Timer.Remove_Tick($TimerRecord.TickHandler) } catch { }
                 try { $TimerRecord.Timer.Stop() } catch { }
-            }
-        } catch { }
-
-        try {
-            foreach ($path in @($TimerRecord.PayloadPath, $TimerRecord.ResultPath, $TimerRecord.StdOutPath, $TimerRecord.StdErrPath)) {
-                $pathValue = ([string]($path + "")).Trim()
-                if ([string]::IsNullOrWhiteSpace($pathValue)) { continue }
-                try {
-                    if (Test-Path -LiteralPath $pathValue) {
-                        Remove-Item -LiteralPath $pathValue -Force -ErrorAction SilentlyContinue
-                    }
-                } catch { }
             }
         } catch { }
 
@@ -11589,11 +11087,10 @@ function Initialize-QOTicketsUI {
             }
         } catch { }
 
-        try {
-            if ($script:TicketsBackgroundActionTimers -is [System.Collections.IList]) {
-                [void]$script:TicketsBackgroundActionTimers.Remove($TimerRecord)
-            }
-        } catch { }
+        foreach ($path in @($TimerRecord.PayloadPath, $TimerRecord.ResultPath, $TimerRecord.StdOutPath, $TimerRecord.StdErrPath)) {
+            if ($path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        }
+        $backgroundActions.Remove($TimerRecord)
     }.GetNewClosure()
     $startBackgroundTicketAction = {
         param(
@@ -11628,15 +11125,21 @@ function Initialize-QOTicketsUI {
         $resultPath = Join-Path $tempRoot ("qot_ticket_action_{0}.result.json" -f $operationId)
         $stdoutPath = Join-Path $tempRoot ("qot_ticket_action_{0}.stdout.log" -f $operationId)
         $stderrPath = Join-Path $tempRoot ("qot_ticket_action_{0}.stderr.log" -f $operationId)
+        $timerRecord = [pscustomobject]@{
+            Timer = $null; TickHandler = $null; Process = $null
+            PayloadPath = $payloadPath; ResultPath = $resultPath
+            StdOutPath = $stdoutPath; StdErrPath = $stderrPath
+        }
 
         try {
-            ($Payload | ConvertTo-Json -Depth 12 -Compress) | Set-Content -LiteralPath $payloadPath -Encoding UTF8 -Force
+            ($Payload | ConvertTo-Json -Depth 12 -Compress) | Set-Content -LiteralPath $payloadPath -Encoding UTF8 -Force -ErrorAction Stop
         } catch {
             $failureResult = [pscustomobject]@{
                 Success = $false
                 Note    = ("Failed to prepare background {0} payload: " -f $LogLabel) + $_.Exception.Message
                 Action  = $ActionName
             }
+            & $cleanupBackgroundActionArtifacts $timerRecord
             if ($OnFailure) { & $OnFailure $failureResult }
             return $null
         }
@@ -11673,6 +11176,7 @@ function Initialize-QOTicketsUI {
                 Action  = $ActionName
             }
             try { & $replySendWriteLogCmd ("Tickets: Failed to start background {0} runner: {1}" -f $LogLabel, $_.Exception.Message) "WARN" } catch { }
+            & $cleanupBackgroundActionArtifacts $timerRecord
             if ($OnFailure) { & $OnFailure $failureResult }
             return $null
         }
@@ -11680,49 +11184,21 @@ function Initialize-QOTicketsUI {
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $timer = [System.Windows.Threading.DispatcherTimer]::new()
         $timer.Interval = [TimeSpan]::FromMilliseconds(250)
-        $timerRecord = [pscustomobject]@{
-            Timer       = $timer
-            TickHandler = $null
-            PayloadPath = $payloadPath
-            ResultPath  = $resultPath
-            StdOutPath  = $stdoutPath
-            StdErrPath  = $stderrPath
-            Process     = $process
-        }
-        try { $script:TicketsBackgroundActionTimers += $timerRecord } catch { }
+        $timerRecord.Timer = $timer
+        $timerRecord.Process = $process
+        [void]$backgroundActions.Add($timerRecord)
 
+        # GetNewClosure captures locals from this invocation. Keep the commands
+        # needed after the click handler returns with this worker's timer.
+        $readWorkerResult = $readBackgroundActionRunnerResultCmd
+        $releaseWorker = $cleanupBackgroundActionArtifacts
+        $writeWorkerLog = $replySendWriteLogCmd
         $tickHandler = {
             try {
-                $isComplete = $false
-                $timedOut = $false
-                if (-not [string]::IsNullOrWhiteSpace([string]$timerRecord.ResultPath)) {
-                    try {
-                        if (Test-Path -LiteralPath $timerRecord.ResultPath) {
-                            $resultInfo = Get-Item -LiteralPath $timerRecord.ResultPath -ErrorAction Stop
-                            if ($resultInfo.Length -gt 0) {
-                                $isComplete = $true
-                            }
-                        }
-                    } catch { }
-                }
-
-                if (-not $isComplete -and $timerRecord.Process) {
-                    try {
-                        if ($timerRecord.Process.HasExited -and $stopwatch.Elapsed.TotalSeconds -ge 1) {
-                            $isComplete = $true
-                        }
-                    } catch { }
-                }
-
-                if (-not $isComplete -and $stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
-                    $timedOut = $true
-                    $isComplete = $true
-                }
-
-                if (-not $isComplete) { return }
-
-                try { $stopwatch.Stop() } catch { }
-                & $cleanupBackgroundActionArtifacts $timerRecord -ForceTerminate:$timedOut
+                $hasExited = $timerRecord.Process.HasExited
+                $timedOut = !$hasExited -and $stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds
+                if (!$hasExited -and !$timedOut) { return }
+                $stopwatch.Stop()
 
                 $result = $null
                 if ($timedOut) {
@@ -11732,7 +11208,7 @@ function Initialize-QOTicketsUI {
                         Action  = $ActionName
                     }
                 } else {
-                    $result = & $readBackgroundActionRunnerResultCmd -ResultPath $timerRecord.ResultPath -StdOutPath $timerRecord.StdOutPath -StdErrPath $timerRecord.StdErrPath
+                    $result = & $readWorkerResult -ResultPath $timerRecord.ResultPath -StdOutPath $timerRecord.StdOutPath -StdErrPath $timerRecord.StdErrPath
                     if (-not $result) {
                         $result = [pscustomobject]@{
                             Success = $false
@@ -11742,21 +11218,21 @@ function Initialize-QOTicketsUI {
                     }
                 }
 
-                $success = $false
-                try { $success = [bool]$result.Success } catch { $success = $false }
-                if ($success) {
-                    if ($OnSuccess) { & $OnSuccess $result }
-                } else {
-                    if ($OnFailure) { & $OnFailure $result }
-                }
             } catch {
-                & $cleanupBackgroundActionArtifacts $timerRecord
-                $failureResult = [pscustomobject]@{
+                $timedOut = $true
+                $result = [pscustomobject]@{
                     Success = $false
                     Note    = ("Background {0} watcher failed: " -f $LogLabel) + $_.Exception.Message
                     Action  = $ActionName
                 }
-                if ($OnFailure) { & $OnFailure $failureResult }
+            }
+            & $releaseWorker $timerRecord -ForceTerminate:$timedOut
+            try {
+                if ($result.Success) {
+                    if ($OnSuccess) { & $OnSuccess $result }
+                } elseif ($OnFailure) { & $OnFailure $result }
+            } catch {
+                & $writeWorkerLog ("Tickets: Background {0} result handler failed: {1}" -f $LogLabel, $_.Exception.Message) "WARN"
             }
         }.GetNewClosure()
 
@@ -11904,9 +11380,20 @@ function Initialize-QOTicketsUI {
         }
     }.GetNewClosure()
     $script:TicketsReplyQueueDrainHandler = $startNextQueuedReply
+    $replyFeedback = @{
+        Log = $replySendWriteLogCmd; ReadTickets = $getTicketsCmd
+        CopyTicket = Get-Command Update-QOTicketObjectFromSource
+        RemoveLocalNote = Get-Command Remove-QOTicketsLocalInternalNote
+        IsVisible = $isTicketVisibleInDetails; RefreshDetails = $queueLightweightDetailsRefresh
+        RefreshQueue = $refreshPendingReplyUi; RefreshCompose = $updateReplyComposeFeedback
+        SetPending = $setOptimisticReplyStateCmd; RemovePending = $removeOptimisticReplyCmd
+        Pulse = $replySendOpenPulseCmd; Status = $syncStatusText
+        Body = $ticketReplyText; Subject = $ticketReplySubject; SendButton = $btnSendReply
+    }
     $script:TicketsSendReplyHandler = [System.Windows.RoutedEventHandler]{
         param($sender, $args)
         try {
+            $feedback = $replyFeedback
             $queuedSendOperation = $null
             try {
                 $sendTag = $null
@@ -11947,9 +11434,11 @@ function Initialize-QOTicketsUI {
                 }
             }
 
-            if (-not $ticket) {
-                $ticket = $grid.SelectedItem
+            if ($queuedSendOperation -and !$ticket) {
+                & $replySendOpenPulseCmd -StatusText $syncStatusText -Message "The original ticket is no longer available for this reply." -DurationMilliseconds 3500
+                return
             }
+            if (-not $ticket) { $ticket = $grid.SelectedItem }
             if (-not $ticket) {
                 $activeId = ""
                 try { $activeId = ([string]($script:TicketsActiveTicketId + "")).Trim() } catch { $activeId = "" }
@@ -11991,7 +11480,7 @@ function Initialize-QOTicketsUI {
                 }
             } catch { $composeMode = "" }
             if ([string]::IsNullOrWhiteSpace($composeMode)) {
-                try { $composeMode = [string]$script:TicketsComposeMode } catch { $composeMode = "" }
+                try { $composeMode = [string]$composeState.Mode } catch { $composeMode = "" }
             }
             if ([string]::IsNullOrWhiteSpace($composeMode)) { $composeMode = "Reply" }
             if ($queuedSendOperation) { $composeMode = "Reply" }
@@ -12071,75 +11560,26 @@ function Initialize-QOTicketsUI {
                 try { & $replySendOpenPulseCmd -StatusText $syncStatusText -Message "Internal note saved locally." -DurationMilliseconds 1600 } catch { }
                 $noteSaveSuccessHandler = {
                     param($result)
-                    $persistedNoteId = $localNoteClientId
-                    $persistedStorePath = ""
-                    try { if ($result -and ($result.PSObject.Properties.Name -contains "NoteId")) { $persistedNoteId = ([string]($result.NoteId + "")).Trim() } } catch { $persistedNoteId = $localNoteClientId }
-                    try { if ($result -and ($result.PSObject.Properties.Name -contains "StorePath")) { $persistedStorePath = ([string]($result.StorePath + "")).Trim() } } catch { $persistedStorePath = "" }
-                    try { & $replySendWriteLogCmd ("Tickets: Background internal note persisted. TicketId='{0}' NoteId='{1}' StorePath='{2}'." -f $ticketId, $persistedNoteId, $persistedStorePath) } catch { }
-                    try {
-                        $savedTicket = $null
-                        $getLatestTicketsCmd = Resolve-QOTicketsCoreCommand -CommandName "Get-QOTickets"
-                        if ($getLatestTicketsCmd) {
-                            $dbLatest = & $getLatestTicketsCmd -Quiet
-                            if ($dbLatest -and ($dbLatest.PSObject.Properties.Name -contains "Tickets")) {
-                                $savedTicket = @(
-                                    @($dbLatest.Tickets) |
-                                        Where-Object { $_ -and ($_.PSObject.Properties.Name -contains "Id") -and ([string]$_.Id -eq $ticketId) } |
-                                        Select-Object -First 1
-                                )
-                                if ($savedTicket -is [System.Array]) {
-                                    if ($savedTicket.Count -gt 0) { $savedTicket = $savedTicket[0] } else { $savedTicket = $null }
-                                }
-                            }
-                        }
-                        if ($savedTicket) {
-                            $noteCount = 0
-                            $replyCount = 0
-                            $pendingCount = 0
-                            try { if ($savedTicket.PSObject.Properties.Name -contains "Notes") { $noteCount = @($savedTicket.Notes | Where-Object { $_ }).Count } } catch { $noteCount = 0 }
-                            try { if ($savedTicket.PSObject.Properties.Name -contains "Replies") { $replyCount = @($savedTicket.Replies | Where-Object { $_ }).Count } } catch { $replyCount = 0 }
-                            try { if ($savedTicket.PSObject.Properties.Name -contains "PendingReplies") { $pendingCount = @($savedTicket.PendingReplies | Where-Object { $_ }).Count } } catch { $pendingCount = 0 }
-                            try { & $replySendWriteLogCmd ("Tickets: Notes found on reload. TicketId='{0}' Notes={1} Replies={2} PendingReplies={3}." -f $ticketId, $noteCount, $replyCount, $pendingCount) } catch { }
-                            try { $null = Update-QOTicketObjectFromSource -Target $ticket -Source $savedTicket } catch { }
-                            try {
-                                foreach ($candidate in @($script:AllTickets)) {
-                                    if (-not $candidate) { continue }
-                                    $candidateId = ""
-                                    try { $candidateId = Get-QOTicketIdValue -Ticket $candidate } catch { $candidateId = "" }
-                                    if ([string]::Equals($candidateId, $ticketId, [System.StringComparison]::OrdinalIgnoreCase)) {
-                                        $null = Update-QOTicketObjectFromSource -Target $candidate -Source $savedTicket
-                                    }
-                                }
-                            } catch { }
-                            try {
-                                if ([bool](& $isTicketVisibleInDetails -TicketIdValue $ticketId)) {
-                                    & $queueLightweightDetailsRefresh $ticket
-                                } else {
-                                    & $replySendWriteLogCmd ("Tickets: Background internal note callback ignored because ticket/view is no longer active. TicketId='{0}'." -f $ticketId)
-                                }
-                            } catch { }
-                        } else {
-                            try { & $replySendWriteLogCmd ("Tickets: Internal note persisted but latest ticket reload did not return a matching ticket. TicketId='{0}' NoteId='{1}'." -f $ticketId, $persistedNoteId) "WARN" } catch { }
-                            try { & $queueLightweightDetailsRefresh $ticket } catch { }
-                        }
-                    } catch {
-                        try { & $replySendWriteLogCmd ("Tickets: Internal note persisted but reload failed. TicketId='{0}' Error='{1}'." -f $ticketId, $_.Exception.Message) "WARN" } catch { }
-                        try { & $queueLightweightDetailsRefresh $ticket } catch { }
+                    & $feedback.Log ("Tickets: Background internal note persisted. TicketId='{0}' NoteId='{1}' StorePath='{2}'." -f $ticketId, $result.NoteId, $result.StorePath)
+                    $latest = (& $feedback.ReadTickets -Quiet).Tickets | Where-Object Id -eq $ticketId | Select-Object -First 1
+                    if ($latest) {
+                        $null = & $feedback.CopyTicket -Target $ticket -Source $latest
+                    }
+                    if (& $feedback.IsVisible -TicketIdValue $ticketId) {
+                        & $feedback.RefreshDetails $ticket
                     }
                 }.GetNewClosure()
                 $noteSaveFailureHandler = {
                     param($result)
-                    $failureNote = ""
-                    try { if ($result -and ($result.PSObject.Properties.Name -contains "Note")) { $failureNote = ([string]($result.Note + "")).Trim() } } catch { $failureNote = "" }
-                    if ([string]::IsNullOrWhiteSpace($failureNote)) { $failureNote = "Internal note save failed in the background." }
-                    try { & $replySendWriteLogCmd ("Tickets: Background internal note save failed. TicketId='{0}' Note='{1}'." -f $ticketId, $failureNote) "WARN" } catch { }
-                    try { $null = Remove-QOTicketsLocalInternalNote -TicketId $ticketId -ClientNoteId $localNoteClientId } catch { }
-                    try { & $queueLightweightDetailsRefresh $ticket } catch { }
-                    try {
-                        if ([bool](& $isTicketVisibleInDetails -TicketIdValue $ticketId)) {
-                            & $replySendOpenPulseCmd -StatusText $syncStatusText -Message "Internal note save failed in the background." -DurationMilliseconds 2400
-                        }
-                    } catch { }
+                    $reason = [string]$result.Note
+                    if (!$reason) { $reason = "The internal note could not be saved." }
+                    & $feedback.Log ("Tickets: Background internal note save failed. TicketId='{0}' Note='{1}'." -f $ticketId, $reason) "WARN"
+                    $null = & $feedback.RemoveLocalNote -TicketId $ticketId -ClientNoteId $localNoteClientId
+                    if (& $feedback.IsVisible -TicketIdValue $ticketId) {
+                        if (!$feedback.Body.Text -and $feedback.SendButton.Tag.ComposeAction -eq 'Note') { $feedback.Body.Text = $messageText }
+                        & $feedback.RefreshDetails $ticket
+                        & $feedback.Pulse -StatusText $feedback.Status -Message $reason -DurationMilliseconds 4000
+                    }
                 }.GetNewClosure()
                 $null = & $startBackgroundTicketAction -ActionName "save-note" -Payload @{
                     TicketId = $ticketId
@@ -12188,6 +11628,11 @@ function Initialize-QOTicketsUI {
                 return
             }
 
+            $expectedRoute = & $getTicketReplyRoute -Ticket $ticket
+            if (!$expectedRoute.To) {
+                [System.Windows.MessageBox]::Show("Enter a valid customer address on this ticket before sending.", "Reply unavailable") | Out-Null
+                return
+            }
             $replyAlreadyInProgress = $false
             try { $replyAlreadyInProgress = [bool]$script:TicketsReplySendInProgress } catch { $replyAlreadyInProgress = $false }
 
@@ -12282,25 +11727,25 @@ function Initialize-QOTicketsUI {
                 try { if ($result -and ($result.PSObject.Properties.Name -contains "DuplicateSuppressed")) { $duplicateSuppressed = [bool]$result.DuplicateSuppressed } } catch { $duplicateSuppressed = $false }
 
                 try {
-                    if ($duplicateSuppressed -and $removeOptimisticReplyCmd -and -not [string]::IsNullOrWhiteSpace($optimisticDraftId)) {
-                        & $removeOptimisticReplyCmd -TicketId $ticketId -DraftId $optimisticDraftId
-                    } elseif ($setOptimisticReplyStateCmd -and -not [string]::IsNullOrWhiteSpace($resultDraftId)) {
-                        $null = & $setOptimisticReplyStateCmd -TicketId $ticketId -DraftId $resultDraftId -SendState Queued -FailureNote ""
+                    if ($duplicateSuppressed -and $feedback.RemovePending -and -not [string]::IsNullOrWhiteSpace($optimisticDraftId)) {
+                        & $feedback.RemovePending -TicketId $ticketId -DraftId $optimisticDraftId
+                    } elseif ($feedback.SetPending -and -not [string]::IsNullOrWhiteSpace($resultDraftId)) {
+                        $null = & $feedback.SetPending -TicketId $ticketId -DraftId $resultDraftId -SendState Queued -FailureNote ""
                     }
                 } catch { }
 
                 try {
                     if ($duplicateSuppressed) {
-                        & $replySendWriteLogCmd ("Tickets: Background reply queue persistence reused an existing queued reply. TicketId='{0}' DraftId='{1}'." -f $ticketId, $resultDraftId)
+                        & $feedback.Log ("Tickets: Background reply queue persistence reused an existing queued reply. TicketId='{0}' DraftId='{1}'." -f $ticketId, $resultDraftId)
                     } else {
-                        & $replySendWriteLogCmd ("Tickets: Background reply queue persistence completed. TicketId='{0}' DraftId='{1}'." -f $ticketId, $resultDraftId)
+                        & $feedback.Log ("Tickets: Background reply queue persistence completed. TicketId='{0}' DraftId='{1}'." -f $ticketId, $resultDraftId)
                     }
                 } catch { }
 
-                try { & $refreshPendingReplyUi -TicketIdValue $ticketId -Reason $(if ($duplicateSuppressed) { "queue-duplicate" } else { "queue-persisted" }) } catch { }
-                try { & $updateReplyComposeFeedback $ticket } catch { }
+                try { & $feedback.RefreshQueue -TicketIdValue $ticketId -Reason $(if ($duplicateSuppressed) { "queue-duplicate" } else { "queue-persisted" }) } catch { }
+                try { & $feedback.RefreshCompose $ticket } catch { }
                 if ($duplicateSuppressed) {
-                    try { & $replySendOpenPulseCmd -StatusText $syncStatusText -Message "This reply is already queued in the background." -DurationMilliseconds 1800 } catch { }
+                    try { & $feedback.Pulse -StatusText $feedback.Status -Message "This reply is already queued in the background." -DurationMilliseconds 1800 } catch { }
                 }
             }.GetNewClosure()
             $queuePersistFailureHandler = {
@@ -12310,17 +11755,22 @@ function Initialize-QOTicketsUI {
                 if ([string]::IsNullOrWhiteSpace($failureText)) { $failureText = "Reply failed before it could enter the queue." }
 
                 try {
-                    if ($setOptimisticReplyStateCmd -and -not [string]::IsNullOrWhiteSpace($optimisticDraftId)) {
-                        $null = & $setOptimisticReplyStateCmd -TicketId $ticketId -DraftId $optimisticDraftId -SendState Failed -FailureNote $failureText
+                    if ($feedback.SetPending -and -not [string]::IsNullOrWhiteSpace($optimisticDraftId)) {
+                        $null = & $feedback.SetPending -TicketId $ticketId -DraftId $optimisticDraftId -SendState Failed -FailureNote $failureText
                     }
                 } catch { }
-                try { & $replySendWriteLogCmd ("Tickets: Background reply queue persistence failed. TicketId='{0}' DraftId='{1}' Note='{2}'." -f $ticketId, $optimisticDraftId, $failureText) "WARN" } catch { }
-                try { & $refreshPendingReplyUi -TicketIdValue $ticketId -Reason "queue-persist-failed" } catch { }
-                try { & $replySendOpenPulseCmd -StatusText $syncStatusText -Message "Reply failed before it could enter the queue." -DurationMilliseconds 2200 } catch { }
+                try { & $feedback.Log ("Tickets: Background reply queue persistence failed. TicketId='{0}' DraftId='{1}' Note='{2}'." -f $ticketId, $optimisticDraftId, $failureText) "WARN" } catch { }
+                try { & $feedback.RefreshQueue -TicketIdValue $ticketId -Reason "queue-persist-failed" } catch { }
+                if (!$queuedSendOperation -and $feedback.Body -and !$feedback.Body.Text -and
+                    $feedback.Subject.Text -eq $replySubject -and (& $feedback.IsVisible -TicketIdValue $ticketId)) {
+                    $feedback.Body.Text = $messageText
+                }
+                try { & $feedback.Pulse -StatusText $feedback.Status -Message $failureText -DurationMilliseconds 4000 } catch { }
             }.GetNewClosure()
 
             $queuePersistAction = & $startBackgroundTicketAction -ActionName "queue-reply" -Payload @{
                 TicketId = $ticketId
+                ExpectedRoute = $expectedRoute
                 Subject  = $replySubject
                 Body     = $messageText
                 DraftId  = $optimisticDraftId
@@ -12460,7 +11910,7 @@ function Initialize-QOTicketsUI {
                 try {
                     if ($btnSendReply) {
                         $btnSendReply.IsEnabled = $true
-                        $btnSendReply.Content = if ([string]::Equals([string]$script:TicketsComposeMode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
+                        $btnSendReply.Content = if ([string]::Equals([string]$composeState.Mode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
                     }
                 } catch { }
             }.GetNewClosure()
@@ -12553,7 +12003,7 @@ function Initialize-QOTicketsUI {
                     try {
                         if ($btnSendReply) {
                             $btnSendReply.IsEnabled = $true
-                            $btnSendReply.Content = if ([string]::Equals([string]$script:TicketsComposeMode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
+                            $btnSendReply.Content = if ([string]::Equals([string]$composeState.Mode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
                         }
                     } catch { }
                     try { & $replySendOpenPulseCmd -StatusText $syncStatusText -Message "Reply queued and will send in the background..." -DurationMilliseconds 1800 } catch { }
@@ -12625,7 +12075,7 @@ function Initialize-QOTicketsUI {
             try {
                 if ($btnSendReply) {
                     $btnSendReply.IsEnabled = $true
-                    $btnSendReply.Content = if ([string]::Equals([string]$script:TicketsComposeMode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
+                    $btnSendReply.Content = if ([string]::Equals([string]$composeState.Mode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
                 }
             } catch { }
 
@@ -12965,7 +12415,7 @@ function Initialize-QOTicketsUI {
             return
         } catch {
             $modeForError = ""
-            try { $modeForError = [string]$script:TicketsComposeMode } catch { $modeForError = "" }
+            try { $modeForError = [string]$composeState.Mode } catch { $modeForError = "" }
             if ([string]::IsNullOrWhiteSpace($modeForError)) { $modeForError = "Reply" }
             $errMessage = $_.Exception.Message
             if ([string]::Equals($modeForError, "Note", [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -13095,7 +12545,7 @@ function Initialize-QOTicketsUI {
                 try {
                     if ($btnSendReply) {
                         $btnSendReply.IsEnabled = $true
-                        $btnSendReply.Content = if ([string]::Equals([string]$script:TicketsComposeMode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
+                        $btnSendReply.Content = if ([string]::Equals([string]$composeState.Mode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Save internal note" } else { "Send reply" }
                     }
                 } catch { }
                 try { & $startNextQueuedReply } catch { }
@@ -13442,8 +12892,9 @@ function Initialize-QOTicketsUI {
             $dialog.Title = "New ticket"
             $dialog.Width = 420
             $dialog.Height = 620
+            $dialog.MaxHeight = [System.Windows.SystemParameters]::WorkArea.Height
             $dialog.WindowStartupLocation = "CenterOwner"
-            $dialog.ResizeMode = "NoResize"
+            $dialog.ResizeMode = "CanResize"
             $dialog.Owner = $Window
 
             $stack = New-Object System.Windows.Controls.StackPanel
@@ -13560,8 +13011,7 @@ function Initialize-QOTicketsUI {
                 foreach ($control in @($emailHint, $customerEmailLabel, $customerEmailBox, $senderMailboxLabel, $senderMailboxBox, $emailBodyLabel, $emailBodyBox)) {
                     if (-not $control) { continue }
                     try {
-                        $control.IsEnabled = $isEnabled
-                        $control.Opacity = if ($isEnabled) { 1.0 } else { 0.55 }
+                        $control.Visibility = if ($isEnabled) { 'Visible' } else { 'Collapsed' }
                     } catch { }
                 }
             }.GetNewClosure()
@@ -13575,34 +13025,69 @@ function Initialize-QOTicketsUI {
 
             $btnCreate = New-Object System.Windows.Controls.Button
             $btnCreate.Content = "Create"
+            $btnCreate.IsDefault = $true
             $btnCreate.Width = 80
             $btnCreate.Margin = "0,0,8,0"
             $buttonsPanel.Children.Add($btnCreate) | Out-Null
 
             $btnCancel = New-Object System.Windows.Controls.Button
             $btnCancel.Content = "Cancel"
+            $btnCancel.IsCancel = $true
             $btnCancel.Width = 80
             $buttonsPanel.Children.Add($btnCancel) | Out-Null
 
-            $stack.Children.Add($buttonsPanel) | Out-Null
-            $dialog.Content = $stack
+            $validation = New-Object System.Windows.Controls.TextBlock
+            $validation.TextWrapping = 'Wrap'
+            $validation.Foreground = [Windows.Media.Brushes]::Firebrick
+            $validation.Margin = '0,0,0,6'
+            $validation.Visibility = 'Collapsed'
+            $footer = New-Object System.Windows.Controls.StackPanel
+            $footer.Margin = '12,0,12,12'
+            $null = $footer.Children.Add($validation)
+            $null = $footer.Children.Add($buttonsPanel)
+            $scroll = New-Object System.Windows.Controls.ScrollViewer
+            $scroll.VerticalScrollBarVisibility = 'Auto'
+            $scroll.Content = $stack
+            $layout = New-Object System.Windows.Controls.DockPanel
+            [System.Windows.Controls.DockPanel]::SetDock($footer, 'Bottom')
+            $null = $layout.Children.Add($footer)
+            $null = $layout.Children.Add($scroll)
+            $dialog.Content = $layout
 
-            $btnCancel.Add_Click({ $dialog.DialogResult = $false })
-            $btnCreate.Add_Click({ $dialog.DialogResult = $true })
+            $btnCancel.Add_Click({ $dialog.DialogResult = $false }.GetNewClosure())
+            $btnCreate.Add_Click({
+                $invalid = $null
+                $message = ''
+                if ([string]::IsNullOrWhiteSpace($nameBox.Text)) {
+                    $invalid = $nameBox
+                    $message = 'Enter a ticket title.'
+                } elseif ($emailToggle.IsChecked) {
+                    $address = $customerEmailBox.Text.Trim()
+                    if (!(Resolve-QOTicketEmailAddress -Value $address)) {
+                        $invalid = $customerEmailBox
+                        $message = 'Enter a customer email address.'
+                    } elseif (!$senderMailboxBox.SelectedItem) {
+                        $invalid = $senderMailboxBox
+                        $message = 'Choose a sender mailbox. You can add a monitored mailbox in Settings.'
+                    } elseif ([string]::IsNullOrWhiteSpace($emailBodyBox.Text)) {
+                        $invalid = $emailBodyBox
+                        $message = 'Enter the email message.'
+                    }
+                }
+                if ($invalid) {
+                    $validation.Text = $message
+                    $validation.Visibility = 'Visible'
+                    $invalid.BringIntoView()
+                    $null = $invalid.Focus()
+                    return
+                }
+                $dialog.DialogResult = $true
+            }.GetNewClosure())
 
             $result = $dialog.ShowDialog()
             if (-not $result) { return }
 
             $ticketName = ([string]$nameBox.Text).Trim()
-            if (-not $ticketName) {
-                [System.Windows.MessageBox]::Show(
-                    "Ticket title is required.",
-                    "Validation",
-                    [System.Windows.MessageBoxButton]::OK,
-                    [System.Windows.MessageBoxImage]::Warning
-                ) | Out-Null
-                return
-            }
 
             $priorityValue = "Medium"
             if ($priorityBox.SelectedItem) {
@@ -13629,38 +13114,6 @@ function Initialize-QOTicketsUI {
             } catch { $senderMailbox = "" }
             $emailBody = ([string]($emailBodyBox.Text + "")).Trim()
 
-            if ($sendEmailNow) {
-                if ([string]::IsNullOrWhiteSpace($customerEmail)) {
-                    [System.Windows.MessageBox]::Show(
-                        "Enter the customer email address before sending.",
-                        "Validation",
-                        [System.Windows.MessageBoxButton]::OK,
-                        [System.Windows.MessageBoxImage]::Warning
-                    ) | Out-Null
-                    return
-                }
-
-                if ([string]::IsNullOrWhiteSpace($senderMailbox)) {
-                    [System.Windows.MessageBox]::Show(
-                        "Add at least one monitored mailbox in Settings, then choose which mailbox should send this email.",
-                        "Validation",
-                        [System.Windows.MessageBoxButton]::OK,
-                        [System.Windows.MessageBoxImage]::Warning
-                    ) | Out-Null
-                    return
-                }
-
-                if ([string]::IsNullOrWhiteSpace($emailBody)) {
-                    [System.Windows.MessageBox]::Show(
-                        "Enter the email message before sending.",
-                        "Validation",
-                        [System.Windows.MessageBoxButton]::OK,
-                        [System.Windows.MessageBoxImage]::Warning
-                    ) | Out-Null
-                    return
-                }
-            }
-
             $newTicketParams = @{
                 Title       = $ticketName
                 TicketName  = $ticketName
@@ -13670,43 +13123,23 @@ function Initialize-QOTicketsUI {
                 Status      = $statusValue
                 InitialNote = $initialNote
             }
-            if (-not [string]::IsNullOrWhiteSpace($customerEmail)) {
+            if ($sendEmailNow) {
+                $customerEmail = Resolve-QOTicketEmailAddress -Value $customerEmail
                 $newTicketParams.EmailTo = $customerEmail
                 $newTicketParams.EmailFrom = $customerEmail
                 $newTicketParams.SenderEmail = $customerEmail
-            }
-            if (-not [string]::IsNullOrWhiteSpace($senderMailbox)) {
                 $newTicketParams.SourceMailbox = $senderMailbox
             }
 
             $ticket = & $newTicketCmd @newTicketParams
-            $null   = & $addTicketCmd -Ticket $ticket
-
-            & $invokeGridRefresh
-
-            $selectedTicket = $ticket
-            try {
-                $selectedTicket = @(
-                    @($grid.ItemsSource) |
-                        Where-Object { $_ -and ($_.PSObject.Properties.Name -contains "Id") -and ([string]$_.Id -eq [string]$ticket.Id) } |
-                        Select-Object -First 1
-                )
-                if ($selectedTicket -is [System.Array]) {
-                    if ($selectedTicket.Count -gt 0) { $selectedTicket = $selectedTicket[0] } else { $selectedTicket = $ticket }
-                }
-            } catch { $selectedTicket = $ticket }
-
-            $grid.SelectedItem = $selectedTicket
-            $grid.ScrollIntoView($selectedTicket)
-
-            if ($sendEmailNow -and $selectedTicket) {
-                try { & $invokeDetailsUpdate $selectedTicket } catch { }
-                try { & $setComposeMode -Mode "Reply" -PreserveText:$false -SkipFocus } catch { }
-                try { if ($ticketReplySubject) { $ticketReplySubject.Text = $ticketName } } catch { }
-                try { if ($ticketReplyText) { $ticketReplyText.Text = $emailBody } } catch { }
+            $ticket = & $addTicketCmd -Ticket $ticket
+            if ($sendEmailNow) {
                 try {
-                    if ($script:TicketsSendReplyHandler) {
-                        $script:TicketsSendReplyHandler.Invoke($btnSendReply, [System.Windows.RoutedEventArgs]::new())
+                    $queued = & $queueTicketPendingReplyCmd -TicketId $ticket.Id -Ticket $ticket -Subject $ticketName -Body $emailBody
+                    $message = if ($queued.WorkerStarted -or $queued.WorkerRunning) { 'Ticket created. Email queued for delivery.' }
+                               else { 'Ticket created. Email is saved in the queue and waiting for the reply worker.' }
+                    if ($replySendOpenPulseCmd) {
+                        try { & $replySendOpenPulseCmd -StatusText $syncStatusText -Message $message -DurationMilliseconds 3500 } catch { }
                     }
                 } catch {
                     [System.Windows.MessageBox]::Show(
@@ -13716,16 +13149,18 @@ function Initialize-QOTicketsUI {
                         [System.Windows.MessageBoxImage]::Warning
                     ) | Out-Null
                 }
-                return
             }
-
-            if ($grid.Columns.Count -gt 0) {
-                $grid.CurrentCell = New-Object System.Windows.Controls.DataGridCellInfo($selectedTicket, $grid.Columns[0])
-                $grid.BeginEdit()
+            & $invokeGridRefresh
+            $selectedTicket = $grid.Items | Where-Object { $_.Id -eq $ticket.Id } | Select-Object -First 1
+            if ($selectedTicket) {
+                $grid.SelectedItem = $selectedTicket
+                $grid.ScrollIntoView($selectedTicket)
+                if ($sendEmailNow) { & $invokeDetailsUpdate $selectedTicket }
             }
         }
         catch {
             Write-QOTicketsUILog ("Create ticket failed: " + $_.Exception.Message) "ERROR"
+            [System.Windows.MessageBox]::Show($_.Exception.Message, 'New ticket') | Out-Null
         }
     }.GetNewClosure()
     $btnNew.Add_Click($script:TicketsNewHandler)
@@ -13756,7 +13191,10 @@ function Initialize-QOTicketsUI {
             $null = & $removeCmd -Id $ids
             & $invokeGridRefresh
         }
-        catch { }
+        catch {
+            Write-QOTicketsUILog ("Tickets: Delete failed: " + $_.Exception.Message) "ERROR"
+            [System.Windows.MessageBox]::Show($_.Exception.Message, 'Could not delete ticket') | Out-Null
+        }
     }.GetNewClosure()
     $btnDelete.Add_Click($script:TicketsDeleteHandler)
 
@@ -13790,32 +13228,8 @@ function Initialize-QOTicketsUI {
         Invoke-QOTicketsEmailSyncAndRefresh -Grid $grid -GetTicketsCmd $getTicketsCmd -SyncCmd $syncCmd -StatusText $syncStatusText
     }
 
-    # Setup clickable sync status - allow user to manually trigger sync
-    try {
-        if ($syncStatusText) {
-            $syncStatusText.Cursor = [System.Windows.Input.Cursors]::Hand
-            $syncStatusText.add_MouseLeftButtonDown({
-                try {
-                    if ($script:TicketsEmailSyncInProgress) {
-                        Write-QOTicketsUILog "Tickets: Sync already in progress; ignoring manual sync click."
-                        return
-                    }
-                    Write-QOTicketsUILog "Tickets: Manual email sync triggered via status text click."
-                    if ($syncCmd) {
-                        & $invokeEmailSyncRefreshCmd -Grid $grid -GetTicketsCmd $getTicketsCmd -SyncCmd $syncCmd -StatusText $syncStatusText -Force
-                    } else {
-                        Write-QOTicketsUILog "Tickets: Sync command not available for manual sync." "WARN"
-                    }
-                } catch {
-                    Write-QOTicketsUILog ("Tickets: Error handling sync status click: " + $_.Exception.Message) "WARN"
-                }
-            })
-        }
-    } catch {
-        Write-QOTicketsUILog ("Tickets: Failed to setup clickable sync status: " + $_.Exception.Message) "WARN"
-    }
-
     Write-QOTicketsUILog "Tickets: Initialize-QOTicketsUI completed."
+    return $true
 }
 
 function Resolve-QOTTicketDetailsSourceTicket {

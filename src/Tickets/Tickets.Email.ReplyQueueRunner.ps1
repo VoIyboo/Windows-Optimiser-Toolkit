@@ -35,8 +35,9 @@ function Get-QOTReplyQueueRetryDelaySeconds {
 }
 
 function Test-QOTReplyQueueFailureRecoverable {
-    param([AllowNull()][string]$FailureNote)
+    param([AllowNull()][string]$FailureNote, [bool]$SubmissionUnconfirmed = $false)
 
+    if ($SubmissionUnconfirmed) { return $false }
     $noteValue = ([string]($FailureNote + "")).Trim()
     if ([string]::IsNullOrWhiteSpace($noteValue)) { return $true }
 
@@ -117,95 +118,22 @@ function Resolve-QOTReplyQueueRunnerCommand {
     return $null
 }
 
-function ConvertFrom-QOTReplyQueueRunnerJson {
-    param(
-        [Parameter(Mandatory=$true)][string]$RawOutput
-    )
-
-    $trimmed = ([string]($RawOutput + "")).Trim()
-    if ([string]::IsNullOrWhiteSpace($trimmed)) {
-        throw "Runner output was empty."
+function New-QOTUnconfirmedSubmissionResult {
+    return [pscustomobject]@{
+        Success = $false
+        SubmissionUnconfirmed = $true
+        Note = "Outlook did not confirm submission. Check Outbox and Sent Items before resending."
     }
-
-    $firstBrace = $trimmed.IndexOf('{')
-    if ($firstBrace -gt 0) {
-        $trimmed = $trimmed.Substring($firstBrace)
-    }
-
-    return ($trimmed | ConvertFrom-Json -ErrorAction Stop)
 }
 
 function Read-QOTReplyQueueChildResult {
-    param(
-        [AllowNull()][string]$ResultPath,
-        [AllowNull()][string]$StandardOutputPath,
-        [AllowNull()][string]$StandardErrorPath,
-        [int]$ExitCode = 0
-    )
-
-    $rawOutput = ""
-    $stdoutText = ""
-    $stderrText = ""
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($ResultPath) -and (Test-Path -LiteralPath $ResultPath)) {
-            $rawOutput = [string](Get-Content -LiteralPath $ResultPath -Raw -ErrorAction SilentlyContinue)
-        }
-    } catch { $rawOutput = "" }
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($StandardOutputPath) -and (Test-Path -LiteralPath $StandardOutputPath)) {
-            $stdoutText = ([string](Get-Content -LiteralPath $StandardOutputPath -Raw -ErrorAction SilentlyContinue)).Trim()
-        }
-    } catch { $stdoutText = "" }
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($StandardErrorPath) -and (Test-Path -LiteralPath $StandardErrorPath)) {
-            $stderrText = ([string](Get-Content -LiteralPath $StandardErrorPath -Raw -ErrorAction SilentlyContinue)).Trim()
-        }
-    } catch { $stderrText = "" }
-
-    if ([string]::IsNullOrWhiteSpace($rawOutput)) {
-        $details = New-Object System.Collections.Generic.List[string]
-        if ($ExitCode -ne 0) { $details.Add(("ExitCode=" + [string]$ExitCode)) | Out-Null }
-        if (-not [string]::IsNullOrWhiteSpace($stderrText)) { $details.Add(("STDERR: " + $stderrText)) | Out-Null }
-        if (-not [string]::IsNullOrWhiteSpace($stdoutText)) { $details.Add(("STDOUT: " + $stdoutText)) | Out-Null }
-        $note = "Reply runner returned no output."
-        if ($details.Count -gt 0) {
-            $note += " " + (($details.ToArray()) -join " | ")
-        }
-        return [pscustomobject]@{
-            Success = $false
-            Note    = $note
-        }
-    }
+    param([Parameter(Mandatory)][string]$ResultPath)
 
     try {
-        $parsed = ConvertFrom-QOTReplyQueueRunnerJson -RawOutput $rawOutput
-    } catch {
-        return [pscustomobject]@{
-            Success = $false
-            Note    = ("Reply runner output parse failed: " + $_.Exception.Message)
-        }
-    }
-
-    $success = $false
-    $note = ""
-    try { if ($parsed.PSObject.Properties.Name -contains "Success") { $success = [bool]$parsed.Success } } catch { $success = $false }
-    try { if ($parsed.PSObject.Properties.Name -contains "Note") { $note = [string]$parsed.Note } } catch { $note = "" }
-    if ($parsed.PSObject.Properties.Name -notcontains "Success") {
-        if ($note -notmatch '(?i)\b(failed|unavailable|not found|required|missing|error)\b') {
-            $success = $true
-        }
-    }
-
-    if ($parsed.PSObject.Properties.Name -notcontains "Success") {
-        try { $parsed | Add-Member -NotePropertyName Success -NotePropertyValue $success -Force } catch { }
-    } else {
-        try { $parsed.Success = $success } catch { }
-    }
-    if ($parsed.PSObject.Properties.Name -notcontains "Note") {
-        try { $parsed | Add-Member -NotePropertyName Note -NotePropertyValue $note -Force } catch { }
-    }
-
-    return $parsed
+        $parsed = [IO.File]::ReadAllText($ResultPath) | ConvertFrom-Json -ErrorAction Stop
+        if ($parsed.Success -is [bool]) { return $parsed }
+    } catch { }
+    return (New-QOTUnconfirmedSubmissionResult)
 }
 
 function Invoke-QOTReplyQueueSendIsolated {
@@ -267,13 +195,11 @@ function Invoke-QOTReplyQueueSendIsolated {
         if (-not $replyProcess.WaitForExit($TimeoutSeconds * 1000)) {
             $replyProcess.Kill()
             $null = $replyProcess.WaitForExit(5000)
-            return [pscustomobject]@{ Success = $false; Note = "Delivery could not be confirmed. Check Sent Items before resending." }
+            return (New-QOTUnconfirmedSubmissionResult)
         }
-        if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
-            return [pscustomobject]@{ Success = $false; Note = "Delivery could not be confirmed. Check Sent Items before resending." }
-        }
-        return (Read-QOTReplyQueueChildResult -ResultPath $resultPath -StandardOutputPath "" -StandardErrorPath "" -ExitCode $replyProcess.ExitCode)
+        return (Read-QOTReplyQueueChildResult -ResultPath $resultPath)
     } catch {
+        if ($replyProcess) { return (New-QOTUnconfirmedSubmissionResult) }
         return [pscustomobject]@{
             Success = $false
             Note    = ("Reply runner failed: " + $_.Exception.Message)
@@ -468,7 +394,7 @@ try {
             }
 
             $nextRetryCount = $retryCount + 1
-            $recoverable = Test-QOTReplyQueueFailureRecoverable -FailureNote $note
+            $recoverable = Test-QOTReplyQueueFailureRecoverable -FailureNote $note -SubmissionUnconfirmed ([bool]$rawResult.SubmissionUnconfirmed)
             if ($recoverable -and $nextRetryCount -lt $MaxFailureRetries) {
                 $delaySeconds = [int](Get-QOTReplyQueueRetryDelaySeconds -RetryCount $nextRetryCount)
                 $nextAttemptAt = (Get-Date).ToUniversalTime().AddSeconds($delaySeconds).ToString("o")

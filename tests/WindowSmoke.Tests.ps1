@@ -1,9 +1,10 @@
 # Run in Windows PowerShell. The child process owns its dispatcher and fixture files.
-param([string]$FixturePath, [ValidateSet('EarlyClose','FreshAppEarlyClose','Normal')][string]$Scenario='Normal')
+param([string]$FixturePath, [ValidateSet('EarlyClose','FreshAppEarlyClose','TicketCommands','Normal')][string]$Scenario='Normal')
 $ErrorActionPreference = 'Stop'
 $parent = [IO.Path]::GetTempPath().TrimEnd('\')
 if (!$FixturePath) {
-    foreach ($testScenario in 'EarlyClose','FreshAppEarlyClose','Normal') {
+    $scenarios = if ($PSBoundParameters.ContainsKey('Scenario')) { @($Scenario) } else { @('EarlyClose','FreshAppEarlyClose','TicketCommands','Normal') }
+    foreach ($testScenario in $scenarios) {
         $dir = Join-Path $parent ('Qot WindowTest-' + [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $dir
         try {
@@ -145,6 +146,10 @@ function Test-StartupHandoff {
     Assert $handoff.MatchedBackground 'Native painting surface starts with the main window background colour'
 }
 Import-Module (Join-Path $src 'UI/MainWindow.UI.psm1') -DisableNameChecking
+if ($Scenario -eq 'TicketCommands') {
+    & (Join-Path $PSScriptRoot 'TicketCommands.ps1') -FixtureSource $src
+    return
+}
 if ($Scenario -ne 'Normal') {
     Add-Type -AssemblyName PresentationFramework
     if ($Scenario -eq 'EarlyClose') { $null = [Windows.Application]::new() }
@@ -162,6 +167,50 @@ foreach ($pair in @('BtnNavApps:TabApps','BtnNavAdvanced:TabAdvanced','BtnNavTic
 Assert ($window.FindName('HelpHost').Content.FindName('HelpSections').Items.Count -gt 0) 'Help sections populated'
 Assert ($null -ne $window.FindName('SettingsHost').Content.FindName('CbShowAppsTab')) 'Settings view populated'
 Assert (& (Get-Module MainWindow.UI) { $script:TicketsUIInitialised }) 'Tickets UI initialised with isolated storage and mail'
+$ticketUi = Get-Module Tickets.UI
+$window.Width = 1000
+$window.Height = 650
+$window.Left = $window.Top = -32000
+$window.ShowActivated = $window.ShowInTaskbar = $false
+$window.Show()
+$window.UpdateLayout()
+$window.FindName('BtnNavTickets').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+function Test-RailButtonTargets([string[]]$Names) {
+    $window.UpdateLayout()
+    foreach ($name in $Names) {
+        $button = $window.FindName($name)
+        $center = [Windows.Point]::new($button.ActualWidth / 2, $button.ActualHeight / 2)
+        $hit = $window.InputHitTest($button.TranslatePoint($center, $window))
+        if (!$hit -or ($button -ne $hit -and !$button.IsAncestorOf($hit))) { return $false }
+    }
+    return $true
+}
+$navButtons = @('BtnNavCleaning','BtnNavApps','BtnNavAdvanced','BtnNavTickets','CbQuickSafeCleanup','BtnPlay','BtnLogs','BtnHelp','BtnSettings')
+$ticketButtons = @('BtnRailTicketBack','BtnRailTicketNew','BtnRailTicketDelete','BtnRailTicketFilter')
+$submenu = $window.FindName('TicketsRailSubmenu')
+Assert ($submenu.IsVisible -and (Test-RailButtonTargets ($navButtons + $ticketButtons))) 'Expanded ticket sidebar keeps all navigation and ticket buttons reachable'
+$window.FindName('BtnNavTickets').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+Assert (!$submenu.IsVisible -and (Test-RailButtonTargets $navButtons)) 'Collapsed ticket sidebar keeps all navigation buttons reachable'
+$window.FindName('BtnNavTickets').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+$ticketGrid = $window.FindName('TicketsGrid')
+$assigned = New-QOTicket -Title 'Fixture printer' -AssignedTo 'Pat'
+$unassigned = New-QOTicket -Title 'Fixture laptop' -AssignedTo 'Unassigned'
+$null = Add-QOTicket -Ticket $assigned
+$null = Add-QOTicket -Ticket $unassigned
+& $ticketUi { param($grid) $null = Invoke-QOTicketsGridRefresh -Grid $grid -GetTicketsCmd (Get-Command Get-QOTickets) } $ticketGrid
+$filterMenu = $window.FindName('BtnTicketsFilterMenu').ContextMenu
+$filterMenu.Opacity = 0
+$window.FindName('BtnRailTicketFilter').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+$assigneeMenu = $filterMenu.Items | Where-Object Header -eq 'Assigned to'
+$pat = $assigneeMenu.Items | Where-Object Tag -eq 'Assignee:Pat'
+Assert ($null -ne $pat) 'Sidebar filter lists assignees found on tickets'
+$pat.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.MenuItem]::ClickEvent))
+$filterMenu.IsOpen = $false
+Assert ($ticketGrid.Items.Count -eq 1 -and $ticketGrid.Items[0].Id -eq $assigned.Id -and $pat.IsChecked) 'Clicking an assignee filters the queue and keeps its checkmark'
+Assert ((Get-QOTicketListViewSettings).AssigneeFilter -eq 'Pat' -and $window.FindName('BtnRailTicketFilter').ToolTip -match 'Pat') 'Sidebar filter tooltip and saved settings match the visible queue'
+$window.FindName('BtnNavCleaning').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+Assert (!$submenu.IsVisible) 'Switching away from Tickets closes its actions'
+$window.Hide()
 Assert ($window.FindName('InstallGrid').Items.Count -eq 32) 'Apps catalogue populated'
 Wait-For { $window.FindName('AppsGrid').Items.Count -gt 0 }
 Assert ($window.FindName('AppsGrid').Items[0].Name -eq 'Scan fixture') 'Apps scanner populated the grid'

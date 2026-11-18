@@ -8,6 +8,7 @@ Import-Module (Join-Path $PSScriptRoot "Settings.psm1") -Global -Force -ErrorAct
 
 # Import logging (optional, but log failures rather than silently swallow them)
 . (Join-Path $PSScriptRoot "QOTImportHelper.ps1")
+. (Join-Path $PSScriptRoot "TicketEmailAddress.ps1")
 $null = Import-QOTOptionalModule -Path (Join-Path $PSScriptRoot "Logging\Logging.psm1") -ImporterContext 'Core.Tickets' -Force
 
 # Import Outlook ticket sync (optional)
@@ -48,6 +49,10 @@ function Import-QOTOutlookIntegrationModule {
 # =====================================================================
 $script:TicketStorePath  = $null
 $script:TicketBackupPath = $null
+# Keep read versions in memory for as long as the caller holds the database or row.
+# These snapshots are never written to the ticket store or included in exports.
+$script:TicketStoreVersions = [Runtime.CompilerServices.ConditionalWeakTable[psobject,hashtable]]::new()
+$script:TicketRowVersions = [Runtime.CompilerServices.ConditionalWeakTable[psobject,hashtable]]::new()
 $script:TicketStoreLockTimeoutSeconds = 5
 $script:TicketBackupMinIntervalSeconds = 90
 $script:TicketLastBackupUtc = [datetime]::MinValue
@@ -290,17 +295,18 @@ function Normalize-QOTicketDatabase {
             $ticket | Add-Member -NotePropertyName DeletedAt -NotePropertyValue $null -Force
         }
 
-        $isDeleted = $false
-        if ($ticket.PSObject.Properties.Name -contains "IsDeleted") {
-            try { $isDeleted = [bool]$ticket.IsDeleted } catch { $isDeleted = $false }
-        } else {
-            $isDeleted = ([bool]$ticket.DeletedAt -or ($ticket.PSObject.Properties.Name -contains "Folder" -and $ticket.Folder -eq "Deleted"))
+        $isDeleted = ([bool]$ticket.DeletedAt -or $ticket.Folder -eq 'Deleted')
+        switch (([string]$ticket.IsDeleted).Trim()) {
+            'False' { $isDeleted = $false }
+            '0'     { $isDeleted = $false }
+            'True'  { $isDeleted = $true }
+            '1'     { $isDeleted = $true }
         }
 
         if (-not ($ticket.PSObject.Properties.Name -contains "Folder")) {
             $folderValue = if ($isDeleted) { "Deleted" } else { "Active" }
             $ticket | Add-Member -NotePropertyName Folder -NotePropertyValue $folderValue -Force
-                }
+        }
 
         if ($isDeleted -and $ticket.Folder -ne "Deleted") {
             $ticket.Folder = "Deleted"
@@ -431,21 +437,21 @@ function Normalize-QOTicketDatabase {
             $ticket | Add-Member -NotePropertyName EmailFrom -NotePropertyValue "" -Force
         }
         try {
-            $ticket.EmailFrom = Normalize-QOTicketTextField -Value ([string]$ticket.EmailFrom) -MaxLength 320
+            $ticket.EmailFrom = ([string]$ticket.EmailFrom).Trim()
         } catch { }
 
         if (-not ($ticket.PSObject.Properties.Name -contains "EmailTo")) {
             $ticket | Add-Member -NotePropertyName EmailTo -NotePropertyValue "" -Force
         }
         try {
-            $ticket.EmailTo = Normalize-QOTicketTextField -Value ([string]$ticket.EmailTo) -MaxLength 320
+            $ticket.EmailTo = ([string]$ticket.EmailTo).Trim()
         } catch { }
 
         if (-not ($ticket.PSObject.Properties.Name -contains "SourceMailbox")) {
             $ticket | Add-Member -NotePropertyName SourceMailbox -NotePropertyValue "" -Force
         }
         try {
-            $ticket.SourceMailbox = Normalize-QOTicketTextField -Value ([string]$ticket.SourceMailbox) -MaxLength 320
+            $ticket.SourceMailbox = ([string]$ticket.SourceMailbox).Trim()
         } catch { }
 
         if (-not ($ticket.PSObject.Properties.Name -contains "SenderName")) {
@@ -459,7 +465,7 @@ function Normalize-QOTicketDatabase {
             $ticket | Add-Member -NotePropertyName SenderEmail -NotePropertyValue "" -Force
         }
         try {
-            $ticket.SenderEmail = Normalize-QOTicketTextField -Value ([string]$ticket.SenderEmail) -MaxLength 320
+            $ticket.SenderEmail = ([string]$ticket.SenderEmail).Trim()
         } catch { }
 
         try {
@@ -468,9 +474,9 @@ function Normalize-QOTicketDatabase {
                     if (-not ($ticket.PSObject.Properties.Name -contains $emailProp)) { continue }
                     $emailCandidate = [string]($ticket.$emailProp + "")
                     if ([string]::IsNullOrWhiteSpace($emailCandidate)) { continue }
-                    $emailMatch = [regex]::Match($emailCandidate, '(?i)([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})')
-                    if ($emailMatch.Success) {
-                        $ticket.SenderEmail = Normalize-QOTicketTextField -Value ([string]$emailMatch.Groups[1].Value) -MaxLength 320
+                    $address = Resolve-QOTicketEmailAddress $emailCandidate
+                    if ($address) {
+                        $ticket.SenderEmail = $address
                         break
                     }
                 }
@@ -487,9 +493,9 @@ function Normalize-QOTicketDatabase {
         try {
             if ([string]::IsNullOrWhiteSpace([string]$ticket.EmailFrom)) {
                 if ((-not [string]::IsNullOrWhiteSpace([string]$ticket.SenderName)) -and (-not [string]::IsNullOrWhiteSpace([string]$ticket.SenderEmail))) {
-                    $ticket.EmailFrom = Normalize-QOTicketTextField -Value ("{0} <{1}>" -f [string]$ticket.SenderName, [string]$ticket.SenderEmail) -MaxLength 320
+                    $ticket.EmailFrom = "{0} <{1}>" -f [string]$ticket.SenderName, [string]$ticket.SenderEmail
                 } elseif (-not [string]::IsNullOrWhiteSpace([string]$ticket.SenderEmail)) {
-                    $ticket.EmailFrom = Normalize-QOTicketTextField -Value ([string]$ticket.SenderEmail) -MaxLength 320
+                    $ticket.EmailFrom = ([string]$ticket.SenderEmail).Trim()
                 }
             }
         } catch { }
@@ -705,6 +711,10 @@ function Get-QOTTicketActivityEntryFingerprint {
 
     if ($null -eq $Entry) { return "" }
     if ($Entry -is [string]) { return ("string|" + ([string]$Entry).Trim().ToLowerInvariant()) }
+    foreach ($propertyName in 'NoteId','ClientNoteId') {
+        $noteId = ([string]$Entry.$propertyName).Trim()
+        if ($noteId) { return ('note|' + $noteId.ToLowerInvariant()) }
+    }
 
     $parts = New-Object System.Collections.Generic.List[string]
     foreach ($propertyName in @("ReplyId", "DraftId", "Type", "EntryType", "Kind", "Subject", "Title", "Body", "Text", "Message", "Content", "Preview", "CreatedAt", "SentAt", "ReceivedAt", "UpdatedAt", "Author", "CreatedBy", "User", "Technician", "To", "FailureNote")) {
@@ -1153,16 +1163,85 @@ function Optimize-QOTicketBodyStorage {
     }
 }
 
+function Set-QOTicketReadVersion {
+    param($Database, [string]$Json)
+
+    $rows = @{}
+    foreach ($ticket in $Database.Tickets) {
+        if (!$ticket -or [string]::IsNullOrWhiteSpace([string]$ticket.Id)) { continue }
+        $original = ConvertTo-Json -InputObject $ticket -Depth 25 -Compress
+        $rows[[string]$ticket.Id] = $original
+        $null = $script:TicketRowVersions.Remove($ticket)
+        $script:TicketRowVersions.Add($ticket, @{ Path=$script:TicketStorePath; Json=$original })
+    }
+    $null = $script:TicketStoreVersions.Remove($Database)
+    $script:TicketStoreVersions.Add($Database, @{ Rows=$rows; Source=$Json.Trim(); Path=$script:TicketStorePath })
+}
+
+function Merge-QOTicketNoteEdits {
+    param($Original, $Current, $Edited)
+
+    $before = [ordered]@{}
+    $after = [ordered]@{}
+    $result = [ordered]@{}
+    foreach ($entry in $Original) { $before[(Get-QOTTicketActivityEntryFingerprint $entry)] = $entry }
+    foreach ($entry in $Edited) { $after[(Get-QOTTicketActivityEntryFingerprint $entry)] = $entry }
+    foreach ($entry in $Current) { $result[(Get-QOTTicketActivityEntryFingerprint $entry)] = $entry }
+
+    foreach ($key in (@($before.Keys) + @($after.Keys) | Select-Object -Unique)) {
+        $old = ConvertTo-Json -InputObject $before[$key] -Depth 25 -Compress
+        $new = ConvertTo-Json -InputObject $after[$key] -Depth 25 -Compress
+        if ([string]::Equals($old, $new, 'Ordinal')) { continue }
+        $currentJson = ConvertTo-Json -InputObject $result[$key] -Depth 25 -Compress
+        if (![string]::Equals($currentJson, $old, 'Ordinal') -and ![string]::Equals($currentJson, $new, 'Ordinal')) {
+            throw 'Another editor changed this note. Refresh the ticket and retry.'
+        }
+        if ($after.Contains($key)) { $result[$key] = $after[$key] }
+        else { $result.Remove($key) }
+    }
+    return ,@($result.Values)
+}
+
+function Merge-QOTicketRowEdits {
+    param($Current, $Edited, [string]$OriginalJson)
+
+    # Work out what this editor actually changed. A newer row on disk may carry
+    # another editor's note, delivery receipt, assignment or trash operation.
+    $original = (ConvertFrom-QOTicketStoreJson -Json $OriginalJson)
+    foreach ($property in $Edited.PSObject.Properties) {
+        $name = $property.Name
+        if ($name -eq 'Id' -or $name -match 'Display$') { continue }
+        $before = ConvertTo-Json -InputObject $original.$name -Depth 25 -Compress
+        $after = ConvertTo-Json -InputObject $property.Value -Depth 25 -Compress
+        if ([string]::Equals($before, $after, 'Ordinal')) { continue }
+        $currentValue = ConvertTo-Json -InputObject $Current.$name -Depth 25 -Compress
+        if (![string]::Equals($currentValue, $before, 'Ordinal') -and ![string]::Equals($currentValue, $after, 'Ordinal')) {
+            if ($name -eq 'Notes') {
+                $Current.Notes = Merge-QOTicketNoteEdits -Original $original.Notes -Current $Current.Notes -Edited $property.Value
+                continue
+            }
+            if ($name -eq 'UpdatedAt') {
+                if ((Get-QOTicketMergeTimestamp $Current) -ge (Get-QOTicketMergeTimestamp $Edited)) { continue }
+            } else {
+                throw "Ticket '$($Current.Id)' has another change to '$name'. Refresh the ticket and retry."
+            }
+        }
+        $Current | Add-Member -NotePropertyName $name -NotePropertyValue $property.Value -Force
+    }
+}
+
 function Merge-QOTicketDatabases {
     param(
         [Parameter(Mandatory)]$BaseDatabase,
-        [Parameter(Mandatory)]$IncomingDatabase
+        [Parameter(Mandatory)]$IncomingDatabase,
+        [hashtable]$ReadVersion
     )
 
     $base = Normalize-QOTicketDatabase -Database $BaseDatabase
-    $incoming = Normalize-QOTicketDatabase -Database $IncomingDatabase
+    $incoming = $IncomingDatabase
 
     $map = @{}
+    $incomingIds = @{}
     $order = New-Object 'System.Collections.Generic.List[string]'
     $orphans = New-Object 'System.Collections.ArrayList'
 
@@ -1170,10 +1249,12 @@ function Merge-QOTicketDatabases {
         if ($null -eq $ticket) { continue }
         $id = ([string]($ticket.Id + "")).Trim()
         if ([string]::IsNullOrWhiteSpace($id)) {
+            if ($ReadVersion) { throw 'A ticket has no ID. Refresh before saving changes to this legacy store.' }
             [void]$orphans.Add($ticket)
             continue
         }
 
+        if ($ReadVersion -and $map.ContainsKey($id)) { throw "Duplicate ticket ID '$id'. Resolve it before merging changes." }
         if (-not $map.ContainsKey($id)) {
             $order.Add($id) | Out-Null
         }
@@ -1184,23 +1265,53 @@ function Merge-QOTicketDatabases {
         if ($null -eq $ticket) { continue }
         $id = ([string]($ticket.Id + "")).Trim()
         if ([string]::IsNullOrWhiteSpace($id)) {
+            if ($ReadVersion) { throw 'A ticket has no ID. Refresh before saving changes to this legacy store.' }
             [void]$orphans.Add($ticket)
             continue
         }
 
+        if ($ReadVersion -and $incomingIds.ContainsKey($id)) { throw "Duplicate ticket ID '$id'. Resolve it before merging changes." }
+        $incomingIds[$id] = $true
         if (-not $map.ContainsKey($id)) {
+            if ($ReadVersion -and $ReadVersion.Rows.ContainsKey($id)) {
+                $submitted = ConvertTo-Json -InputObject $ticket -Depth 25 -Compress
+                if (![string]::Equals($submitted, $ReadVersion.Rows[$id], 'Ordinal')) {
+                    throw "Ticket '$id' was removed. Refresh the ticket list and retry."
+                }
+                continue
+            }
             $map[$id] = $ticket
             $order.Add($id) | Out-Null
             continue
         }
 
         $existing = $map[$id]
+        if ($ReadVersion) {
+            if (!$ReadVersion.Rows.ContainsKey($id)) { throw "Ticket ID '$id' already exists. Refresh the ticket list and retry." }
+            $original = $ReadVersion.Rows[$id]
+            $incomingJson = ConvertTo-Json -InputObject $ticket -Depth 25 -Compress
+            if (![string]::Equals($incomingJson, $original, 'Ordinal')) {
+                Merge-QOTicketRowEdits -Current $existing -Edited $ticket -OriginalJson $original
+            }
+            continue
+        }
         $existingStamp = Get-QOTicketMergeTimestamp -Ticket $existing
         $incomingStamp = Get-QOTicketMergeTimestamp -Ticket $ticket
 
         # Same timestamp resolves to incoming (latest in-memory edit intent).
         if ($incomingStamp -ge $existingStamp) {
             $map[$id] = $ticket
+        }
+    }
+
+    if ($ReadVersion) {
+        foreach ($id in $ReadVersion.Rows.Keys) {
+            if ($incomingIds.ContainsKey($id) -or !$map.ContainsKey($id)) { continue }
+            $committed = ConvertTo-Json -InputObject $map[$id] -Depth 25 -Compress
+            if (![string]::Equals($committed, $ReadVersion.Rows[$id], 'Ordinal')) {
+                throw "Ticket '$id' changed before it could be removed. Refresh the ticket list and retry."
+            }
+            $map.Remove($id)
         }
     }
 
@@ -1459,8 +1570,6 @@ function Get-QOTickets {
             if (-not $Quiet) { Write-QOTicketsCoreLog ("Tickets: Store file missing. Creating new store at {0}." -f $script:TicketStorePath) }
             New-QODefaultTicketsFile -Path $script:TicketStorePath
         }
-        $currentWriteUtc = [datetime]::MinValue
-        try { $currentWriteUtc = [System.IO.File]::GetLastWriteTimeUtc($script:TicketStorePath) } catch { $currentWriteUtc = [datetime]::MinValue }
         $rawJson = Read-QOTicketStoreJsonText -Path $script:TicketStorePath
         try {
             $db = ConvertFrom-QOTicketStoreJson -Json $rawJson
@@ -1471,13 +1580,7 @@ function Get-QOTickets {
 
         if (-not $Quiet) { Write-QOTicketsCoreLog "Tickets: Map to objects" }
         $db = Normalize-QOTicketDatabase -Database $db
-        $stampTicks = 0L
-        try { $stampTicks = [int64]$currentWriteUtc.Ticks } catch { $stampTicks = 0L }
-        if ($db.PSObject.Properties.Name -contains "__StoreLastWriteUtcTicks") {
-            try { $db.__StoreLastWriteUtcTicks = $stampTicks } catch { }
-        } else {
-            try { $db | Add-Member -NotePropertyName "__StoreLastWriteUtcTicks" -NotePropertyValue $stampTicks -Force } catch { }
-        }
+        Set-QOTicketReadVersion -Database $db -Json $rawJson
         $ticketCount = 0
         try { $ticketCount = @($db.Tickets).Count } catch { }
         try {
@@ -1529,7 +1632,9 @@ function Get-QOTickets {
                 if ($locked) {
                     $latestJson = Read-QOTicketStoreJsonText -Path $ticketPath
                     if ($latestJson -cne $rawJson) {
-                        return Normalize-QOTicketDatabase -Database (ConvertFrom-QOTicketStoreJson -Json $latestJson)
+                        $latest = Normalize-QOTicketDatabase -Database (ConvertFrom-QOTicketStoreJson -Json $latestJson)
+                        Set-QOTicketReadVersion -Database $latest -Json $latestJson
+                        return $latest
                     }
                     foreach ($backup in (Get-QOTicketBackupCandidates -TicketPath $ticketPath -BackupDirectory $script:TicketBackupPath)) {
                         try {
@@ -1548,7 +1653,9 @@ function Get-QOTickets {
                         }
                         $damagedPath = "$ticketPath.corrupt_$([guid]::NewGuid().ToString('N'))"
                         Copy-Item -LiteralPath $ticketPath -Destination $damagedPath -ErrorAction Stop
-                        Write-QOTicketsStoreFileAtomic -Path $ticketPath -JsonContent (ConvertTo-Json -InputObject $restored -Depth 25)
+                        $restoredJson = ConvertTo-Json -InputObject $restored -Depth 25
+                        Write-QOTicketsStoreFileAtomic -Path $ticketPath -JsonContent $restoredJson
+                        Set-QOTicketReadVersion -Database $restored -Json $restoredJson
                         Write-QOTicketsCoreLog ("Tickets: Restored from {0}; damaged file retained at {1}." -f $backup.FullName, $damagedPath) "WARN"
                         return $restored
                     }
@@ -1569,7 +1676,9 @@ function Save-QOTickets {
     param(
         [Parameter(Mandatory)]$Database,
         [switch]$SkipBodyOptimization,
-        [switch]$Quiet
+        [switch]$Quiet,
+        [string]$RouteTicketId,
+        $ExpectedRoute
     )
 
     $saveStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1581,13 +1690,12 @@ function Save-QOTickets {
 
     $Database = Normalize-QOTicketDatabase -Database $Database
 
-    $incomingStoreStampTicks = 0L
-    try {
-        if ($Database.PSObject.Properties.Name -contains "__StoreLastWriteUtcTicks") {
-            $incomingStoreStampTicks = [int64]$Database.__StoreLastWriteUtcTicks
-            try { $null = $Database.PSObject.Properties.Remove("__StoreLastWriteUtcTicks") } catch { }
-        }
-    } catch { $incomingStoreStampTicks = 0L }
+    $readVersion = $null
+    $null = $script:TicketStoreVersions.TryGetValue($Database, [ref]$readVersion)
+    if ($readVersion -and $readVersion.Path -ne $script:TicketStorePath) {
+        throw 'The ticket storage location changed. Refresh the ticket list and retry.'
+    }
+    $Database.PSObject.Properties.Remove('__StoreLastWriteUtcTicks')
 
     $mutexName = Get-QOTicketStoreMutexName -StorePath $script:TicketStorePath
     $mutex = $null
@@ -1611,35 +1719,21 @@ function Save-QOTickets {
             throw ("Timed out after {0}s waiting for shared ticket store lock ({1})." -f $timeoutSeconds, $script:TicketStorePath)
         }
 
-        $currentWriteUtc = [datetime]::MinValue
-        $currentWriteTicks = 0L
+        $merged = $Database
         if (Test-Path -LiteralPath $script:TicketStorePath) {
-            try {
-                $currentWriteUtc = [System.IO.File]::GetLastWriteTimeUtc($script:TicketStorePath)
-                $currentWriteTicks = [int64]$currentWriteUtc.Ticks
-            } catch {
-                $currentWriteUtc = [datetime]::MinValue
-                $currentWriteTicks = 0L
-            }
-        }
-
-        $useFastIncomingSave = $false
-        if (-not (Test-Path -LiteralPath $script:TicketStorePath)) {
-            $useFastIncomingSave = $true
-        } elseif ($incomingStoreStampTicks -gt 0 -and $currentWriteTicks -gt 0 -and $incomingStoreStampTicks -eq $currentWriteTicks) {
-            $useFastIncomingSave = $true
-        }
-
-        $merged = $null
-        if ($useFastIncomingSave) {
-            $merged = $Database
-        } else {
-            $latestOnDisk = New-QODefaultTicketDatabase
-            if (Test-Path -LiteralPath $script:TicketStorePath) {
-                $rawJson = Read-QOTicketStoreJsonText -Path $script:TicketStorePath
+            $rawJson = Read-QOTicketStoreJsonText -Path $script:TicketStorePath
+            if (!$readVersion -or ![string]::Equals($rawJson.Trim(), $readVersion.Source, 'Ordinal')) {
                 $latestOnDisk = ConvertFrom-QOTicketStoreJson -Json $rawJson
+                $merged = Merge-QOTicketDatabases -BaseDatabase $latestOnDisk -IncomingDatabase $Database -ReadVersion $readVersion
             }
-            $merged = Merge-QOTicketDatabases -BaseDatabase $latestOnDisk -IncomingDatabase $Database
+        } elseif ($readVersion) {
+            throw 'The ticket store was removed. Refresh the ticket list and retry.'
+        }
+        if ($ExpectedRoute) {
+            $row = $merged.Tickets | Where-Object Id -eq $RouteTicketId | Select-Object -First 1
+            if (!$row -or $row.IsDeleted -or !(Test-QOTTicketReplyRoute $ExpectedRoute (Get-QOTTicketPendingReplyMetadataFromTicket $row))) {
+                throw 'The ticket recipient, sending mailbox or original message changed. Review the ticket before sending.'
+            }
         }
         try {
             if (Test-Path -LiteralPath $script:TicketStorePath) {
@@ -1686,11 +1780,6 @@ function Save-QOTickets {
         $json = $merged | ConvertTo-Json -Depth 25
         Write-QOTicketsStoreFileAtomic -Path $script:TicketStorePath -JsonContent $json
 
-        $newWriteTicks = 0L
-        try {
-            $newWriteTicks = [int64]([System.IO.File]::GetLastWriteTimeUtc($script:TicketStorePath).Ticks)
-        } catch { $newWriteTicks = 0L }
-
         try {
             $Database.Tickets = @($merged.Tickets)
             if ($Database.PSObject.Properties.Name -contains "SchemaVersion") {
@@ -1698,12 +1787,8 @@ function Save-QOTickets {
             } else {
                 $Database | Add-Member -NotePropertyName SchemaVersion -NotePropertyValue $merged.SchemaVersion -Force
             }
-            if ($Database.PSObject.Properties.Name -contains "__StoreLastWriteUtcTicks") {
-                $Database.__StoreLastWriteUtcTicks = $newWriteTicks
-            } else {
-                $Database | Add-Member -NotePropertyName "__StoreLastWriteUtcTicks" -NotePropertyValue $newWriteTicks -Force
-            }
         } catch { }
+        Set-QOTicketReadVersion -Database $Database -Json $json
 
         $savedCount = 0
         try { $savedCount = @($merged.Tickets).Count } catch { }
@@ -1748,11 +1833,11 @@ function New-QOTicket {
 
     $nameValue = if ([string]::IsNullOrWhiteSpace([string]$TicketName)) { $Title } else { $TicketName }
     $subjectValue = if ([string]::IsNullOrWhiteSpace([string]$Subject)) { $nameValue } else { $Subject }
-    $emailFromValue = Normalize-QOTicketTextField -Value ([string]$EmailFrom) -MaxLength 320
-    $emailToValue = Normalize-QOTicketTextField -Value ([string]$EmailTo) -MaxLength 320
+    $emailFromValue = ([string]$EmailFrom).Trim()
+    $emailToValue = ([string]$EmailTo).Trim()
     $senderNameValue = Normalize-QOTicketTextField -Value ([string]$SenderName) -MaxLength 240
-    $senderEmailValue = Normalize-QOTicketTextField -Value ([string]$SenderEmail) -MaxLength 320
-    $sourceMailboxValue = Normalize-QOTicketTextField -Value ([string]$SourceMailbox) -MaxLength 320
+    $senderEmailValue = ([string]$SenderEmail).Trim()
+    $sourceMailboxValue = ([string]$SourceMailbox).Trim()
     $sourceValue = Normalize-QOTicketTextField -Value ([string]$Source) -MaxLength 80
     if ([string]::IsNullOrWhiteSpace($sourceValue)) { $sourceValue = "Manual" }
 
@@ -1795,6 +1880,10 @@ function Add-QOTicket {
     param([Parameter(Mandatory)]$Ticket)
 
     $db = Get-QOTickets -Quiet
+    if ([string]::IsNullOrWhiteSpace([string]$Ticket.Id)) {
+        $Ticket | Add-Member -NotePropertyName Id -NotePropertyValue ([guid]::NewGuid().ToString()) -Force
+    }
+    if ($db.Tickets.Id -contains $Ticket.Id) { throw "Ticket ID '$($Ticket.Id)' already exists." }
     try {
         if ($Ticket.PSObject.Properties.Name -notcontains "UpdatedAt") {
             $Ticket | Add-Member -NotePropertyName UpdatedAt -NotePropertyValue (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") -Force
@@ -1846,10 +1935,15 @@ function Update-QOTicket {
             }
         } catch { }
 
-        foreach ($prop in $Ticket.PSObject.Properties) {
-            if ($prop.Name -eq "Id") { continue }
-            if ($prop.Name -match 'Display$') { continue }
-            $existing | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
+        $originalRow = $null
+        if ($script:TicketRowVersions.TryGetValue($Ticket, [ref]$originalRow)) {
+            if ($originalRow.Path -ne $script:TicketStorePath) { throw 'The ticket storage location changed. Refresh the ticket list and retry.' }
+            Merge-QOTicketRowEdits -Current $existing -Edited $Ticket -OriginalJson $originalRow.Json
+        } else {
+            foreach ($prop in $Ticket.PSObject.Properties) {
+                if ($prop.Name -eq "Id" -or $prop.Name -match 'Display$') { continue }
+                $existing | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
+            }
         }
         try {
             if ($existing.PSObject.Properties.Name -notcontains "AssignedTo") {
@@ -1864,6 +1958,9 @@ function Update-QOTicket {
 
     if ($updated) {
         Save-QOTickets -Database $db -Quiet
+        if ($originalRow) {
+            $originalRow.Json = ConvertTo-Json -InputObject $Ticket -Depth 25 -Compress
+        }
     }
 
     return $updated
@@ -2982,20 +3079,6 @@ function Test-QOTicketHasReplyReference {
     return $false
 }
 
-function Normalize-QOTicketEmailAddress {
-    param(
-        [AllowNull()][string]$Value
-    )
-
-    $rawValue = ([string]($Value + "")).Trim()
-    if ([string]::IsNullOrWhiteSpace($rawValue)) { return "" }
-
-    $match = [regex]::Match($rawValue, '(?i)([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})')
-    if (-not $match.Success) { return "" }
-
-    return ([string]$match.Groups[1].Value).Trim().ToLowerInvariant()
-}
-
 function Get-QOTicketPrimaryEmailAddress {
     param(
         [AllowNull()]$Ticket
@@ -3003,64 +3086,28 @@ function Get-QOTicketPrimaryEmailAddress {
 
     if (-not $Ticket) { return "" }
 
-    foreach ($propName in @("EmailTo", "SenderEmail", "ContactEmail", "EmailFrom")) {
-        $rawValue = ""
-        try {
-            if ($Ticket.PSObject.Properties.Name -contains $propName) {
-                $rawValue = ([string]($Ticket.$propName + "")).Trim()
-            }
-        } catch { $rawValue = "" }
-
-        if ([string]::IsNullOrWhiteSpace($rawValue)) { continue }
-        $match = [regex]::Match($rawValue, '(?i)([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})')
-        if ($match.Success) {
-            return ([string]$match.Groups[1].Value).Trim()
+    $mailbox = Resolve-QOTicketEmailAddress $Ticket.SourceMailbox
+    $fields = @('EmailTo','SenderEmail','ContactEmail','CustomerEmail','RequesterEmail','RequestEmail','EmailFrom')
+    if ($Ticket.Source -in 'Outlook','Email' -or (!$Ticket.Source -and (Test-QOTicketHasReplyReference $Ticket))) {
+        # In an incoming message EmailTo is the helpdesk. Only use it for an
+        # outgoing message whose sender matches the known support mailbox.
+        $sender = if ($Ticket.SenderEmail) { $Ticket.SenderEmail } else { $Ticket.EmailFrom }
+        $senderAddress = Resolve-QOTicketEmailAddress $sender
+        if (!$mailbox -or $senderAddress -ne $mailbox) {
+            $fields = @('SenderEmail','ContactEmail','CustomerEmail','RequesterEmail','RequestEmail','EmailFrom')
+        } else {
+            $fields = @('EmailTo','ContactEmail','CustomerEmail','RequesterEmail','RequestEmail')
         }
+    }
+    foreach ($name in $fields) {
+        $candidate = [string]$Ticket.$name
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        $address = Resolve-QOTicketEmailAddress $candidate
+        if ($address -and $address -ne $mailbox) { return $address }
+        return ''
     }
 
     return ""
-}
-
-function Test-QOTicketPrefersOutboundEmailSend {
-    param(
-        [AllowNull()]$Ticket
-    )
-
-    if (-not $Ticket) { return $false }
-    if (-not (Test-QOTicketHasReplyReference -Ticket $Ticket)) { return $false }
-
-    $mailboxAddress = Normalize-QOTicketEmailAddress -Value (Get-QOTicketPreferredSenderMailbox -Ticket $Ticket)
-    if ([string]::IsNullOrWhiteSpace($mailboxAddress)) {
-        try {
-            if ($Ticket.PSObject.Properties.Name -contains "SourceMailbox") {
-                $mailboxAddress = Normalize-QOTicketEmailAddress -Value ([string]$Ticket.SourceMailbox)
-            }
-        } catch { $mailboxAddress = "" }
-    }
-    if ([string]::IsNullOrWhiteSpace($mailboxAddress)) { return $false }
-
-    $fromAddress = ""
-    foreach ($propName in @("SenderEmail", "EmailFrom")) {
-        try {
-            if ([string]::IsNullOrWhiteSpace($fromAddress) -and $Ticket.PSObject.Properties.Name -contains $propName) {
-                $fromAddress = Normalize-QOTicketEmailAddress -Value ([string]$Ticket.$propName)
-            }
-        } catch { }
-    }
-
-    $toAddress = ""
-    try {
-        if ($Ticket.PSObject.Properties.Name -contains "EmailTo") {
-            $toAddress = Normalize-QOTicketEmailAddress -Value ([string]$Ticket.EmailTo)
-        }
-    } catch { $toAddress = "" }
-
-    return (
-        -not [string]::IsNullOrWhiteSpace($fromAddress) -and
-        -not [string]::IsNullOrWhiteSpace($toAddress) -and
-        $fromAddress -eq $mailboxAddress -and
-        $toAddress -eq $mailboxAddress
-    )
 }
 
 function Get-QOTicketPreferredSenderMailbox {
@@ -3148,34 +3195,23 @@ function Get-QOTTicketPendingReplyMetadataFromTicket {
         MessageId       = ""
         ConversationId  = ""
         SourceMessageId = ""
+        SourceStoreId   = ""
+        EmailEntryId    = ""
         SenderMailbox   = ""
     }
 
     if (-not $Ticket) { return $result }
 
     try {
-        $toValue = ""
-        try { $toValue = [string](Get-QOTicketPrimaryEmailAddress -Ticket $Ticket) } catch { $toValue = "" }
-        if ([string]::IsNullOrWhiteSpace($toValue)) {
-            foreach ($propName in @("CustomerEmail", "ContactEmail", "RequesterEmail", "RequestEmail", "EmailTo")) {
-                try {
-                    if ($Ticket.PSObject.Properties.Name -contains $propName) {
-                        $candidate = ([string]($Ticket.$propName + "")).Trim()
-                        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                            $toValue = $candidate
-                            break
-                        }
-                    }
-                } catch { }
-            }
-        }
-        $result.To = ([string]($toValue + "")).Trim()
+        $result.To = Get-QOTicketPrimaryEmailAddress -Ticket $Ticket
     } catch { }
 
     foreach ($mapping in @(
             @{ Result = "MessageId"; Source = "EmailMessageId" },
             @{ Result = "ConversationId"; Source = "EmailConversationId" },
-            @{ Result = "SourceMessageId"; Source = "SourceMessageId" }
+            @{ Result = "SourceMessageId"; Source = "SourceMessageId" },
+            @{ Result = "SourceStoreId"; Source = "SourceStoreId" },
+            @{ Result = "EmailEntryId"; Source = "EmailEntryId" }
         )) {
         try {
             $sourceName = [string]$mapping.Source
@@ -3202,6 +3238,19 @@ function Get-QOTTicketPendingReplyMetadataFromTicket {
     } catch { }
 
     return $result
+}
+
+function Test-QOTTicketReplyRoute {
+    param($Expected, $Current)
+
+    $expectedRoute = [pscustomobject]$Expected
+    if (!$expectedRoute.To -or !$Current.To) { return $false }
+    foreach ($field in 'To','SenderMailbox','SourceMessageId','MessageId','ConversationId','SourceStoreId','EmailEntryId') {
+        # Drafts saved by older versions did not carry these two identifiers.
+        if ($field -in 'SourceStoreId','EmailEntryId' -and $expectedRoute.PSObject.Properties.Name -notcontains $field) { continue }
+        if ([string]$expectedRoute.$field -cne [string]$Current.$field) { return $false }
+    }
+    return $true
 }
 
 function New-QOTTicketReplyWorkerPayload {
@@ -3341,7 +3390,9 @@ function Add-QOTTicketPendingReply {
         [Parameter(Mandatory)][string]$Body,
         [AllowNull()][string]$DraftId,
         [AllowNull()][string]$SendState = "Queued",
-        [AllowNull()]$Ticket
+        [AllowNull()]$Ticket,
+        $ExpectedRoute,
+        [string]$ReplaceDraftId
     )
 
     $resolvedTicketId = ([string]($TicketId + "")).Trim()
@@ -3356,6 +3407,7 @@ function Add-QOTTicketPendingReply {
     if ([string]::IsNullOrWhiteSpace($bodyValue.Trim())) { throw "Reply body is required." }
     if ([string]::IsNullOrWhiteSpace($draftKey)) { $draftKey = [guid]::NewGuid().ToString("N") }
 
+    if (!$ExpectedRoute -and $Ticket) { $ExpectedRoute = Get-QOTTicketPendingReplyMetadataFromTicket $Ticket }
     $db = Get-QOTickets -Quiet
     $updated = $false
     $savedEntry = $null
@@ -3374,9 +3426,16 @@ function Add-QOTTicketPendingReply {
 
         $pendingReplies = @()
         try { $pendingReplies = @($ticket.PendingReplies) } catch { $pendingReplies = @() }
-        $metadataTicket = $Ticket
-        if (-not $metadataTicket) { $metadataTicket = $ticket }
-        $pendingMetadata = Get-QOTTicketPendingReplyMetadataFromTicket -Ticket $metadataTicket
+        $pendingMetadata = Get-QOTTicketPendingReplyMetadataFromTicket -Ticket $ticket
+        if ($ExpectedRoute -and !(Test-QOTTicketReplyRoute $ExpectedRoute $pendingMetadata)) {
+            throw 'The ticket recipient, sending mailbox or original message changed. Review the ticket before sending.'
+        }
+        if ($ReplaceDraftId) {
+            $old = $pendingReplies | Where-Object DraftId -eq $ReplaceDraftId | Select-Object -First 1
+            if (!$old -or $old.SendState -ne 'Failed') { throw 'Only a failed reply can be retried. Refresh the ticket and retry.' }
+            if (!(Test-QOTTicketReplyRoute $old $pendingMetadata)) { throw 'The failed reply destination changed. Review the ticket and compose a new reply.' }
+            $pendingReplies = @($pendingReplies | Where-Object DraftId -ne $ReplaceDraftId)
+        }
         $contentKey = Get-QOTTicketPendingReplyContentKey -Subject $subjectValue -Body $bodyValue -To ([string]$pendingMetadata.To)
         if ($ticket.Replies.ReplyId -contains $draftKey) { throw "This draft was already delivered." }
 
@@ -3412,7 +3471,7 @@ function Add-QOTTicketPendingReply {
                     $pending | Add-Member -NotePropertyName RetryCount -NotePropertyValue 0 -Force
                 }
             } catch { }
-            foreach ($metadataProp in @("To", "MessageId", "ConversationId", "SourceMessageId", "SenderMailbox")) {
+            foreach ($metadataProp in @("To", "MessageId", "ConversationId", "SourceMessageId", "SenderMailbox", "SourceStoreId", "EmailEntryId")) {
                 $metadataValue = ""
                 try { $metadataValue = ([string]($pendingMetadata.$metadataProp + "")).Trim() } catch { $metadataValue = "" }
                 if ([string]::IsNullOrWhiteSpace($metadataValue)) { continue }
@@ -3506,6 +3565,10 @@ function Add-QOTTicketPendingReply {
             try {
                 Write-QOTicketsCoreLog ("Tickets: Duplicate pending reply suppressed. TicketId='{0}' DraftId='{1}' ExistingDraftId='{2}'." -f $resolvedTicketId, $draftKey, [string]$savedEntry.DraftId)
             } catch { }
+            if ($ReplaceDraftId) {
+                $ticket.PendingReplies = $pendingReplies
+                Save-QOTickets -Database $db -SkipBodyOptimization -Quiet -RouteTicketId $resolvedTicketId -ExpectedRoute $pendingMetadata
+            }
             return $savedEntry
         }
 
@@ -3520,6 +3583,8 @@ function Add-QOTTicketPendingReply {
                 MessageId     = [string]$pendingMetadata.MessageId
                 ConversationId = [string]$pendingMetadata.ConversationId
                 SourceMessageId = [string]$pendingMetadata.SourceMessageId
+                SourceStoreId = [string]$pendingMetadata.SourceStoreId
+                EmailEntryId = [string]$pendingMetadata.EmailEntryId
                 SenderMailbox = [string]$pendingMetadata.SenderMailbox
                 CreatedAt     = $nowStamp
                 LastAttemptAt = $nowStamp
@@ -3540,6 +3605,8 @@ function Add-QOTTicketPendingReply {
                 MessageId     = $savedEntry.MessageId
                 ConversationId = $savedEntry.ConversationId
                 SourceMessageId = $savedEntry.SourceMessageId
+                SourceStoreId = $savedEntry.SourceStoreId
+                EmailEntryId = $savedEntry.EmailEntryId
                 SenderMailbox = $savedEntry.SenderMailbox
                 CreatedAt     = $savedEntry.CreatedAt
                 LastAttemptAt = $savedEntry.LastAttemptAt
@@ -3569,7 +3636,7 @@ function Add-QOTTicketPendingReply {
 
     if (-not $updated) { throw ("Ticket not found: " + $resolvedTicketId) }
 
-    Save-QOTickets -Database $db -SkipBodyOptimization -Quiet
+    Save-QOTickets -Database $db -SkipBodyOptimization -Quiet -RouteTicketId $resolvedTicketId -ExpectedRoute $pendingMetadata
     return $savedEntry
 }
 
@@ -4594,10 +4661,11 @@ function Queue-QOTTicketPendingReply {
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$Body,
         [AllowNull()][string]$DraftId,
-        [AllowNull()]$Ticket
+        [AllowNull()]$Ticket,
+        $ExpectedRoute
     )
 
-    $savedEntry = Add-QOTTicketPendingReply -TicketId $TicketId -Subject $Subject -Body $Body -DraftId $DraftId -SendState "Queued" -Ticket $Ticket
+    $savedEntry = Add-QOTTicketPendingReply -TicketId $TicketId -Subject $Subject -Body $Body -DraftId $DraftId -SendState "Queued" -Ticket $Ticket -ExpectedRoute $ExpectedRoute
     $duplicateSuppressed = $false
     try { if ($savedEntry -and ($savedEntry.PSObject.Properties.Name -contains "DuplicateSuppressed")) { $duplicateSuppressed = [bool]$savedEntry.DuplicateSuppressed } } catch { $duplicateSuppressed = $false }
     if ($duplicateSuppressed) {
@@ -4658,22 +4726,9 @@ function Retry-QOTTicketPendingReply {
     if ([string]::IsNullOrWhiteSpace($subjectValue)) { throw "Reply subject is required before retrying." }
     if ([string]::IsNullOrWhiteSpace($bodyValue.Trim())) { throw "Reply body is required before retrying." }
 
-    $retryMetadataTicket = [pscustomobject]@{
-        Id                  = ([string]($TicketId + "")).Trim()
-        EmailTo             = [string]($(if ($existingEntry.PSObject.Properties.Name -contains "To") { $existingEntry.To } else { "" }) + "")
-        EmailMessageId      = [string]($(if ($existingEntry.PSObject.Properties.Name -contains "MessageId") { $existingEntry.MessageId } else { "" }) + "")
-        EmailConversationId = [string]($(if ($existingEntry.PSObject.Properties.Name -contains "ConversationId") { $existingEntry.ConversationId } else { "" }) + "")
-        SourceMessageId     = [string]($(if ($existingEntry.PSObject.Properties.Name -contains "SourceMessageId") { $existingEntry.SourceMessageId } else { "" }) + "")
-        SourceMailbox       = [string]($(if ($existingEntry.PSObject.Properties.Name -contains "SenderMailbox") { $existingEntry.SenderMailbox } else { "" }) + "")
-    }
-    $oldDraftId = ([string]($DraftId + "")).Trim()
+    $oldDraftId = $DraftId.Trim()
     $newDraftId = [guid]::NewGuid().ToString("N")
-    $removed = [bool](Remove-QOTTicketPendingReply -TicketId $TicketId -DraftId $oldDraftId)
-    if (-not $removed) {
-        throw ("Pending reply could not be removed before retrying: " + $oldDraftId)
-    }
-
-    $savedEntry = Add-QOTTicketPendingReply -TicketId $TicketId -Subject $subjectValue -Body $bodyValue -DraftId $newDraftId -SendState "Queued" -Ticket $retryMetadataTicket
+    $savedEntry = Add-QOTTicketPendingReply -TicketId $TicketId -Subject $subjectValue -Body $bodyValue -DraftId $newDraftId -SendState "Queued" -ReplaceDraftId $oldDraftId
     try { Write-QOTicketsCoreLog ("Tickets: Pending reply added to active queue. TicketId='{0}' DraftId='{1}' RetriedFromDraftId='{2}' State='Queued' Reason='retry'." -f [string]$savedEntry.TicketId, [string]$savedEntry.DraftId, $oldDraftId) } catch { }
     $serviceResult = Initialize-QOTicketsReplyQueueService -Reason "retry"
 
@@ -4761,68 +4816,21 @@ function Complete-QOTTicketReplySend {
     $ticketToUpdate = $Ticket
 
     try {
-        $ticketIdForRefresh = ""
-        try { if ($Ticket -and ($Ticket.PSObject.Properties.Name -contains "Id")) { $ticketIdForRefresh = ([string]($Ticket.Id + "")).Trim() } } catch { $ticketIdForRefresh = "" }
-        if (-not [string]::IsNullOrWhiteSpace($ticketIdForRefresh)) {
-            $latestTicket = @(
-                @(Get-QOTickets -Quiet).Tickets |
-                    Where-Object {
-                        $_ -and
-                        ($_.PSObject.Properties.Name -contains "Id") -and
-                        [string]::Equals(([string]$_.Id).Trim(), $ticketIdForRefresh, [System.StringComparison]::OrdinalIgnoreCase)
-                    } |
-                    Select-Object -First 1
-            )
-            if ($latestTicket -is [System.Array]) {
-                if ($latestTicket.Count -gt 0) { $latestTicket = $latestTicket[0] } else { $latestTicket = $null }
-            }
-            if ($latestTicket) {
-                $ticketToUpdate = $latestTicket
-                foreach ($prop in @($Ticket.PSObject.Properties)) {
-                    if (-not $prop) { continue }
-                    $propName = ([string]($prop.Name + "")).Trim()
-                    if ([string]::IsNullOrWhiteSpace($propName)) { continue }
-                    if ($propName -eq "Id") { continue }
-
-                    $incomingValue = $prop.Value
-                    $incomingIsMeaningful = $false
-                    if ($null -ne $incomingValue) {
-                        if ($incomingValue -is [System.Array]) {
-                            $incomingIsMeaningful = (@($incomingValue).Count -gt 0)
-                        } else {
-                            $incomingText = ""
-                            try { $incomingText = ([string]($incomingValue + "")).Trim() } catch { $incomingText = "" }
-                            $incomingIsMeaningful = (-not [string]::IsNullOrWhiteSpace($incomingText))
-                        }
-                    }
-
-                    if (-not ($ticketToUpdate.PSObject.Properties.Name -contains $propName)) {
-                        try { $ticketToUpdate | Add-Member -NotePropertyName $propName -NotePropertyValue $incomingValue -Force } catch { }
-                        continue
-                    }
-
-                    $existingValue = $null
-                    $existingIsMeaningful = $false
-                    try { $existingValue = $ticketToUpdate.$propName } catch { $existingValue = $null }
-                    if ($null -ne $existingValue) {
-                        if ($existingValue -is [System.Array]) {
-                            $existingIsMeaningful = (@($existingValue).Count -gt 0)
-                        } else {
-                            $existingText = ""
-                            try { $existingText = ([string]($existingValue + "")).Trim() } catch { $existingText = "" }
-                            $existingIsMeaningful = (-not [string]::IsNullOrWhiteSpace($existingText))
-                        }
-                    }
-
-                    if ((-not $existingIsMeaningful) -and $incomingIsMeaningful) {
-                        try { $ticketToUpdate.$propName = $incomingValue } catch { }
-                    }
-                }
-            }
+        $id = ([string]$Ticket.Id).Trim()
+        if ($id) {
+            $ticketToUpdate = (Get-QOTickets -Quiet).Tickets | Where-Object Id -eq $id | Select-Object -First 1
+            if (!$ticketToUpdate) { throw 'The ticket was removed before delivery could be recorded.' }
         }
 
-        $preferredSenderMailbox = Get-QOTicketPreferredSenderMailbox -Ticket $ticketToUpdate
-        $replyRecipient = Get-QOTicketPrimaryEmailAddress -Ticket $ticketToUpdate
+        # The receipt describes the actual delivery. Customer or mailbox fields
+        # may have changed by the time we write history or repair a saved draft.
+        $preferredSenderMailbox = Get-QOTicketPreferredSenderMailbox -Ticket $Ticket
+        $replyRecipient = Get-QOTicketPrimaryEmailAddress -Ticket $Ticket
+        if ($PendingReplyDraftId) {
+            $draft = $ticketToUpdate.PendingReplies | Where-Object DraftId -eq $PendingReplyDraftId | Select-Object -First 1
+            if ($draft.To) { $replyRecipient = [string]$draft.To }
+            if ($draft.SenderMailbox) { $preferredSenderMailbox = [string]$draft.SenderMailbox }
+        }
         $sentConversationId = ""
         $sentEntryId = ""
         $sentStoreId = ""
@@ -4911,44 +4919,9 @@ function Complete-QOTTicketReplySend {
             }
         }
 
-        try {
-            $ticketIdValue = ""
-            try { if ($ticketToUpdate.PSObject.Properties.Name -contains "Id") { $ticketIdValue = ([string]($ticketToUpdate.Id + "")).Trim() } } catch { $ticketIdValue = "" }
-            if (-not [string]::IsNullOrWhiteSpace($ticketIdValue)) {
-                $latestPendingReplies = @()
-                try {
-                    $latestTicket = @(
-                        @(Get-QOTickets -Quiet).Tickets |
-                            Where-Object { $_ -and ($_.PSObject.Properties.Name -contains "Id") -and ([string]$_.Id -eq $ticketIdValue) } |
-                            Select-Object -First 1
-                    )
-                    if ($latestTicket -is [System.Array]) {
-                        if ($latestTicket.Count -gt 0) { $latestTicket = $latestTicket[0] } else { $latestTicket = $null }
-                    }
-                    if ($latestTicket -and ($latestTicket.PSObject.Properties.Name -contains "PendingReplies")) {
-                        $latestPendingReplies = @($latestTicket.PendingReplies)
-                    }
-                } catch { $latestPendingReplies = @() }
-
-                if (-not [string]::IsNullOrWhiteSpace([string]$PendingReplyDraftId)) {
-                    $remainingPendingReplies = @()
-                    foreach ($pendingReply in @($latestPendingReplies)) {
-                        if (-not $pendingReply) { continue }
-                        $pendingDraftId = ""
-                        try { if ($pendingReply.PSObject.Properties.Name -contains "DraftId") { $pendingDraftId = ([string]($pendingReply.DraftId + "")).Trim() } } catch { $pendingDraftId = "" }
-                        if ([string]::Equals($pendingDraftId, ([string]$PendingReplyDraftId).Trim(), [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-                        $remainingPendingReplies += $pendingReply
-                    }
-                    $latestPendingReplies = @($remainingPendingReplies)
-                }
-
-                if ($ticketToUpdate.PSObject.Properties.Name -contains "PendingReplies") {
-                    $ticketToUpdate.PendingReplies = @($latestPendingReplies)
-                } else {
-                    $ticketToUpdate | Add-Member -NotePropertyName PendingReplies -NotePropertyValue @($latestPendingReplies) -Force
-                }
-            }
-        } catch { }
+        if ($PendingReplyDraftId) {
+            $ticketToUpdate.PendingReplies = @($ticketToUpdate.PendingReplies | Where-Object { $_ -and $_.DraftId -ne $PendingReplyDraftId })
+        }
 
         $updatedAtStamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         if ($ticketToUpdate.PSObject.Properties.Name -contains "UpdatedAt") {
@@ -4969,6 +4942,10 @@ function Complete-QOTTicketReplySend {
                     } else {
                         try { $Ticket | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force } catch { }
                     }
+                }
+                $originalRow = $null
+                if ($script:TicketRowVersions.TryGetValue($Ticket, [ref]$originalRow)) {
+                    $originalRow.Json = ConvertTo-Json -InputObject $Ticket -Depth 25 -Compress
                 }
             } catch { }
         }
@@ -5024,99 +5001,50 @@ function Send-QOTicketReply {
         throw "Reply body is required."
     }
 
-    try {
-        $ticketIdForRefresh = ""
-        try { if ($Ticket -and ($Ticket.PSObject.Properties.Name -contains "Id")) { $ticketIdForRefresh = ([string]($Ticket.Id + "")).Trim() } } catch { $ticketIdForRefresh = "" }
-        if (-not [string]::IsNullOrWhiteSpace($ticketIdForRefresh)) {
-            $latestTicket = @(
-                @(Get-QOTickets -Quiet).Tickets |
-                    Where-Object {
-                        $_ -and
-                        ($_.PSObject.Properties.Name -contains "Id") -and
-                        [string]::Equals(([string]$_.Id).Trim(), $ticketIdForRefresh, [System.StringComparison]::OrdinalIgnoreCase)
-                    } |
-                    Select-Object -First 1
-            )
-            if ($latestTicket -is [System.Array]) {
-                if ($latestTicket.Count -gt 0) { $latestTicket = $latestTicket[0] } else { $latestTicket = $null }
-            }
-            if ($latestTicket) {
-                $ticketToUpdate = $latestTicket
-                foreach ($prop in @($Ticket.PSObject.Properties)) {
-                    if (-not $prop) { continue }
-                    $propName = ([string]($prop.Name + "")).Trim()
-                    if ([string]::IsNullOrWhiteSpace($propName)) { continue }
-                    if ($propName -eq "Id") { continue }
-
-                    $incomingValue = $prop.Value
-                    $incomingIsMeaningful = $false
-                    if ($null -ne $incomingValue) {
-                        if ($incomingValue -is [System.Array]) {
-                            $incomingIsMeaningful = (@($incomingValue).Count -gt 0)
-                        } else {
-                            $incomingText = ""
-                            try { $incomingText = ([string]($incomingValue + "")).Trim() } catch { $incomingText = "" }
-                            $incomingIsMeaningful = (-not [string]::IsNullOrWhiteSpace($incomingText))
-                        }
-                    }
-
-                    if (-not ($ticketToUpdate.PSObject.Properties.Name -contains $propName)) {
-                        try { $ticketToUpdate | Add-Member -NotePropertyName $propName -NotePropertyValue $incomingValue -Force } catch { }
-                        continue
-                    }
-
-                    $existingValue = $null
-                    $existingIsMeaningful = $false
-                    try { $existingValue = $ticketToUpdate.$propName } catch { $existingValue = $null }
-                    if ($null -ne $existingValue) {
-                        if ($existingValue -is [System.Array]) {
-                            $existingIsMeaningful = (@($existingValue).Count -gt 0)
-                        } else {
-                            $existingText = ""
-                            try { $existingText = ([string]($existingValue + "")).Trim() } catch { $existingText = "" }
-                            $existingIsMeaningful = (-not [string]::IsNullOrWhiteSpace($existingText))
-                        }
-                    }
-
-                    if ((-not $existingIsMeaningful) -and $incomingIsMeaningful) {
-                        try { $ticketToUpdate.$propName = $incomingValue } catch { }
-                    }
-                }
-            }
+    $id = ([string]$Ticket.Id).Trim()
+    if ($id) {
+        try { $ticketToUpdate = (Get-QOTickets -Quiet).Tickets | Where-Object Id -eq $id | Select-Object -First 1 }
+        catch { return [pscustomobject]@{ Success=$false; Note='The ticket could not be read. Refresh before sending.' } }
+        if (!$ticketToUpdate -or $ticketToUpdate.IsDeleted) {
+            return [pscustomobject]@{ Success=$false; Note='The ticket was removed. Review it before sending.' }
         }
-    } catch { $ticketToUpdate = $Ticket }
+        $originalRow = $null
+        if ($script:TicketRowVersions.TryGetValue($Ticket, [ref]$originalRow) -and $originalRow.Path -ne $script:TicketStorePath) {
+            return [pscustomobject]@{ Success=$false; Note='The ticket storage location changed. Refresh before sending.' }
+        }
+        $route = Get-QOTTicketPendingReplyMetadataFromTicket $ticketToUpdate
+        if (!(Test-QOTTicketReplyRoute (Get-QOTTicketPendingReplyMetadataFromTicket $Ticket) $route)) {
+            return [pscustomobject]@{ Success=$false; Note='The ticket recipient, sending mailbox or original message changed. Review the ticket before sending.' }
+        }
+    }
 
     if ($TransportOnly -and $PendingReplyDraftId) {
         $draft = $ticketToUpdate.PendingReplies | Where-Object DraftId -eq $PendingReplyDraftId | Select-Object -First 1
         if (-not $draft -or $draft.SendState -ne "Sending") {
             return [pscustomobject]@{ Success = $false; Note = "This draft is no longer awaiting delivery." }
         }
-        $route = Get-QOTTicketPendingReplyMetadataFromTicket -Ticket $ticketToUpdate
+        if (!$id) { $route = Get-QOTTicketPendingReplyMetadataFromTicket -Ticket $ticketToUpdate }
         if (-not $draft.To -and -not $draft.SourceMessageId -and -not $draft.MessageId) {
             return [pscustomobject]@{ Success = $false; Note = "The saved reply has no recipient or Outlook reference. Review the ticket before resending." }
         }
-        foreach ($field in "To","SenderMailbox","SourceMessageId","MessageId","ConversationId") {
-            if ([string]$draft.$field -ne [string]$route.$field) {
-                return [pscustomobject]@{ Success = $false; Note = "The ticket recipient, sending mailbox or original message changed. Review the ticket before resending." }
-            }
+        if (!(Test-QOTTicketReplyRoute $draft $route)) {
+            return [pscustomobject]@{ Success = $false; Note = "The ticket recipient, sending mailbox or original message changed. Review the ticket before resending." }
         }
     }
     $result = $null
     $null = Import-QOTOutlookIntegrationModule
     $preferredSenderMailbox = Get-QOTicketPreferredSenderMailbox -Ticket $ticketToUpdate
     $hasReplyReference = Test-QOTicketHasReplyReference -Ticket $ticketToUpdate
-    $preferOutboundEmailSend = Test-QOTicketPrefersOutboundEmailSend -Ticket $ticketToUpdate
+    $recipientEmail = Get-QOTicketPrimaryEmailAddress -Ticket $ticketToUpdate
+    if (!$recipientEmail) {
+        return [pscustomobject]@{ Success=$false; Note='A single valid customer email address is required.' }
+    }
 
     if ($hasReplyReference) {
-        if ($preferOutboundEmailSend) {
-            try {
-                Write-QOTicketsCoreLog ("Tickets: Reply send is using the Outlook reply path for a self-addressed thread. TicketId='{0}'." -f ([string]($ticketToUpdate.Id + "")).Trim())
-            } catch { }
-        }
         if (Get-Command Send-QOTicketOutlookReply -ErrorAction SilentlyContinue) {
             $ticketIdForSend = ""
             try { if ($ticketToUpdate.PSObject.Properties.Name -contains "Id") { $ticketIdForSend = [string]$ticketToUpdate.Id } } catch { $ticketIdForSend = "" }
-            $result = Send-QOTicketOutlookReply -Ticket $ticketToUpdate -Subject $subjectValue -Body $bodyValue -FromMailbox $preferredSenderMailbox -TicketId $ticketIdForSend
+            $result = Send-QOTicketOutlookReply -Ticket $ticketToUpdate -Subject $subjectValue -Body $bodyValue -FromMailbox $preferredSenderMailbox -TicketId $ticketIdForSend -ExpectedRecipient $recipientEmail
 
             $shouldFallbackToOutboundEmail = $false
             $replyFailureNote = ""
@@ -5135,31 +5063,9 @@ function Send-QOTicketReply {
             }
 
             if ($shouldFallbackToOutboundEmail -and (Get-Command Send-QOTicketOutlookEmail -ErrorAction SilentlyContinue)) {
-                $recipientEmail = Get-QOTicketPrimaryEmailAddress -Ticket $ticketToUpdate
-                if (-not [string]::IsNullOrWhiteSpace($recipientEmail)) {
-                    try {
-                        Write-QOTicketsCoreLog ("Tickets: Reply fallback is sending as a normal Outlook email because the original Outlook item could not be found. TicketId='{0}' To='{1}'." -f $ticketIdForSend, $recipientEmail) "WARN"
-                    } catch { }
-
-                    $fallbackResult = Send-QOTicketOutlookEmail -To $recipientEmail -Subject $subjectValue -Body $bodyValue -FromMailbox $preferredSenderMailbox -TicketId $ticketIdForSend
-                    $fallbackSucceeded = $false
-                    try { $fallbackSucceeded = [bool]$fallbackResult.Success } catch { $fallbackSucceeded = $false }
-                    if ($fallbackSucceeded) {
-                        try {
-                            Write-QOTicketsCoreLog ("Tickets: Reply fallback email send succeeded. TicketId='{0}' To='{1}'." -f $ticketIdForSend, $recipientEmail)
-                        } catch { }
-                        $result = $fallbackResult
-                    } else {
-                        $fallbackFailureNote = ""
-                        try { if ($fallbackResult.PSObject.Properties.Name -contains "Note") { $fallbackFailureNote = ([string]($fallbackResult.Note + "")).Trim() } } catch { $fallbackFailureNote = "" }
-                        try {
-                            Write-QOTicketsCoreLog ("Tickets: Reply fallback email send failed. TicketId='{0}' To='{1}' ReplyFailure='{2}' FallbackFailure='{3}'." -f $ticketIdForSend, $recipientEmail, $replyFailureNote, $fallbackFailureNote) "WARN"
-                        } catch { }
-                    }
-                } else {
-                    try {
-                        Write-QOTicketsCoreLog ("Tickets: Reply fallback skipped because no recipient email address could be resolved. TicketId='{0}' ReplyFailure='{1}'." -f $ticketIdForSend, $replyFailureNote) "WARN"
-                    } catch { }
+                $result = Send-QOTicketOutlookEmail -To $recipientEmail -Subject $subjectValue -Body $bodyValue -FromMailbox $preferredSenderMailbox -TicketId $ticketIdForSend
+                if (!$result.Success) {
+                    Write-QOTicketsCoreLog ("Tickets: Reply fallback failed. TicketId='{0}' ReplyFailure='{1}' FallbackFailure='{2}'." -f $ticketIdForSend, $replyFailureNote, $result.Note) "WARN"
                 }
             }
         } else {
@@ -5170,13 +5076,6 @@ function Send-QOTicketReply {
         }
     }
     elseif (Get-Command Send-QOTicketOutlookEmail -ErrorAction SilentlyContinue) {
-        $recipientEmail = Get-QOTicketPrimaryEmailAddress -Ticket $ticketToUpdate
-        if ([string]::IsNullOrWhiteSpace($recipientEmail)) {
-            return [pscustomobject]@{
-                Success = $false
-                Note    = "Ticket has no customer email address."
-            }
-        }
         $ticketIdForSend = ""
         try { if ($ticketToUpdate.PSObject.Properties.Name -contains "Id") { $ticketIdForSend = [string]$ticketToUpdate.Id } } catch { $ticketIdForSend = "" }
         $result = Send-QOTicketOutlookEmail -To $recipientEmail -Subject $subjectValue -Body $bodyValue -FromMailbox $preferredSenderMailbox -TicketId $ticketIdForSend
@@ -5203,6 +5102,9 @@ $exports = @(
     "Initialize-QOTicketStorage",
     "Reset-QOTicketStorageCache",
     "Get-QOTicketsStorePath",
+    "Get-QOTicketPrimaryEmailAddress",
+    "Get-QOTTicketPendingReplyMetadataFromTicket",
+    "Resolve-QOTicketEmailAddress",
     "Ensure-QOTicketsStoreDirectory",
     "Get-QOTickets",
     "Save-QOTickets",

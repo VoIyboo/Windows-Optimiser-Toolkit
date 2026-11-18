@@ -23,7 +23,7 @@ try {
     $core = Join-Path $root 'src\Core'
     $tickets = Join-Path $root 'src\Tickets'
     $null = New-Item -Type Directory -Path $tickets,$core,(Join-Path $core 'Logging') -Force
-    foreach ($file in 'Tickets.psm1','Settings.psm1','QOTImportHelper.ps1','Logging\Logging.psm1') {
+    foreach ($file in 'Tickets.psm1','Settings.psm1','QOTImportHelper.ps1','TicketEmailAddress.ps1','Logging\Logging.psm1') {
         Copy-Item -LiteralPath (Join-Path $repo "src\Core\$file") -Destination (Join-Path $core $file)
     }
     Copy-Item -Path (Join-Path $repo 'src\Tickets\*.ps1') -Destination $tickets
@@ -44,6 +44,10 @@ function Sync-QOTicketsFromOutlook { throw "No live mailbox is available in this
 function Send-QOTicketOutlookReply { throw "Unexpected reply transport." }
 function Send-QOTicketOutlookEmail {
     param($To,$Subject,$Body,$FromMailbox,$TicketId)
+    if ($Subject -eq 'Unconfirmed Outlook submission') {
+        Add-Content -LiteralPath ($env:QOT_TEST_MAIL + '.unconfirmed') -Value $To
+        return [pscustomobject]@{ Success=$false; SubmissionUnconfirmed=$true; Note='Outlook busy during submission. Check Outbox and Sent Items before resending.' }
+    }
     Add-Content -LiteralPath $env:QOT_TEST_MAIL -Value $To
     return [pscustomobject]@{ Success = $true; Note = "Simulated send"; SentEntryId = "fixture-message" }
 }
@@ -87,12 +91,51 @@ function Send-QOTicketOutlookEmail {
         $null = Export-QOTicketsToExcelSpreadsheet -Path $csv
         Assert ((Import-Csv -LiteralPath $csv).Id -eq $ticket.Id) 'Ticket export failed'
     }
+    Check 'background note worker saves, replays and deletes the same note' {
+        $payload = Join-Path $root 'note-payload.json'
+        $resultPath = Join-Path $root 'note-result.json'
+        $noteText = 'Printer location ' + [char]0x03b2
+        $noteJson = @{ TicketId = $ticket.Id; NoteId = 'background-note'; Author = 'Pat'; Note = $noteText } | ConvertTo-Json
+        [IO.File]::WriteAllText($payload, $noteJson, [Text.UTF8Encoding]::new($false))
+        $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $runner = Join-Path $tickets 'Tickets.BackgroundActionRunner.ps1'
+        foreach ($operation in 'save-note','save-note','delete-note') {
+            $null = & $engine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $runner -ToolkitRoot $root -Action $operation -PayloadPath $payload -ResultPath $resultPath
+            Assert ($LASTEXITCODE -eq 0) "The $operation worker failed"
+            $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+            Assert ($result.Success -and $result.Action -eq $operation -and $result.TicketId -eq $ticket.Id) "Unexpected $operation result"
+            $stored = (Get-QOTickets -Quiet).Tickets | Where-Object Id -eq $ticket.Id
+            $notes = @($stored.Notes | Where-Object NoteId -eq 'background-note')
+            if ($operation -eq 'save-note') {
+                Assert ($notes.Count -eq 1 -and $notes[0].Body -ceq $noteText) 'Saving or replaying the note changed the content or count'
+            } else {
+                Assert ($notes.Count -eq 0) 'Deleted background note remained in the ticket'
+            }
+        }
+    }
     Check 'email import deduplicates and retains full Unicode body' {
         $message = [pscustomobject]@{ Subject='New request'; MessageId='message1'; Body=('sample '+[char]0x03b2)*300; From='client@example.invalid' }
         $first = Add-QOTicketFromEmail -Email $message
         $again = Add-QOTicketFromEmail -Email $message
         Assert ($first.Id -eq $again.Id) 'Duplicate import'
         Assert ([IO.File]::ReadAllText($again.EmailBodyPath) -ceq $message.Body) 'Lost imported body'
+    }
+    Check 'background queue rejects a customer change after the user submits a reply' {
+        $composed = Add-QOTicket (New-QOTicket -Title 'Route handoff' -EmailTo 'first@example.invalid' -SourceMailbox 'help@example.invalid')
+        $route = Get-QOTTicketPendingReplyMetadataFromTicket $composed
+        Assert ($route.To -eq 'first@example.invalid') 'The compose snapshot missed the original recipient'
+        $current = (Get-QOTickets -Quiet).Tickets | Where-Object Id -eq $composed.Id
+        $current.EmailTo = 'other@example.invalid'
+        $null = Update-QOTicket -Ticket $current
+        $payload = Join-Path $root 'queue-payload.json'
+        $resultPath = Join-Path $root 'queue-result.json'
+        $json = @{ TicketId=$composed.Id; Subject='Original customer'; Body='Private reply'; DraftId='route-test'; ExpectedRoute=$route } | ConvertTo-Json
+        [IO.File]::WriteAllText($payload, $json)
+        $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $null = & $engine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $tickets 'Tickets.BackgroundActionRunner.ps1') -ToolkitRoot $root -Action queue-reply -PayloadPath $payload -ResultPath $resultPath
+        $result = [IO.File]::ReadAllText($resultPath) | ConvertFrom-Json
+        Assert (!$result.Success -and $result.Note -match 'changed|match|conflict') 'The worker accepted a different customer or failed for the wrong reason'
+        Assert ($null -eq (Get-QOTTicketPendingReply -TicketId $composed.Id -DraftId 'route-test')) 'The mismatched reply entered the queue'
     }
     Check 'background reply sends exactly once through a clean install' {
         $entry = Add-QOTTicketPendingReply -TicketId $ticket.Id -Subject 'Re: Printer' -Body 'Try again' -DraftId 'draft1'
@@ -146,6 +189,22 @@ function Send-QOTicketOutlookEmail {
         Assert ((Get-QOTTicketPendingReply -TicketId $ticket.Id -DraftId routing).SendState -eq 'Failed') 'Modified target was used'
         Assert (@(Get-Content -LiteralPath $env:QOT_TEST_MAIL).Count -eq 2) 'Sent to a changed recipient'
         $null = Cancel-QOTTicketPendingReply -TicketId $ticket.Id -DraftId routing
+    }
+    Check 'an unconfirmed Outlook submission is held for review across worker restarts' {
+        $address = 'uncertain@example.invalid'
+        $unsure = Add-QOTicket (New-QOTicket -Title 'Delivery acknowledgement' -EmailTo $address)
+        $null = Add-QOTTicketPendingReply -TicketId $unsure.Id -DraftId unsure -Subject 'Unconfirmed Outlook submission' -Body 'Fixture only'
+        $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $worker = Join-Path $tickets 'Tickets.Email.ReplyQueueRunner.ps1'
+        foreach ($run in 1,2) {
+            & $engine -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File $worker -ToolkitRoot $root -MaxFailureRetries 2
+            Assert ($LASTEXITCODE -eq 0) "Queue worker run $run failed"
+            $held = Get-QOTTicketPendingReply -TicketId $unsure.Id -DraftId unsure
+            Assert ($held.SendState -eq 'Failed' -and !$held.NextAttemptAt -and $held.RetryCount -eq 1) 'An uncertain submission remained eligible for automatic retry'
+            Assert ($held.FailureNote -match 'Check Outbox and Sent Items before resending') 'The operator did not receive the manual review instruction'
+            $submissions = @(Get-Content -LiteralPath ($env:QOT_TEST_MAIL + '.unconfirmed'))
+            Assert ($submissions.Count -eq 1 -and $submissions[0] -ceq $address) 'The worker submitted the message more than once or to the wrong mailbox'
+        }
     }
     Check 'unconfigured automatic sync stays idle and manual sync remains available' {
         Add-Type -AssemblyName PresentationFramework
@@ -223,9 +282,10 @@ function Send-QOTicketOutlookEmail {
     Check 'ticket details preserve Unicode sender names from body files' {
         $senderName = 'Ren' + [char]0x00e9
         $bodyPath = Join-Path $root 'sender.txt'
-        [IO.File]::WriteAllText($bodyPath, "From: $senderName <sender@example.invalid>")
+        [IO.File]::WriteAllText($bodyPath, "From: $senderName <o'brien@example.invalid>")
         $details = & (Get-Module Tickets.UI) { param($path) Get-QOTicketSenderFallbackInfo -Ticket ([pscustomobject]@{EmailBodyPath=$path}) } $bodyPath
         Assert ($details.SenderName -ceq $senderName) "Wrong sender name: $($details.SenderName)"
+        Assert ($details.SenderEmail -ceq "o'brien@example.invalid") "Wrong sender address: $($details.SenderEmail)"
     }
     Check 'closing delegate releases the module watcher and stops the sync timer' {
         $close = & (Get-Module Tickets.UI) {
@@ -256,6 +316,8 @@ function Send-QOTicketOutlookEmail {
                 $item
             }) }
             $script:mailItems | Add-Member -MemberType ScriptMethod -Name Item -Value {param($n) $this.Messages[$n-1]}
+            $script:mailItems | Add-Member -MemberType ScriptProperty -Name Count -Value { $this.Messages.Length }
+            $script:mailItems | Add-Member -MemberType ScriptMethod -Name Sort -Value { param($field,$descending) }
             function script:Get-QOTMailboxInboxFolder {param($MAPI,$MailboxAddress) [pscustomobject]@{Items=$script:mailItems}}
             $first = Sync-QOTicketsFromOutlook
             Assert ($first.Added -eq 2) "Distinct messages became $($first.Added) new tickets"

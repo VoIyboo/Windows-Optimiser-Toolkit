@@ -919,27 +919,12 @@ function Register-QOTRailIconReordering {
 function Set-QOTTicketsRailSubmenuState {
     param(
         [AllowNull()]$Submenu,
-        [AllowNull()]$TicketsButton,
-        [AllowNull()]$Container,
         [bool]$IsOpen
     )
 
-    if (-not $Submenu) { return }
-
-    if (-not $IsOpen) {
-        try { $Submenu.Visibility = [System.Windows.Visibility]::Collapsed } catch { }
-        return
+    if ($Submenu) {
+        $Submenu.Visibility = if ($IsOpen) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
     }
-
-    try {
-        if ($TicketsButton -and $Container) {
-            $origin = $TicketsButton.TranslatePoint((New-Object System.Windows.Point(0, 0)), $Container)
-            $top = [Math]::Round($origin.Y + $TicketsButton.ActualHeight + 4)
-            $Submenu.Margin = New-Object System.Windows.Thickness(0, $top, 0, 0)
-        }
-    } catch { }
-
-    try { $Submenu.Visibility = [System.Windows.Visibility]::Visible } catch { }
 }
 
 function Set-QOTProcessTaskbarIdentity {
@@ -3857,7 +3842,7 @@ function Start-QOTMainWindow {
         Show-QOTStartupErrorBanner -Window $window -Message $fatalMessage
     }
 
-    $extraControlResolution = Invoke-QOTControlResolution -Root $script:MainWindow -Names @("TabApps","TabCleaning","TabAdvanced","BtnPlayProgressPath","BtnPlayProgressClip","ExecutionMessage","BtnLogs","BtnSettings","BtnHelp","TabHelp","TabSettings","CbQuickSafeCleanup","BtnNavCleaning","BtnNavApps","BtnNavAdvanced","BtnNavTickets","RailIconHost","RailShellGrid","TicketsRailSubmenu","BtnRailTicketBack","BtnRailTicketNew","BtnRailTicketDelete","BtnRailTicketFilter","BtnToggleTicketDetails","BtnNewTicket","BtnDeleteTicket","BtnTicketsFilterMenu","CustomTitleBarHost","WindowDragSurface","HeaderContentDragSurface","BtnWindowMinimize","BtnWindowMaximize","BtnWindowMaximizeGlyph","BtnWindowClose","WindowTitleIcon")
+    $extraControlResolution = Invoke-QOTControlResolution -Root $script:MainWindow -Names @("TabApps","TabCleaning","TabAdvanced","BtnPlayProgressPath","BtnPlayProgressClip","ExecutionMessage","BtnLogs","BtnSettings","BtnHelp","TabHelp","TabSettings","CbQuickSafeCleanup","BtnNavCleaning","BtnNavApps","BtnNavAdvanced","BtnNavTickets","RailIconHost","TicketsRailSubmenu","BtnRailTicketBack","BtnRailTicketNew","BtnRailTicketDelete","BtnRailTicketFilter","BtnToggleTicketDetails","BtnNewTicket","BtnDeleteTicket","BtnTicketsFilterMenu","CustomTitleBarHost","WindowDragSurface","HeaderContentDragSurface","BtnWindowMinimize","BtnWindowMaximize","BtnWindowMaximizeGlyph","BtnWindowClose","WindowTitleIcon")
     foreach ($kv in $extraControlResolution.Resolved.GetEnumerator()) {
         if (-not $resolvedControls.ContainsKey($kv.Key)) {
             $resolvedControls[$kv.Key] = $kv.Value
@@ -3880,7 +3865,6 @@ function Start-QOTMainWindow {
     $btnHelpNav = $resolvedControls["BtnHelp"]
     $btnSettingsNav = $resolvedControls["BtnSettings"]
     $railIconHost = $resolvedControls["RailIconHost"]
-    $railShellGrid = $resolvedControls["RailShellGrid"]
     $ticketsRailSubmenu = $resolvedControls["TicketsRailSubmenu"]
     $btnRailTicketBack = $resolvedControls["BtnRailTicketBack"]
     $btnRailTicketNew = $resolvedControls["BtnRailTicketNew"]
@@ -3909,7 +3893,7 @@ function Start-QOTMainWindow {
             $selectedTabName = ""
             try { if ($tabs.SelectedItem) { $selectedTabName = [string]$tabs.SelectedItem.Name } } catch { $selectedTabName = "" }
             if ($selectedTabName -ne "TabTickets") {
-                & $setTicketsRailSubmenuStateCmd -Submenu $ticketsRailSubmenu -TicketsButton $btnNavByTab["TabTickets"] -Container $railShellGrid -IsOpen $false
+                & $setTicketsRailSubmenuStateCmd -Submenu $ticketsRailSubmenu -IsOpen $false
             }
         } catch { }
     }.GetNewClosure()
@@ -4059,10 +4043,10 @@ function Start-QOTMainWindow {
                         }
                         $tabs.SelectedItem = $targetTab
                         if ($targetTabName -eq "TabTickets") {
-                            & $setTicketsRailSubmenuStateCmd -Submenu $ticketsRailSubmenu -TicketsButton $btnNavByTab["TabTickets"] -Container $railShellGrid -IsOpen $shouldOpenTicketsSubmenu
+                            & $setTicketsRailSubmenuStateCmd -Submenu $ticketsRailSubmenu -IsOpen $shouldOpenTicketsSubmenu
                         }
                         else {
-                            & $setTicketsRailSubmenuStateCmd -Submenu $ticketsRailSubmenu -TicketsButton $btnNavByTab["TabTickets"] -Container $railShellGrid -IsOpen $false
+                            & $setTicketsRailSubmenuStateCmd -Submenu $ticketsRailSubmenu -IsOpen $false
                         }
                     }
                 } catch { }
@@ -4075,7 +4059,7 @@ function Start-QOTMainWindow {
                 $selectedTabName = ""
                 try { if ($tabs.SelectedItem) { $selectedTabName = [string]$tabs.SelectedItem.Name } } catch { $selectedTabName = "" }
                 $shouldStayOpen = ($selectedTabName -eq "TabTickets")
-                & $setTicketsRailSubmenuStateCmd -Submenu $ticketsRailSubmenu -TicketsButton $btnNavByTab["TabTickets"] -Container $railShellGrid -IsOpen $shouldStayOpen
+                & $setTicketsRailSubmenuStateCmd -Submenu $ticketsRailSubmenu -IsOpen $shouldStayOpen
             } catch { }
         }.GetNewClosure()
 
