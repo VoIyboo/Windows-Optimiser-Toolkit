@@ -42,12 +42,11 @@ function Test-QOTReplyQueueFailureRecoverable {
 
     foreach ($pattern in @(
         'classic outlook is not running',
+        'classic outlook is not open',
         'unable to access classic outlook',
         'outlook com unavailable',
         'could not attach to classic outlook',
         'reply runner failed',
-        'reply runner returned no output',
-        'output parse failed',
         'processing -file',
         'does not have a ''.ps1'' extension',
         'server execution failed',
@@ -211,17 +210,17 @@ function Read-QOTReplyQueueChildResult {
 
 function Invoke-QOTReplyQueueSendIsolated {
     param(
-        [Parameter(Mandatory=$true)][string]$WorkerExePath,
+        [Parameter(Mandatory=$true)][string]$RunnerPath,
         [Parameter(Mandatory=$true)]$Payload,
         [Parameter(Mandatory=$true)][string]$RuntimeRoot,
         [int]$TimeoutSeconds = 120
     )
 
     if ($TimeoutSeconds -lt 30) { $TimeoutSeconds = 30 }
-    if ([string]::IsNullOrWhiteSpace($WorkerExePath) -or -not (Test-Path -LiteralPath $WorkerExePath)) {
+    if (-not (Test-Path -LiteralPath $RunnerPath -PathType Leaf)) {
         return [pscustomobject]@{
             Success = $false
-            Note    = ("Reply worker executable is unavailable: " + $WorkerExePath)
+            Note    = ("Reply runner is unavailable: " + $RunnerPath)
         }
     }
 
@@ -243,9 +242,9 @@ function Invoke-QOTReplyQueueSendIsolated {
         ($payload | ConvertTo-Json -Depth 8 -Compress) | Set-Content -LiteralPath $payloadPath -Encoding UTF8 -ErrorAction Stop
 
         $argList = @(
-            "send-reply",
-            "--payload", $payloadPath,
-            "--result", $resultPath
+            "-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass",
+            "-File", $RunnerPath, "-ToolkitRoot", $ToolkitRoot,
+            "-ReplyCommand", $ReplyCommand, "-PayloadPath", $payloadPath, "-ResultPath", $resultPath, "-TransportOnly"
         )
         $quotedArgList = foreach ($argument in @($argList)) {
             $text = [string]($argument + "")
@@ -263,52 +262,24 @@ function Invoke-QOTReplyQueueSendIsolated {
         }
         $argumentString = ($quotedArgList -join ' ')
 
-        $workingDirectory = Split-Path -Parent $WorkerExePath
-        if ([string]::IsNullOrWhiteSpace($workingDirectory) -or -not (Test-Path -LiteralPath $workingDirectory)) {
-            $workingDirectory = $env:TEMP
+        $engine = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $replyProcess = Start-Process -FilePath $engine -ArgumentList $argumentString -WorkingDirectory $ToolkitRoot -WindowStyle Hidden -PassThru
+        if (-not $replyProcess.WaitForExit($TimeoutSeconds * 1000)) {
+            $replyProcess.Kill()
+            $null = $replyProcess.WaitForExit(5000)
+            return [pscustomobject]@{ Success = $false; Note = "Delivery could not be confirmed. Check Sent Items before resending." }
         }
-        $replyProcess = Start-Process -FilePath $WorkerExePath -ArgumentList $argumentString -WorkingDirectory $workingDirectory -WindowStyle Hidden -PassThru
-        $deadlineUtc = (Get-Date).ToUniversalTime().AddSeconds($TimeoutSeconds)
-
-        while ((Get-Date).ToUniversalTime() -lt $deadlineUtc) {
-            Start-Sleep -Milliseconds 750
-
-            try {
-                if (Test-Path -LiteralPath $resultPath) {
-                    $resultInfo = Get-Item -LiteralPath $resultPath -ErrorAction SilentlyContinue
-                    if ($resultInfo -and $resultInfo.Length -gt 0) {
-                        $exitCode = 0
-                        try { if ($replyProcess) { $exitCode = [int]$replyProcess.ExitCode } } catch { $exitCode = 0 }
-                        return (Read-QOTReplyQueueChildResult -ResultPath $resultPath -StandardOutputPath "" -StandardErrorPath "" -ExitCode $exitCode)
-                    }
-                }
-            } catch { }
-
-            try {
-                if ($replyProcess -and $replyProcess.HasExited) { break }
-            } catch { }
+        if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+            return [pscustomobject]@{ Success = $false; Note = "Delivery could not be confirmed. Check Sent Items before resending." }
         }
-
-        try {
-            if ($replyProcess -and -not $replyProcess.HasExited) {
-                try { $replyProcess.Kill() } catch { }
-                try { $replyProcess.WaitForExit(5000) | Out-Null } catch { }
-                return [pscustomobject]@{
-                    Success = $false
-                    Note    = ("Reply timed out after {0} seconds." -f [int]$TimeoutSeconds)
-                }
-            }
-        } catch { }
-
-        $processExitCode = 0
-        try { if ($replyProcess) { $processExitCode = [int]$replyProcess.ExitCode } } catch { $processExitCode = 0 }
-        return (Read-QOTReplyQueueChildResult -ResultPath $resultPath -StandardOutputPath "" -StandardErrorPath "" -ExitCode $processExitCode)
+        return (Read-QOTReplyQueueChildResult -ResultPath $resultPath -StandardOutputPath "" -StandardErrorPath "" -ExitCode $replyProcess.ExitCode)
     } catch {
         return [pscustomobject]@{
             Success = $false
             Note    = ("Reply runner failed: " + $_.Exception.Message)
         }
     } finally {
+        if ($replyProcess) { $replyProcess.Dispose() }
         foreach ($cleanupPath in @($cleanupPaths)) {
             try {
                 if (-not [string]::IsNullOrWhiteSpace([string]$cleanupPath) -and (Test-Path -LiteralPath $cleanupPath)) {
@@ -347,9 +318,7 @@ try {
         "Get-QOTPendingReplyQueueSnapshot",
         "Get-QOTNextPendingReply",
         "Set-QOTTicketPendingReplyState",
-        "Remove-QOTTicketPendingReply",
         "Get-QOTTicketsReplyQueueMutexName",
-        "Ensure-QOTTicketsWorker",
         "Get-QOTTicketsWorkerRuntimeRoot",
         "New-QOTTicketReplyWorkerPayload",
         "Complete-QOTTicketReplySend"
@@ -375,17 +344,12 @@ try {
     $getQueueSnapshotCmd = $requiredCommands["Get-QOTPendingReplyQueueSnapshot"]
     $getNextPendingReplyCmd = $requiredCommands["Get-QOTNextPendingReply"]
     $setPendingReplyStateCmd = $requiredCommands["Set-QOTTicketPendingReplyState"]
-    $removePendingReplyCmd = $requiredCommands["Remove-QOTTicketPendingReply"]
     $getMutexNameCmd = $requiredCommands["Get-QOTTicketsReplyQueueMutexName"]
-    $ensureWorkerCmd = $requiredCommands["Ensure-QOTTicketsWorker"]
     $getWorkerRuntimeRootCmd = $requiredCommands["Get-QOTTicketsWorkerRuntimeRoot"]
     $buildReplyPayloadCmd = $requiredCommands["New-QOTTicketReplyWorkerPayload"]
     $completeReplySendCmd = $requiredCommands["Complete-QOTTicketReplySend"]
-    $replyWorkerExePath = [string](& $ensureWorkerCmd)
+    $replyRunnerPath = Join-Path $PSScriptRoot "Tickets.Email.ReplyRunner.ps1"
     $replyWorkerRuntimeRoot = [string](& $getWorkerRuntimeRootCmd)
-    if ([string]::IsNullOrWhiteSpace($replyWorkerExePath) -or -not (Test-Path -LiteralPath $replyWorkerExePath)) {
-        throw "Reply worker executable is unavailable."
-    }
 
     $mutexName = [string](& $getMutexNameCmd)
     if ([string]::IsNullOrWhiteSpace($mutexName)) {
@@ -456,7 +420,8 @@ try {
                 Write-QOTReplyQueueRunnerLog ("Recovering stale sending reply DraftId='{0}' TicketId='{1}'." -f $draftId, $ticketId) "WARN"
             }
 
-            $null = & $setPendingReplyStateCmd -TicketId $ticketId -DraftId $draftId -SendState Sending -FailureNote "" -RetryCount $retryCount -NextAttemptAt ""
+            $claimed = & $setPendingReplyStateCmd -TicketId $ticketId -DraftId $draftId -SendState Sending -FailureNote "" -RetryCount $retryCount -NextAttemptAt ""
+            if (-not $claimed) { continue }
 
             $db = & $getTicketsCmd -Quiet
             $ticket = @(
@@ -477,7 +442,7 @@ try {
             Write-QOTReplyQueueRunnerLog ("Sending queued reply DraftId='{0}' TicketId='{1}' RetryCount={2}" -f $draftId, $ticketId, $retryCount)
             $sendStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             $payload = & $buildReplyPayloadCmd -Ticket $ticket -Subject $subject -Body $body -PendingReplyDraftId $draftId
-            $rawResult = Invoke-QOTReplyQueueSendIsolated -WorkerExePath $replyWorkerExePath -Payload $payload -RuntimeRoot $replyWorkerRuntimeRoot -TimeoutSeconds $ReplySendTimeoutSeconds
+            $rawResult = Invoke-QOTReplyQueueSendIsolated -RunnerPath $replyRunnerPath -Payload $payload -RuntimeRoot $replyWorkerRuntimeRoot -TimeoutSeconds $ReplySendTimeoutSeconds
             try { if ($sendStopwatch) { $sendStopwatch.Stop() } } catch { }
 
             $success = $false
@@ -490,12 +455,14 @@ try {
             Write-QOTReplyQueueRunnerLog ("Reply send completed. DraftId='{0}' TicketId='{1}' Success={2} DurationMs={3} Note='{4}'" -f $draftId, $ticketId, $success, [int]$sendStopwatch.Elapsed.TotalMilliseconds, $note)
 
             if ($success) {
+                $receipt = & $setPendingReplyStateCmd -TicketId $ticketId -DraftId $draftId -SendState Sent -DeliveryReceipt $rawResult
                 try {
-                    $rawResult = & $completeReplySendCmd -Ticket $ticket -Subject $subject -Body $body -SendResult $rawResult -PendingReplyDraftId $draftId
+                    $rawResult = & $completeReplySendCmd -Ticket $ticket -Subject $subject -Body $body -SendResult $rawResult -PendingReplyDraftId $draftId -SentAt $receipt.SentAt
+                    if (-not $rawResult.Persisted) { throw $rawResult.PersistError }
                 } catch {
                     Write-QOTReplyQueueRunnerLog ("Reply send succeeded but persistence completion failed. DraftId='{0}' TicketId='{1}' Error='{2}'" -f $draftId, $ticketId, $_.Exception.Message) "WARN"
+                    continue
                 }
-                try { $null = & $removePendingReplyCmd -TicketId $ticketId -DraftId $draftId } catch { }
                 Write-QOTReplyQueueRunnerLog ("Queued reply sent successfully. DraftId='{0}' TicketId='{1}'" -f $draftId, $ticketId)
                 continue
             }

@@ -1656,7 +1656,7 @@
                                 <Trigger Property="Tag" Value="Invoke-QCleanWindowsUpdateCache"><Setter Property="ToolTip" Value="Caution: Windows Update may re-download required files." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanThumbnailCache"><Setter Property="ToolTip" Value="Safe: refresh Explorer thumbnail and preview cache." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanErrorLogs"><Setter Property="ToolTip" Value="Safe: remove old error logs and crash dump files." /></Trigger>
-                                <Trigger Property="Tag" Value="Invoke-QCleanSetupLeftovers"><Setter Property="ToolTip" Value="Safe: remove setup leftovers from past upgrades." /></Trigger>
+                                <Trigger Property="Tag" Value="Invoke-QCleanSetupLeftovers"><Setter Property="ToolTip" Value="Removes archived setup logs in the Windows Panther folder." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanStoreCache"><Setter Property="ToolTip" Value="Safe: reset local Microsoft Store cache files." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanEdgeCache"><Setter Property="ToolTip" Value="Light cleanup of Microsoft Edge cache files." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanChromeCache"><Setter Property="ToolTip" Value="Light cleanup of Chrome and Chromium cache files." /></Trigger>
@@ -1745,7 +1745,7 @@
                                                       Content="Windows housekeeping"
                                                       ToolTip="Check every option in Windows housekeeping" />
                                             <CheckBox x:Name="CbCleanErrorLogs" Tag="Invoke-QCleanErrorLogs" Content="Clean old error logs and crash dumps" />
-                                            <CheckBox x:Name="CbCleanSetupLeftovers" Tag="Invoke-QCleanSetupLeftovers" Content="Remove safe setup / upgrade leftovers" />
+                                            <CheckBox x:Name="CbCleanSetupLeftovers" Tag="Invoke-QCleanSetupLeftovers" Content="Clear archived Windows setup logs" />
                                             <CheckBox x:Name="CbClearStoreCache" Tag="Invoke-QCleanStoreCache" Content="Clear Microsoft Store cache" />
                                             <CheckBox x:Name="CbClearEventLogs" Tag="Invoke-QClearWindowsEventLogs" Content="Clear Windows Event Logs" />
                                             <CheckBox x:Name="CbClearTeamsCache" Tag="Invoke-QCleanTeamsCache" Content="Clear Microsoft Teams cache" />
@@ -2619,7 +2619,7 @@
                                 <Trigger Property="Name" Value="CbAdvDeepCacheCleanup"><Setter Property="ToolTip" Value="High-risk: deep cache and component store cleanup actions." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvCleanComponentStore"><Setter Property="ToolTip" Value="Caution: removes superseded Windows component files using DISM cleanup." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvAggressiveComponentStoreCleanup"><Setter Property="ToolTip" Value="High-risk: deeper DISM cleanup that may remove update rollback capability." /></Trigger>
-                                <Trigger Property="Name" Value="CbAdvScanUnusedDeviceDrivers"><Setter Property="ToolTip" Value="Scan/report mode for orphaned or unused driver packages. No driver packages are removed by this action." /></Trigger>
+                                <Trigger Property="Name" Value="CbAdvScanUnusedDeviceDrivers"><Setter Property="ToolTip" Value="Counts third-party driver packages reported by PnPUtil." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvDisableTelemetryScheduledTasks"><Setter Property="ToolTip" Value="Safe: disables selected telemetry and CEIP scheduled tasks." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvDisableIPv6"><Setter Property="ToolTip" Value="Disable IPv6 stack usage on network adapters." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvDisableTeredo"><Setter Property="ToolTip" Value="Disable Teredo tunneling components and related services." /></Trigger>
@@ -2698,7 +2698,7 @@
                                             <CheckBox x:Name="CbAdvRemoveOldProfiles" Content="Remove old profiles" />
                                             <CheckBox x:Name="CbAdvCleanComponentStore" Content="Clean Windows Component Store" />
                                             <CheckBox x:Name="CbAdvDisableTelemetryScheduledTasks" Content="Disable telemetry scheduled tasks" />
-                                            <CheckBox x:Name="CbAdvScanUnusedDeviceDrivers" Content="Scan unused device drivers (report only)" />
+                                            <CheckBox x:Name="CbAdvScanUnusedDeviceDrivers" Content="Count third-party driver packages (report only)" />
                                             <CheckBox x:Name="CbAdvAggressiveRestoreCleanup" Content="Aggressive restore/log cleanup" />
                                             <CheckBox x:Name="CbAdvDeepCacheCleanup" Content="Deep cache/component store cleanup" />
                                             <CheckBox x:Name="CbAdvAggressiveComponentStoreCleanup" Content="Aggressive component store cleanup" />

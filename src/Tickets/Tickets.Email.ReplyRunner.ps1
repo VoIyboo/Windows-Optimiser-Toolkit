@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory=$true)][string]$ToolkitRoot,
     [string]$ReplyCommand = "Send-QOTicketReply",
     [Parameter(Mandatory=$true)][string]$PayloadPath,
-    [string]$ResultPath
+    [string]$ResultPath,
+    [switch]$TransportOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -119,7 +120,9 @@ try {
         exit 0
     }
 
-    $rawResult = & $ReplyCommand -Ticket $ticket -Subject $subject -Body $body -PendingReplyDraftId $pendingReplyDraftId
+    $replyParams = @{ Ticket = $ticket; Subject = $subject; Body = $body; PendingReplyDraftId = $pendingReplyDraftId }
+    if ($TransportOnly) { $replyParams.TransportOnly = $true }
+    $rawResult = & $replyCmd @replyParams
     if (-not $rawResult) {
         $rawResult = New-QOTReplyRunnerResult -Success:$false -Note "Reply command returned no result."
     }
@@ -136,7 +139,10 @@ try {
     }
 
     Write-QOTReplyRunnerLog ("Reply runner completed. Success={0} Note='{1}' TicketId='{2}'" -f $success, $note, $ticketId)
-    Write-QOTReplyRunnerResult -Result (New-QOTReplyRunnerResult -Success:$success -Note $note)
+    if ($rawResult.PSObject.Properties.Name -notcontains "Success") {
+        $rawResult | Add-Member -NotePropertyName Success -NotePropertyValue $success
+    }
+    Write-QOTReplyRunnerResult -Result $rawResult
     exit 0
 }
 catch {

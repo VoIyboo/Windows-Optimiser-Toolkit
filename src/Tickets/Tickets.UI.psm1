@@ -475,7 +475,6 @@ function Find-QOTTicketMatchInCollection {
     $emailMessageId = [string](Get-QOTicketPropertyTextValue -Ticket $Ticket -PropertyNames @("EmailMessageId", "InternetMessageId", "MessageId"))
     $sourceMessageId = [string](Get-QOTicketPropertyTextValue -Ticket $Ticket -PropertyNames @("SourceMessageId", "OutlookEntryId", "EntryId"))
     $bodyPath = [string](Get-QOTicketPropertyTextValue -Ticket $Ticket -PropertyNames @("EmailBodyPath", "BodyPath", "HtmlBodyPath", "TextBodyPath", "PreviewPath"))
-    $threadKey = Normalize-QOTTicketThreadKey -Subject (Get-QOTTicketPreferredSubject -Ticket $Ticket)
 
     $matches = @(
         $sourceItems |
@@ -485,13 +484,13 @@ function Find-QOTTicketMatchInCollection {
                 $candidateEmailMessageId = [string](Get-QOTicketPropertyTextValue -Ticket $_ -PropertyNames @("EmailMessageId", "InternetMessageId", "MessageId"))
                 $candidateSourceMessageId = [string](Get-QOTicketPropertyTextValue -Ticket $_ -PropertyNames @("SourceMessageId", "OutlookEntryId", "EntryId"))
                 $candidateBodyPath = [string](Get-QOTicketPropertyTextValue -Ticket $_ -PropertyNames @("EmailBodyPath", "BodyPath", "HtmlBodyPath", "TextBodyPath", "PreviewPath"))
-                $candidateThreadKey = Normalize-QOTTicketThreadKey -Subject (Get-QOTTicketPreferredSubject -Ticket $_)
 
-                if ((-not [string]::IsNullOrWhiteSpace($ticketId)) -and [string]::Equals($candidateId, $ticketId, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+                if ($ticketId -and $candidateId) {
+                    return [string]::Equals($candidateId, $ticketId, [System.StringComparison]::OrdinalIgnoreCase)
+                }
                 if ((-not [string]::IsNullOrWhiteSpace($emailMessageId)) -and [string]::Equals($candidateEmailMessageId, $emailMessageId, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
                 if ((-not [string]::IsNullOrWhiteSpace($sourceMessageId)) -and [string]::Equals($candidateSourceMessageId, $sourceMessageId, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
                 if ((-not [string]::IsNullOrWhiteSpace($bodyPath)) -and [string]::Equals($candidateBodyPath, $bodyPath, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-                if ((-not [string]::IsNullOrWhiteSpace($threadKey)) -and [string]::Equals($candidateThreadKey, $threadKey, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
                 return $false
             }
     )
@@ -1876,7 +1875,7 @@ function Get-QOTicketSenderFallbackInfo {
             $bodyPath = ([string]($Ticket.EmailBodyPath + "")).Trim()
             $bodyPath = Resolve-QOTicketBodyPath -Ticket $Ticket -BodyPath $bodyPath
             if (-not [string]::IsNullOrWhiteSpace($bodyPath) -and (Test-Path -LiteralPath $bodyPath)) {
-                $bodyText = Get-Content -LiteralPath $bodyPath -Raw -ErrorAction SilentlyContinue
+                $bodyText = Read-QOTicketBodyFilePreview -Path $bodyPath
             }
         }
     } catch { $bodyText = "" }
@@ -3764,18 +3763,7 @@ function Get-QOTicketDetailsBodyText {
         return [datetime]::MinValue
     }.GetNewClosure()
 
-    $buildThreadKey = {
-        param([AllowNull()][string]$Subject)
-        $value = ([string]($Subject + "")).Trim()
-        if ([string]::IsNullOrWhiteSpace($value)) { return "" }
-        $value = ($value -replace '[\r\n]+', ' ').Trim()
-        for ($i = 0; $i -lt 6; $i++) {
-            $next = ($value -replace '^(?i)\s*((RE|FW|FWD)\s*:\s*)+', '').Trim()
-            if ($next -eq $value) { break }
-            $value = $next
-        }
-        return (($value -replace '\s+', ' ').Trim().ToLowerInvariant())
-    }.GetNewClosure()
+
 
     $resolveBodyPathCmd = $null
     try { $resolveBodyPathCmd = Resolve-QOTicketsLocalFunction -Name "Resolve-QOTicketBodyPath" } catch { $resolveBodyPathCmd = $null }
@@ -4218,13 +4206,9 @@ function Get-QOTicketDetailsBodyText {
         }
     }
 
-    # Include related incoming emails with same thread subject so the IT person sees the running conversation.
-    $threadSubject = $subjectSummary
-    if ([string]::IsNullOrWhiteSpace($threadSubject)) {
-        try { if ($Ticket.PSObject.Properties.Name -contains "Title") { $threadSubject = [string]$Ticket.Title } } catch { $threadSubject = "" }
-    }
-    $threadKey = & $buildThreadKey $threadSubject
-    if (-not [string]::IsNullOrWhiteSpace($threadKey)) {
+    # Different customers can use identical subjects in the same support inbox.
+    $conversationId = Get-QOTicketPropertyTextValue -Ticket $Ticket -PropertyNames @("EmailConversationId", "ConversationId")
+    if ($conversationId) {
         try {
             $allTickets = $allTicketsCache
             if ($allTickets.Count -eq 0) {
@@ -4249,13 +4233,8 @@ function Get-QOTicketDetailsBodyText {
                 $otherId = ""
                 try { if ($other.PSObject.Properties.Name -contains "Id") { $otherId = [string]$other.Id } } catch { $otherId = "" }
                 if (-not [string]::IsNullOrWhiteSpace($currentId) -and $otherId -eq $currentId) { continue }
-                $otherSubject = ""
-                try {
-                    if ($other.PSObject.Properties.Name -contains "Subject") { $otherSubject = [string]$other.Subject }
-                    elseif ($other.PSObject.Properties.Name -contains "Title") { $otherSubject = [string]$other.Title }
-                } catch { $otherSubject = "" }
-                $otherKey = & $buildThreadKey $otherSubject
-                if ([string]::IsNullOrWhiteSpace($otherKey) -or $otherKey -ne $threadKey) { continue }
+                $otherConversationId = Get-QOTicketPropertyTextValue -Ticket $other -PropertyNames @("EmailConversationId", "ConversationId")
+                if ($otherConversationId -ne $conversationId) { continue }
 
                 $otherBody = & $getBodyForTicket $other
                 if ([string]::IsNullOrWhiteSpace($otherBody)) { continue }
@@ -4515,7 +4494,7 @@ function Set-QOTicketDetailsBodyContent {
                             ClientNoteId = $noteId
                         }
                         $deleteNoteButton.Add_Click([System.Windows.RoutedEventHandler]{
-                            param($sender, $args)
+                            param($sender, $eventArgs)
                             try {
                                 $tagNoteId = ""
                                 try {
@@ -4525,9 +4504,9 @@ function Set-QOTicketDetailsBodyContent {
                                 } catch { $tagNoteId = "" }
                                 try { Write-QOTicketsUILog ("Tickets: Delete note timeline button clicked with NoteId='{0}'." -f $tagNoteId) } catch { }
                                 if ($script:TicketsDeleteNoteHandler) {
-                                    $script:TicketsDeleteNoteHandler.Invoke($sender, $args)
+                                    $script:TicketsDeleteNoteHandler.Invoke($sender, $eventArgs)
                                 }
-                                try { if ($args) { $args.Handled = $true } } catch { }
+                                try { if ($eventArgs) { $eventArgs.Handled = $true } } catch { }
                             } catch {
                                 try { Write-QOTicketsUILog ("Tickets: Internal note delete icon action failed: " + $_.Exception.Message) "WARN" } catch { }
                             }
@@ -4700,7 +4679,7 @@ function Set-QOTicketDetailsBodyContent {
                             PendingReplyDraftId  = $replyDraftId
                         }
                         $retryButton.Add_Click([System.Windows.RoutedEventHandler]{
-                            param($sender, $args)
+                            param($sender, $eventArgs)
                             try {
                                 $tagDraftId = ""
                                 try {
@@ -4710,11 +4689,11 @@ function Set-QOTicketDetailsBodyContent {
                                 } catch { $tagDraftId = "" }
                                 try { Write-QOTicketsUILog ("Tickets: Retry reply timeline button clicked with DraftId='{0}'." -f $tagDraftId) } catch { }
                                 if ($script:TicketsRetryReplyHandler) {
-                                    $script:TicketsRetryReplyHandler.Invoke($sender, $args)
+                                    $script:TicketsRetryReplyHandler.Invoke($sender, $eventArgs)
                                 } else {
                                     try { Write-QOTicketsUILog "Tickets: Retry reply timeline button ignored because handler is not attached." "WARN" } catch { }
                                 }
-                                try { if ($args) { $args.Handled = $true } } catch { }
+                                try { if ($eventArgs) { $eventArgs.Handled = $true } } catch { }
                             } catch {
                                 try { Write-QOTicketsUILog ("Tickets: Failed reply retry icon action failed: " + $_.Exception.Message) "WARN" } catch { }
                             }
@@ -4744,7 +4723,7 @@ function Set-QOTicketDetailsBodyContent {
                             PendingReplyDraftId  = $replyDraftId
                         }
                         $cancelButton.Add_Click([System.Windows.RoutedEventHandler]{
-                            param($sender, $args)
+                            param($sender, $eventArgs)
                             try {
                                 $tagDraftId = ""
                                 try {
@@ -4754,11 +4733,11 @@ function Set-QOTicketDetailsBodyContent {
                                 } catch { $tagDraftId = "" }
                                 try { Write-QOTicketsUILog ("Tickets: Delete reply timeline button clicked with DraftId='{0}'." -f $tagDraftId) } catch { }
                                 if ($script:TicketsCancelReplyHandler) {
-                                    $script:TicketsCancelReplyHandler.Invoke($sender, $args)
+                                    $script:TicketsCancelReplyHandler.Invoke($sender, $eventArgs)
                                 } else {
                                     try { Write-QOTicketsUILog "Tickets: Delete reply timeline button ignored because handler is not attached." "WARN" } catch { }
                                 }
-                                try { if ($args) { $args.Handled = $true } } catch { }
+                                try { if ($eventArgs) { $eventArgs.Handled = $true } } catch { }
                             } catch {
                                 try { Write-QOTicketsUILog ("Tickets: Pending reply cancel icon action failed: " + $_.Exception.Message) "WARN" } catch { }
                             }
@@ -5734,6 +5713,9 @@ function Show-QOTicketsOpenPulse {
 function Get-QOTicketDedupKey {
     param([Parameter(Mandatory)]$Ticket)
 
+    $ticketId = Get-QOTicketIdValue -Ticket $Ticket
+    if ($ticketId) { return ("id:" + $ticketId.ToLowerInvariant()) }
+
     try {
         if ($Ticket.PSObject.Properties.Name -contains "SourceMessageId") {
             $id = ([string]$Ticket.SourceMessageId).Trim()
@@ -6660,6 +6642,7 @@ function Start-TicketsEmailSyncAsync {
         [AllowNull()][System.Windows.Controls.TextBlock]$StatusText,
         [int]$MaxPerMailbox = 120,
         [int]$TimeoutSeconds = 120,
+        [switch]$Automatic,
         [switch]$RespectNextAttempt
     )
 
@@ -6724,6 +6707,12 @@ function Start-TicketsEmailSyncAsync {
         if ($nextAttemptUtc -and $nextAttemptUtc -is [datetime] -and $nextAttemptUtc -ne [datetime]::MinValue -and $nowUtc -lt $nextAttemptUtc) {
             return
         }
+    }
+
+    if ($Automatic -and @(Get-QOTMonitoredMailboxAddresses).Count -eq 0) {
+        $script:TicketsSyncNextAttemptUtc = [datetime]::UtcNow.AddMinutes(1)
+        Set-QOTicketsSyncStatus -StatusText $StatusText -Message "Add a monitored mailbox in Settings to enable automatic sync."
+        return
     }
 
     $script:TicketsEmailSyncInProgress = $true
@@ -7200,7 +7189,7 @@ function Start-QOTicketsAutoSyncWorker {
             Write-QOTicketsUILog "Tickets: Sync command became available; starting auto-sync."
         }
 
-        Start-TicketsEmailSyncAsync -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $script:TicketsBackgroundBatchSize -RespectNextAttempt
+        Start-TicketsEmailSyncAsync -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $script:TicketsBackgroundBatchSize -Automatic -RespectNextAttempt
     }.GetNewClosure()
 
     $script:TicketsSyncTimer.Add_Tick($script:TicketsSyncWorkerTickHandler)
@@ -7228,7 +7217,7 @@ function Invoke-QOTicketsEmailSyncAndRefresh {
     }
     if ($requestedMax -lt 1) { $requestedMax = 1 }
     if ($requestedMax -gt 500) { $requestedMax = 500 }
-    Start-TicketsEmailSyncAsync -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $requestedMax
+    Start-TicketsEmailSyncAsync -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $requestedMax -Automatic:(-not $Force)
 }
 
 function Invoke-QOTicketsManualSyncRequest {
@@ -7272,10 +7261,10 @@ function Invoke-QOTicketsManualSyncRequest {
         Set-QOTicketsSyncStatus -StatusText $StatusText -Message "Manual sync requested..."
 
         if ($InvokeSyncCmd) {
-            & $InvokeSyncCmd -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $requestedMax
+            & $InvokeSyncCmd -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $requestedMax -Force
         }
         else {
-            Invoke-QOTicketsEmailSyncAndRefresh -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $requestedMax
+            Invoke-QOTicketsEmailSyncAndRefresh -Grid $Grid -GetTicketsCmd $GetTicketsCmd -SyncCmd $SyncCmd -StatusText $StatusText -MaxPerMailbox $requestedMax -Force
         }
 
         return $true
@@ -7540,6 +7529,30 @@ function Stop-QOTicketsFileWatcher {
         try { Write-QOTicketsUILog "Tickets: File watcher disposed and subscriptions cleared." } catch { }
     }
     return $disposed
+}
+
+function Close-QOTicketsUI {
+    # This WPF delegate stays bound to the Tickets.UI module and its private state.
+    try {
+        $sortMode = if ($script:TicketsSortMode) { $script:TicketsSortMode } else { "Priority" }
+        $null = Save-QOTicketsFilterState -ShowOpen ([bool]$script:ShowOpen) -ShowClosed ([bool]$script:ShowClosed) -ShowDeleted ([bool]$script:ShowDeleted) -SortMode $sortMode -AssigneeFilter $script:TicketsAssigneeFilter
+    } catch {
+        Write-QOTicketsUILog ("Tickets: Persisting filter state on window close failed: " + $_.Exception.Message) "WARN"
+    }
+    foreach ($timer in @($script:TicketsSyncTimer, $script:TicketsFileRefreshTimer,
+                         $script:TicketsSelectionSyncTimer, $script:TicketsReplyQueueKickTimer,
+                         $script:TicketsOpenPulseTimer, $script:TicketsQueuedDetailsRefreshTimer,
+                         $script:TicketsIncrementalMergeTimer, $script:TicketsSyncCompletionTimer)) {
+        if ($timer) { $timer.Stop() }
+    }
+    $script:TicketsSyncWorkerStarted = $false
+    if ($script:TicketsEmailSyncInProgress) {
+        Stop-QOTicketsSyncExecution -StopActiveOperation
+        Clear-QOTicketsSyncExecutionState -RemoveRunnerFiles
+        $script:TicketsEmailSyncInProgress = $false
+    }
+    Unregister-QOTicketEventHandlers
+    $null = Stop-QOTicketsFileWatcher
 }
 
 function Initialize-QOTicketsUI {
@@ -9535,38 +9548,7 @@ function Initialize-QOTicketsUI {
     }.GetNewClosure()
     try { $script:TicketsFilterMenu.Add_Closed($script:TicketsFilterMenuClosedHandler) } catch { }
 
-    $saveFilterStateCmd = Resolve-QOTicketsLocalFunction -Name "Save-QOTicketsFilterState"
-    if (-not $saveFilterStateCmd) {
-        $saveFilterStateCmd = Resolve-QOTInvokable -Candidate (Get-Command Save-QOTicketsFilterState -ErrorAction SilentlyContinue) -CommandName "Save-QOTicketsFilterState"
-    }
-    if (-not $saveFilterStateCmd) {
-        try { $saveFilterStateCmd = ${function:Save-QOTicketsFilterState} } catch { $saveFilterStateCmd = $null }
-    }
-
-    $script:TicketsWindowClosingHandler = [System.ComponentModel.CancelEventHandler]{
-        param($sender, $args)
-        try {
-            if ($saveFilterStateCmd) {
-                $sortModeToPersist = ([string]($script:TicketsSortMode + "")).Trim()
-                if ([string]::IsNullOrWhiteSpace($sortModeToPersist)) { $sortModeToPersist = "Priority" }
-                $null = & $saveFilterStateCmd -ShowOpen ([bool]$script:ShowOpen) -ShowClosed ([bool]$script:ShowClosed) -ShowDeleted ([bool]$script:ShowDeleted) -SortMode $sortModeToPersist -AssigneeFilter ([string]$script:TicketsAssigneeFilter)
-            }
-        } catch {
-            Write-QOTicketsUILog ("Tickets: Persisting filter state on window close failed. " + $_.Exception.Message) "WARN"
-        }
-
-        # Release every event handler tracked in the registry so they can't fire
-        # against a disposed window and so their closures can be garbage-collected.
-        try { Unregister-QOTicketEventHandlers } catch {
-            Write-QOTicketsUILog ("Tickets: Unregister-QOTicketEventHandlers on close failed: " + $_.Exception.Message) "WARN"
-        }
-
-        # Dispose the FileSystemWatcher so it cannot keep firing change events
-        # against a closed UI and accumulate background work after shutdown.
-        try { $null = Stop-QOTicketsFileWatcher } catch {
-            Write-QOTicketsUILog ("Tickets: Stop-QOTicketsFileWatcher on close failed: " + $_.Exception.Message) "WARN"
-        }
-    }.GetNewClosure()
+    $script:TicketsWindowClosingHandler = [System.ComponentModel.CancelEventHandler]${function:Close-QOTicketsUI}
     try { $Window.Add_Closing($script:TicketsWindowClosingHandler) } catch { }
 
     try {
@@ -10782,22 +10764,22 @@ function Initialize-QOTicketsUI {
 
     # Back-to-list click handler typed
     $script:TicketsToggleDetailsHandler = [System.Windows.RoutedEventHandler]{
-        param($sender, $args)
+        param($sender, $eventArgs)
         try {
             $collapsed = $false
             try { $collapsed = [bool]$invokeBackToList.Invoke("click") } catch { $collapsed = $false }
-            if ($collapsed -and $args) { $args.Handled = $true }
+            if ($collapsed -and $eventArgs) { $eventArgs.Handled = $true }
         } catch { }
     }.GetNewClosure()
     $btnToggleDetails.Add_Click($script:TicketsToggleDetailsHandler)
 
     # Routed-event fallback for hosts where Click does not fire reliably.
     $script:TicketsToggleDetailsPreviewHandler = [System.Windows.Input.MouseButtonEventHandler]{
-        param($sender, $args)
+        param($sender, $eventArgs)
         try {
             $collapsed = $false
             try { $collapsed = [bool]$invokeBackToList.Invoke("preview-mouse-up") } catch { $collapsed = $false }
-            if ($collapsed -and $args) { $args.Handled = $true }
+            if ($collapsed -and $eventArgs) { $eventArgs.Handled = $true }
         } catch { }
     }.GetNewClosure()
     $btnToggleDetails.AddHandler([System.Windows.UIElement]::PreviewMouseLeftButtonUpEvent, $script:TicketsToggleDetailsPreviewHandler, $true)
@@ -10806,12 +10788,12 @@ function Initialize-QOTicketsUI {
     # Selection changed handler typed
     # Keep selection tracking lightweight. Details open is driven by double-click.
     $script:TicketsSelectionChangedHandler = [System.Windows.Controls.SelectionChangedEventHandler]{
-        param($sender, $args)
+        param($sender, $eventArgs)
         try {
             $selectedTicket = $null
             try {
-                if ($args -and $args.AddedItems -and @($args.AddedItems).Count -gt 0) {
-                    $selectedTicket = @($args.AddedItems | Where-Object { $null -ne $_ }) | Select-Object -First 1
+                if ($eventArgs -and $eventArgs.AddedItems -and @($eventArgs.AddedItems).Count -gt 0) {
+                    $selectedTicket = @($eventArgs.AddedItems | Where-Object { $null -ne $_ }) | Select-Object -First 1
                 }
             } catch { $selectedTicket = $null }
             if (-not $selectedTicket) {
@@ -11199,14 +11181,14 @@ function Initialize-QOTicketsUI {
     $script:TicketsOpenFromContextCmd = $openTicketDetailsFromContext
 
     $script:TicketsOpenMenuItemHandler = [System.Windows.RoutedEventHandler]{
-        param($sender, $args)
+        param($sender, $eventArgs)
         try {
             $opened = $false
             $preferred = @()
             try { $preferred = @(& $getSelectedTicketsCmd -Grid $grid -AllowContextFallback) } catch { $preferred = @() }
             try { $opened = [bool](& $openTicketDetailsFromContext -Items $preferred -Source "row context menu") } catch { $opened = $false }
             if ($opened) {
-                if ($args) { $args.Handled = $true }
+                if ($eventArgs) { $eventArgs.Handled = $true }
             }
         } catch {
             try { & $writeTicketsLogCmd ("Tickets: Open ticket menu action failed: " + $_.Exception.Message) "ERROR" } catch { }
@@ -11219,10 +11201,10 @@ function Initialize-QOTicketsUI {
     } catch { }
 
     $script:TicketsRowDoubleClickHandler = [System.Windows.Input.MouseButtonEventHandler]{
-        param($sender, $args)
+        param($sender, $eventArgs)
         try {
             $eventArgs = $null
-            try { $eventArgs = & $resolveMouseArgs -Primary $args -Secondary $null } catch { $eventArgs = $null }
+            try { $eventArgs = & $resolveMouseArgs -Primary $eventArgs -Secondary $null } catch { $eventArgs = $null }
             if ($eventArgs) {
                 if ($eventArgs.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) { return }
                 if ($eventArgs.ClickCount -lt 2) { return }
@@ -11271,10 +11253,10 @@ function Initialize-QOTicketsUI {
     # Use routed events with handledEventsToo=true so double-click still works from editable cells.
     $grid.AddHandler([System.Windows.Controls.Control]::MouseDoubleClickEvent, $script:TicketsRowDoubleClickHandler, $true)
     $script:TicketsRowPreviewDoubleClickHandler = [System.Windows.Input.MouseButtonEventHandler]{
-        param($sender, $args)
+        param($sender, $eventArgs)
         try {
             $eventArgs = $null
-            try { $eventArgs = & $resolveMouseArgs -Primary $args -Secondary $null } catch { $eventArgs = $null }
+            try { $eventArgs = & $resolveMouseArgs -Primary $eventArgs -Secondary $null } catch { $eventArgs = $null }
             if (-not $eventArgs) { return }
             if ($eventArgs.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) { return }
             if ($eventArgs.ClickCount -lt 2) { return }
@@ -11327,10 +11309,10 @@ function Initialize-QOTicketsUI {
     $grid.AddHandler([System.Windows.Controls.Control]::PreviewMouseDoubleClickEvent, $script:TicketsRowPreviewDoubleClickHandler, $true)
     # Fallback for environments where MouseDoubleClick does not bubble reliably from row templates.
     $script:TicketsRowPreviewMouseDownHandler = [System.Windows.Input.MouseButtonEventHandler]{
-        param($sender, $args)
+        param($sender, $eventArgs)
         try {
             $eventArgs = $null
-            try { $eventArgs = & $resolveMouseArgs -Primary $args -Secondary $null } catch { $eventArgs = $null }
+            try { $eventArgs = & $resolveMouseArgs -Primary $eventArgs -Secondary $null } catch { $eventArgs = $null }
             if (-not $eventArgs) { return }
             if ($eventArgs.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) { return }
 
@@ -11418,16 +11400,16 @@ function Initialize-QOTicketsUI {
 
     # Keyboard fallback: Enter opens selected ticket details.
     $script:TicketsGridKeyDownHandler = [System.Windows.Input.KeyEventHandler]{
-        param($sender, $args)
+        param($sender, $eventArgs)
         try {
-            if (-not $args) { return }
-            if ($args.Key -ne [System.Windows.Input.Key]::Enter) { return }
+            if (-not $eventArgs) { return }
+            if ($eventArgs.Key -ne [System.Windows.Input.Key]::Enter) { return }
             $selectedItems = @()
             try { $selectedItems = @(& $getSelectedTicketsCmd -Grid $grid -AllowContextFallback) } catch { $selectedItems = @() }
             $opened = $false
             try { $opened = [bool](& $openTicketDetailsFromContext -Items $selectedItems -Source "enter key") } catch { $opened = $false }
             if ($opened) {
-                $args.Handled = $true
+                $eventArgs.Handled = $true
             } else {
                 try { Write-QOTicketsUILog "Tickets: Enter key pressed but no ticket could be opened." "WARN" } catch { }
             }
@@ -11451,12 +11433,12 @@ function Initialize-QOTicketsUI {
 
     # Row edit handler typed
     $script:TicketsRowEditHandler = [System.EventHandler[System.Windows.Controls.DataGridRowEditEndingEventArgs]]{
-        param($sender, $args)
+        param($sender, $eventArgs)
         try {
-            if ($args.EditAction -ne [System.Windows.Controls.DataGridEditAction]::Commit) { return }
+            if ($eventArgs.EditAction -ne [System.Windows.Controls.DataGridEditAction]::Commit) { return }
 
             $grid.CommitEdit([System.Windows.Controls.DataGridEditingUnit]::Row, $true)
-            $ticket = $args.Row.Item
+            $ticket = $eventArgs.Row.Item
             if ($null -eq $ticket) { return }
             $subjectValue = ""
             try {
@@ -13853,7 +13835,7 @@ function Initialize-QOTicketsUI {
                     }
                     Write-QOTicketsUILog "Tickets: Manual email sync triggered via status text click."
                     if ($syncCmd) {
-                        & $invokeEmailSyncRefreshCmd -Grid $grid -GetTicketsCmd $getTicketsCmd -SyncCmd $syncCmd -StatusText $syncStatusText
+                        & $invokeEmailSyncRefreshCmd -Grid $grid -GetTicketsCmd $getTicketsCmd -SyncCmd $syncCmd -StatusText $syncStatusText -Force
                     } else {
                         Write-QOTicketsUILog "Tickets: Sync command not available for manual sync." "WARN"
                     }
@@ -13876,274 +13858,19 @@ function Resolve-QOTTicketDetailsSourceTicket {
 
     if (-not $Ticket) { return $null }
 
-    $getTextValue = $null
-    $getTextValue = {
-        param(
-            [AllowNull()]$Source,
-            [string[]]$PropertyNames
-        )
-
-        if (-not $Source) { return "" }
-        foreach ($propertyName in @($PropertyNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-            try {
-                if ($Source.PSObject.Properties.Name -contains $propertyName) {
-                    $value = ([string]($Source.$propertyName + "")).Trim()
-                    if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
-                }
-            } catch { }
-        }
-        foreach ($nestedProperty in @("Ticket", "SourceTicket", "SelectedTicket")) {
-            try {
-                if ($Source.PSObject.Properties.Name -contains $nestedProperty) {
-                    $nestedValue = (& $getTextValue -Source $Source.$nestedProperty -PropertyNames $PropertyNames)
-                    if (-not [string]::IsNullOrWhiteSpace($nestedValue)) { return $nestedValue }
-                }
-            } catch { }
-        }
-        return ""
-    }.GetNewClosure()
-
-    $getIdValue = {
-        param([AllowNull()]$Source)
-        return [string](& $getTextValue -Source $Source -PropertyNames @("Id", "TicketId", "SelectedTicketId"))
-    }.GetNewClosure()
-
-    $getSubjectValue = {
-        param([AllowNull()]$Source)
-        return [string](& $getTextValue -Source $Source -PropertyNames @("Subject", "Title", "TicketName"))
-    }.GetNewClosure()
-
-    $normalizeThreadKeyValue = {
-        param([AllowNull()][string]$Subject)
-        $value = ([string]($Subject + "")).Trim()
-        if ([string]::IsNullOrWhiteSpace($value)) { return "" }
-        $value = ($value -replace '[\r\n]+', ' ').Trim()
-        for ($i = 0; $i -lt 6; $i++) {
-            $next = ($value -replace '^(?i)\s*((RE|FW|FWD)\s*:\s*)+', '').Trim()
-            if ($next -eq $value) { break }
-            $value = $next
-        }
-        return (($value -replace '\s+', ' ').Trim().ToLowerInvariant())
-    }.GetNewClosure()
-
-    $getSortTicks = {
-        param([AllowNull()]$Source)
-        foreach ($dateProp in @("UpdatedAt", "CreatedAt")) {
-            try {
-                if ($Source -and ($Source.PSObject.Properties.Name -contains $dateProp)) {
-                    $parsed = [datetime]::MinValue
-                    if ([datetime]::TryParse(([string]($Source.$dateProp + "")).Trim(), [ref]$parsed)) {
-                        return [int64]$parsed.Ticks
-                    }
-                }
-            } catch { }
-        }
-        return 0L
-    }.GetNewClosure()
-
-    $countListItems = {
-        param(
-            [AllowNull()]$Source,
-            [string[]]$PropertyNames
-        )
-        if (-not $Source) { return 0 }
-        $count = 0
-        foreach ($propertyName in @($PropertyNames)) {
-            try {
-                if ($Source.PSObject.Properties.Name -contains $propertyName) {
-                    $count += @($Source.$propertyName | Where-Object { $_ }).Count
-                }
-            } catch { }
-        }
-        return $count
-    }.GetNewClosure()
-
-    $ticketId = [string](& $getIdValue -Source $Ticket)
-    $inputSubject = [string](& $getSubjectValue -Source $Ticket)
-    $inputThreadKey = [string](& $normalizeThreadKeyValue -Subject $inputSubject)
-    $inputEmailMessageId = [string](& $getTextValue -Source $Ticket -PropertyNames @("EmailMessageId", "InternetMessageId", "MessageId"))
-    $inputSourceMessageId = [string](& $getTextValue -Source $Ticket -PropertyNames @("SourceMessageId", "OutlookEntryId", "EntryId"))
-    $inputBodyPath = [string](& $getTextValue -Source $Ticket -PropertyNames @("EmailBodyPath", "BodyPath", "HtmlBodyPath", "TextBodyPath", "PreviewPath"))
-    $inputPreview = [string](& $getTextValue -Source $Ticket -PropertyNames @("EmailBodyPreview", "BodyPreview", "Preview"))
-    $inputSender = [string](& $getTextValue -Source $Ticket -PropertyNames @("EmailFrom", "SenderEmail", "SenderName", "From", "Sender"))
-
-    $getCandidateScore = {
-        param([AllowNull()]$Candidate)
-
-        if (-not $Candidate) { return -1 }
-
-        $score = 0
-        $candidateId = [string](& $getIdValue -Source $Candidate)
-        $candidateSubject = [string](& $getSubjectValue -Source $Candidate)
-        $candidateThreadKey = [string](& $normalizeThreadKeyValue -Subject $candidateSubject)
-        $candidateEmailMessageId = [string](& $getTextValue -Source $Candidate -PropertyNames @("EmailMessageId", "InternetMessageId", "MessageId"))
-        $candidateSourceMessageId = [string](& $getTextValue -Source $Candidate -PropertyNames @("SourceMessageId", "OutlookEntryId", "EntryId"))
-        $candidateBodyPath = [string](& $getTextValue -Source $Candidate -PropertyNames @("EmailBodyPath", "BodyPath", "HtmlBodyPath", "TextBodyPath", "PreviewPath"))
-        $candidatePreview = [string](& $getTextValue -Source $Candidate -PropertyNames @("EmailBodyPreview", "BodyPreview", "Preview"))
-        $candidateSender = [string](& $getTextValue -Source $Candidate -PropertyNames @("EmailFrom", "SenderEmail", "SenderName", "From", "Sender"))
-
-        if ((-not [string]::IsNullOrWhiteSpace($ticketId)) -and [string]::Equals($candidateId, $ticketId, [System.StringComparison]::OrdinalIgnoreCase)) { $score += 5000 }
-        if ((-not [string]::IsNullOrWhiteSpace($inputEmailMessageId)) -and [string]::Equals($candidateEmailMessageId, $inputEmailMessageId, [System.StringComparison]::OrdinalIgnoreCase)) { $score += 4000 }
-        if ((-not [string]::IsNullOrWhiteSpace($inputSourceMessageId)) -and [string]::Equals($candidateSourceMessageId, $inputSourceMessageId, [System.StringComparison]::OrdinalIgnoreCase)) { $score += 4000 }
-        if ((-not [string]::IsNullOrWhiteSpace($inputBodyPath)) -and [string]::Equals($candidateBodyPath, $inputBodyPath, [System.StringComparison]::OrdinalIgnoreCase)) { $score += 3000 }
-        if ((-not [string]::IsNullOrWhiteSpace($inputThreadKey)) -and [string]::Equals($candidateThreadKey, $inputThreadKey, [System.StringComparison]::OrdinalIgnoreCase)) { $score += 400 }
-        if ((-not [string]::IsNullOrWhiteSpace($inputSender)) -and (-not [string]::IsNullOrWhiteSpace($candidateSender)) -and [string]::Equals($candidateSender, $inputSender, [System.StringComparison]::OrdinalIgnoreCase)) { $score += 250 }
-
-        if ((-not [string]::IsNullOrWhiteSpace($inputPreview)) -and (-not [string]::IsNullOrWhiteSpace($candidatePreview))) {
-            $prefixLength = [Math]::Min([Math]::Min($inputPreview.Length, $candidatePreview.Length), 120)
-            if ($prefixLength -ge 24) {
-                $inputPreviewPrefix = $inputPreview.Substring(0, $prefixLength)
-                $candidatePreviewPrefix = $candidatePreview.Substring(0, $prefixLength)
-                if ([string]::Equals($candidatePreviewPrefix, $inputPreviewPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $score += 1200
-                }
-            }
-        }
-
-        foreach ($textProp in @("SenderName", "SenderEmail", "EmailFrom", "EmailBody", "Body", "HtmlBody", "TextBody", "Preview", "EmailBodyPreview", "BodyPreview")) {
-            $value = [string](& $getTextValue -Source $Candidate -PropertyNames @($textProp))
-            if (-not [string]::IsNullOrWhiteSpace($value)) {
-                $score += [Math]::Min($value.Length, 200)
-            }
-        }
-        foreach ($pathProp in @("EmailBodyPath", "BodyPath", "HtmlBodyPath", "TextBodyPath", "PreviewPath")) {
-            $value = [string](& $getTextValue -Source $Candidate -PropertyNames @($pathProp))
-            if (-not [string]::IsNullOrWhiteSpace($value)) {
-                $score += 150
-            }
-        }
-
-        $score += ((& $countListItems -Source $Candidate -PropertyNames @("IncomingMessages", "Replies", "Notes", "PendingReplies", "Messages", "History", "Conversation", "SentReplies", "InternalNotes", "SystemEvents", "Events", "Timeline", "Activity", "AuditTrail")) * 25)
-        return $score
-    }.GetNewClosure()
-
-    $choosePreferredTicket = {
-        param(
-            [AllowNull()]$Current,
-            [AllowNull()]$Candidate
-        )
-        if (-not $Candidate) { return $Current }
-        if (-not $Current) { return $Candidate }
-        $currentScore = & $getCandidateScore -Candidate $Current
-        $candidateScore = & $getCandidateScore -Candidate $Candidate
-        if ($candidateScore -gt $currentScore) { return $Candidate }
-        if ($candidateScore -lt $currentScore) { return $Current }
-        if ((& $getSortTicks -Source $Candidate) -gt (& $getSortTicks -Source $Current)) { return $Candidate }
-        return $Current
-    }.GetNewClosure()
-
-    $inputScore = & $getCandidateScore -Candidate $Ticket
-
-    $logResolvedTicket = {
-        param(
-            [AllowNull()]$ResolvedTicket,
-            [string]$Reason
-        )
-        if (-not $ResolvedTicket) { return }
-        try {
-            $bodyInfo = Get-QOTicketDisplayBodyInfo -Ticket $ResolvedTicket
-            Write-QOTicketsUILog ("Tickets: Ticket load body detected. Reason={0}; TicketId={1}; Subject={2}; Source={3}; Property={4}; Length={5}; InputSubject={6}; InputMessageId={7}; InputSourceMessageId={8}" -f `
-                $Reason, `
-                ([string](& $getIdValue -Source $ResolvedTicket)), `
-                ([string](& $getSubjectValue -Source $ResolvedTicket)), `
-                $bodyInfo.Source, `
-                $bodyInfo.Property, `
-                $bodyInfo.Length, `
-                $inputSubject, `
-                $inputEmailMessageId, `
-                $inputSourceMessageId)
-        } catch { }
-    }.GetNewClosure()
-
-    $findBestMatchInItems = {
-        param([AllowNull()][object[]]$Items)
-
-        $exactMatch = $null
-        $threadMatch = $null
-        $bestOverall = $null
-
-        foreach ($candidate in @($Items | Where-Object { $_ })) {
-            $bestOverall = & $choosePreferredTicket -Current $bestOverall -Candidate $candidate
-
-            $candidateId = [string](& $getIdValue -Source $candidate)
-            $candidateEmailMessageId = [string](& $getTextValue -Source $candidate -PropertyNames @("EmailMessageId", "InternetMessageId", "MessageId"))
-            $candidateSourceMessageId = [string](& $getTextValue -Source $candidate -PropertyNames @("SourceMessageId", "OutlookEntryId", "EntryId"))
-            $candidateBodyPath = [string](& $getTextValue -Source $candidate -PropertyNames @("EmailBodyPath", "BodyPath", "HtmlBodyPath", "TextBodyPath", "PreviewPath"))
-
-            $isExact = $false
-            if ((-not [string]::IsNullOrWhiteSpace($ticketId)) -and [string]::Equals($candidateId, $ticketId, [System.StringComparison]::OrdinalIgnoreCase)) { $isExact = $true }
-            if ((-not $isExact) -and (-not [string]::IsNullOrWhiteSpace($inputEmailMessageId)) -and [string]::Equals($candidateEmailMessageId, $inputEmailMessageId, [System.StringComparison]::OrdinalIgnoreCase)) { $isExact = $true }
-            if ((-not $isExact) -and (-not [string]::IsNullOrWhiteSpace($inputSourceMessageId)) -and [string]::Equals($candidateSourceMessageId, $inputSourceMessageId, [System.StringComparison]::OrdinalIgnoreCase)) { $isExact = $true }
-            if ((-not $isExact) -and (-not [string]::IsNullOrWhiteSpace($inputBodyPath)) -and [string]::Equals($candidateBodyPath, $inputBodyPath, [System.StringComparison]::OrdinalIgnoreCase)) { $isExact = $true }
-
-            if ($isExact) {
-                $exactMatch = & $choosePreferredTicket -Current $exactMatch -Candidate $candidate
-                continue
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($inputThreadKey)) {
-                $candidateThreadKey = [string](& $normalizeThreadKeyValue -Subject (& $getSubjectValue -Source $candidate))
-                if ([string]::Equals($candidateThreadKey, $inputThreadKey, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $threadMatch = & $choosePreferredTicket -Current $threadMatch -Candidate $candidate
-                }
-            }
-        }
-
-        return [pscustomobject]@{
-            ExactMatch  = $exactMatch
-            ThreadMatch = $threadMatch
-            BestOverall = $bestOverall
-        }
-    }.GetNewClosure()
-
     try {
         $getTicketsCmd = Resolve-QOTicketsCoreCommand -CommandName "Get-QOTickets"
         if ($getTicketsCmd) {
-            $dbLatest = & $getTicketsCmd -Quiet
-            if ($dbLatest) {
-                $allTickets = @()
-                if ($dbLatest.PSObject.Properties.Name -contains "Tickets") {
-                    $allTickets = @($dbLatest.Tickets)
-                } else {
-                    $allTickets = @($dbLatest)
-                }
-                try { $script:AllTickets = @($allTickets) } catch { }
-
-                $resolvedResults = & $findBestMatchInItems -Items $allTickets
-                if ($resolvedResults -and $resolvedResults.ExactMatch) {
-                    & $logResolvedTicket -ResolvedTicket $resolvedResults.ExactMatch -Reason "StoreExact"
-                    return $resolvedResults.ExactMatch
-                }
-                if ($resolvedResults -and $resolvedResults.BestOverall -and ((& $getCandidateScore -Candidate $resolvedResults.BestOverall) -gt $inputScore)) {
-                    & $logResolvedTicket -ResolvedTicket $resolvedResults.BestOverall -Reason "StoreBest"
-                    return $resolvedResults.BestOverall
-                }
-                if ($resolvedResults -and $resolvedResults.ThreadMatch -and ((& $getCandidateScore -Candidate $resolvedResults.ThreadMatch) -gt $inputScore)) {
-                    & $logResolvedTicket -ResolvedTicket $resolvedResults.ThreadMatch -Reason "StoreThread"
-                    return $resolvedResults.ThreadMatch
-                }
-            }
+            $database = & $getTicketsCmd -Quiet
+            $script:AllTickets = @($database.Tickets)
         }
-    } catch { }
-
-    try {
-        $visibleResults = & $findBestMatchInItems -Items @($script:AllTickets)
-        if ($visibleResults -and $visibleResults.ExactMatch) {
-            & $logResolvedTicket -ResolvedTicket $visibleResults.ExactMatch -Reason "VisibleExact"
-            return $visibleResults.ExactMatch
-        }
-        if ($visibleResults -and $visibleResults.BestOverall -and ((& $getCandidateScore -Candidate $visibleResults.BestOverall) -gt $inputScore)) {
-            & $logResolvedTicket -ResolvedTicket $visibleResults.BestOverall -Reason "VisibleBest"
-            return $visibleResults.BestOverall
-        }
-        if ($visibleResults -and $visibleResults.ThreadMatch -and ((& $getCandidateScore -Candidate $visibleResults.ThreadMatch) -gt $inputScore)) {
-            & $logResolvedTicket -ResolvedTicket $visibleResults.ThreadMatch -Reason "VisibleThread"
-            return $visibleResults.ThreadMatch
-        }
-    } catch { }
-
+    } catch {
+        Write-QOTicketsUILog ("Tickets: Could not refresh details from storage. " + $_.Exception.Message) "WARN"
+    }
+    $match = Find-QOTTicketMatchInCollection -Ticket $Ticket -Items $script:AllTickets
+    if ($match) { return $match }
     return $Ticket
 }
 
-Export-ModuleMember -Function Write-QOTicketsUILog, Initialize-QOTicketsUI, Invoke-QOTicketsFilterSafely, Invoke-QOTicketsEmailSyncAndRefresh, Start-TicketsEmailSyncAsync, Invoke-QOTicketStatusChangeForItems, Invoke-QOTicketAssigneeChangeForItems, Invoke-QOTicketPriorityChangeForItems, Set-QOTicketsSyncStatus, Resolve-QOTInvokable, Update-QOTicketDetailsView, Get-QOTTicketDetailsRenderModel, Get-QOTTicketDetailsBodyText, Resolve-QOTTicketDetailsSourceTicket, Get-QOTicketDisplayBodyInfo, Get-QOTicketPreferredSubject, Get-QOTicketPropertyTextValue, Normalize-QOTTicketThreadKey, Set-QOTicketDetailsBodyContent, Set-QOTicketContactHeader, Get-QOTicketLogLabel, Get-QOTicketIdValue
+Export-ModuleMember -Function Write-QOTicketsUILog, Initialize-QOTicketsUI, Invoke-QOTicketsFilterSafely, Invoke-QOTicketsEmailSyncAndRefresh, Start-TicketsEmailSyncAsync, Invoke-QOTicketStatusChangeForItems, Invoke-QOTicketAssigneeChangeForItems, Invoke-QOTicketPriorityChangeForItems, Set-QOTicketsSyncStatus, Resolve-QOTInvokable, Update-QOTicketDetailsView, Get-QOTTicketDetailsRenderModel, Get-QOTicketDetailsBodyText, Resolve-QOTTicketDetailsSourceTicket, Get-QOTicketDisplayBodyInfo, Get-QOTTicketPreferredSubject, Get-QOTicketPropertyTextValue, Normalize-QOTTicketThreadKey, Set-QOTicketDetailsBodyContent, Set-QOTicketContactHeader, Get-QOTicketLogLabel, Get-QOTicketIdValue
 

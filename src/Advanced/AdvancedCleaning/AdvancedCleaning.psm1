@@ -47,7 +47,7 @@ function Invoke-QAdvancedDeepCache {
 }
 
 function Invoke-QScanUnusedDeviceDrivers {
-    $taskName = "Scan unused device drivers (report only)"
+    $taskName = "Count third-party driver packages (report only)"
 
     $pnputil = Get-Command -Name "pnputil.exe" -ErrorAction SilentlyContinue
     if (-not $pnputil) {
@@ -56,7 +56,13 @@ function Invoke-QScanUnusedDeviceDrivers {
 
     try {
         $output = @(& $pnputil.Source /enum-drivers 2>&1)
-        $drivers = @($output | Where-Object { $_ -match '^\s*Published Name\s*:\s*oem\d+\.inf\s*$' })
+        if ($LASTEXITCODE -ne 0) {
+            return New-QOTTaskResult -Name $taskName -Status "Failed" -Reason ("PnPUtil exited with code {0}" -f $LASTEXITCODE) -Error ($output -join ' ')
+        }
+        # PnPUtil localizes field headings. The published INF names are invariant.
+        $drivers = @($output | ForEach-Object {
+            if ($_ -match '^\s*[^:]+:\s*(oem\d+\.inf)\s*$') { $matches[1] }
+        } | Sort-Object -Unique)
         $count = $drivers.Count
 
         Write-QLog ("Advanced: driver scan complete (report mode). Enumerated packages: {0}" -f $count)

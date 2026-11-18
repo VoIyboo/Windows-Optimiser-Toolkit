@@ -89,88 +89,97 @@ function Invoke-QOTClearFolderContents {
         [Parameter(Mandatory)][string]$Label
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return New-QOTOperationResult -Status "Skipped" -Reason "Not found"
-    }
+    Invoke-QCleanPath -Path $Path -Label $Label
+}
 
-    try {
-        $items = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+function Remove-QOTCacheItem {
+    param([Parameter(Mandatory)]$Item)
+
+    if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "Skipped linked item: $($Item.FullName)"
     }
-    catch {
-        if (Test-QOTAdminRequiredFailure -ErrorRecord $_) {
-            return New-QOTOperationResult -Status "Skipped" -Reason "Admin required"
+    if ($Item.PSIsContainer) {
+        # PowerShell 5.1's recursive deletion can descend into junctions.
+        # Inspect each child and remove the directory only once it is empty.
+        foreach ($child in (Get-ChildItem -LiteralPath $Item.FullName -Force -ErrorAction Stop)) {
+            Remove-QOTCacheItem -Item $child
         }
-        return New-QOTOperationResult -Status "Failed" -Reason "Cleanup failed" -Error $_.Exception.Message
+        [IO.Directory]::Delete($Item.FullName, $false)
     }
-
-    if ($items.Count -eq 0) {
-        return New-QOTOperationResult -Status "Skipped" -Reason "Already clear"
+    else {
+        Remove-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop
     }
-
-    foreach ($item in $items) {
-        try {
-            Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
-        }
-        catch {
-            if (Test-QOTAdminRequiredFailure -ErrorRecord $_) {
-                return New-QOTOperationResult -Status "Skipped" -Reason "Admin required"
-            }
-            return New-QOTOperationResult -Status "Failed" -Reason "Cleanup failed" -Error $_.Exception.Message
-        }
-    }
-
-    Write-QLog ("Cleaning: {0} (done)" -f $Label)
-    return New-QOTOperationResult -Status "Success"
 }
 
 function Invoke-QCleanPath {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [string]$Label
+        [string]$Label,
+        [string]$Filter,
+        [switch]$TempFolder
     )
 
-    if ($Label -and $Label -isnot [string]) {
-        $Label = [string]$Label
-    }
-
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        return New-QOTOperationResult -Status "Skipped" -Reason "Invalid path in task definition"
-    }
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        if ($Label) {
-            Write-QLog ("Cleaning: {0} (skip, not found)" -f $Label)
-        } else {
-            Write-QLog ("Cleaning: Path not found: {0}" -f $Path)
-        }
-        return New-QOTOperationResult -Status "Skipped" -Reason "Not found"
-    }
-
+    if (-not $Label) { $Label = $Path }
     try {
-        $items = Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-        $removedAny = $false
+        if (-not (Test-Path -LiteralPath $Path -PathType Container -ErrorAction Stop)) {
+            return New-QOTOperationResult -Status "Skipped" -Reason "Not found"
+        }
+
+        $folder = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($folder -isnot [IO.DirectoryInfo] -or -not $folder.Parent) {
+            return New-QOTOperationResult -Status "Skipped" -Reason "Not a cleanup folder"
+        }
+        for ($parent = $folder; $null -ne $parent; $parent = $parent.Parent) {
+            if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                return New-QOTOperationResult -Status "Skipped" -Reason "Linked cleanup folder"
+            }
+        }
+        if ($TempFolder) {
+            $prefix = $folder.FullName.TrimEnd('\') + '\'
+            foreach ($protected in @($env:SystemRoot,$env:USERPROFILE,$env:APPDATA,$env:LOCALAPPDATA,
+                    $env:ProgramData,$env:ProgramFiles,[Environment]::GetFolderPath('MyDocuments'),
+                    [Environment]::GetFolderPath('DesktopDirectory'))) {
+                if ($protected -and ($protected -eq $folder.FullName -or $protected.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase))) {
+                    return New-QOTOperationResult -Status "Skipped" -Reason "Temp path contains a protected system or user folder"
+                }
+            }
+        }
+
+        $options = @{ LiteralPath = $folder.FullName; Force = $true; ErrorAction = 'Stop' }
+        if ($Filter) { $options.Filter = $Filter; $options.File = $true }
+        $items = @(Get-ChildItem @options)
+        if ($items.Count -eq 0) {
+            return New-QOTOperationResult -Status "Skipped" -Reason "Already clear"
+        }
+
+        $preserved = 0
+        $failed = 0
+        $firstError = $null
         foreach ($item in $items) {
             try {
-                Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
-                $removedAny = $true
-            } catch { }
+                if ($TempFolder -and ($item.Name -eq 'QuinnOptimiserToolkit' -or
+                        $PSScriptRoot.StartsWith(($item.FullName + '\'), [StringComparison]::OrdinalIgnoreCase))) {
+                    $preserved++
+                    continue
+                }
+                Remove-QOTCacheItem -Item $item
+            }
+            catch {
+                $failed++
+                if (-not $firstError) { $firstError = $_.Exception.Message }
+            }
         }
-        if ($Label) {
-            Write-QLog ("Cleaning: {0} (done)" -f $Label)
-        } else {
-            Write-QLog ("Cleaning: Cleared {0}" -f $Path)
+        if ($failed) {
+            return New-QOTOperationResult -Status "Failed" -Reason ("Unable to remove {0} of {1} items" -f $failed, $items.Count) -Error $firstError
         }
-        if ($removedAny) {
-            return New-QOTOperationResult -Status "Success"
+
+        if ($preserved -eq $items.Count) {
+            return New-QOTOperationResult -Status "Skipped" -Reason "Only toolkit files present"
         }
-        return New-QOTOperationResult -Status "Skipped" -Reason "Already done"
+        Write-QLog ("Cleaning: {0} (done)" -f $Label)
+        return New-QOTOperationResult -Status "Success"
     }
     catch {
-        if ($Label) {
-            Write-QLog ("Cleaning: {0} failed: {1}" -f $Label, $_.Exception.Message) "ERROR"
-        } else {
-            Write-QLog ("Cleaning: {0} failed: {1}" -f $Path, $_.Exception.Message) "ERROR"
-        }
         return New-QOTOperationResult -Status "Failed" -Reason "Cleanup failed" -Error $_.Exception.Message
     }
 }
@@ -182,64 +191,45 @@ function Invoke-QCleanPathFiles {
         [string]$Label
     )
 
-    if ($Label -and $Label -isnot [string]) {
-        $Label = [string]$Label
-    }
-
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        return New-QOTOperationResult -Status "Skipped" -Reason "Invalid path in task definition"
-    }
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        if ($Label) {
-            Write-QLog ("Cleaning: {0} (skip, not found)" -f $Label)
-        } else {
-            Write-QLog ("Cleaning: Path not found: {0}" -f $Path)
-        }
-        return New-QOTOperationResult -Status "Skipped" -Reason "Not found"
-    }
-
-    try {
-        $items = Get-ChildItem -LiteralPath $Path -Filter $Filter -Force -ErrorAction SilentlyContinue
-        $removedAny = $false
-        foreach ($item in $items) {
-            try {
-                Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
-                $removedAny = $true
-            } catch { }
-        }
-        if ($Label) {
-            Write-QLog ("Cleaning: {0} (done)" -f $Label)
-        } else {
-            Write-QLog ("Cleaning: Cleared {0}\\{1}" -f $Path, $Filter)
-        }
-        if ($removedAny) {
-            return New-QOTOperationResult -Status "Success"
-        }
-        return New-QOTOperationResult -Status "Skipped" -Reason "Not found"
-    }
-    catch {
-        if ($Label) {
-            Write-QLog ("Cleaning: {0} failed: {1}" -f $Label, $_.Exception.Message) "ERROR"
-        } else {
-            Write-QLog ("Cleaning: {0}\\{1} failed: {2}" -f $Path, $Filter, $_.Exception.Message) "ERROR"
-        }
-        return New-QOTOperationResult -Status "Failed" -Reason "Cleanup failed" -Error $_.Exception.Message
-    }
+    Invoke-QCleanPath -Path $Path -Label $Label -Filter $Filter
 }
-
 
 # ------------------------------
 # Public: Clean Windows Update cache
-# (placeholder for now, real logic added later)
 # ------------------------------
 function Invoke-QCleanWindowsUpdateCache {
-    Write-QLog "Cleaning: Windows Update cache"
+    $taskName = "Windows Update cache"
     $serviceName = "wuauserv"
-    try { Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue } catch { }
-    $op = Invoke-QCleanPath -Path "$env:SystemRoot\SoftwareDistribution\Download" -Label "Windows Update cache"
-    try { Start-Service -Name $serviceName -ErrorAction SilentlyContinue } catch { }
-    return Resolve-QOTTaskResult -Name "Windows Update cache" -Operations @($op)
+    $restartService = $false
+    Write-QLog "Cleaning: Windows Update cache"
+
+    if (-not (Test-QOTIsAdmin)) {
+        return New-QOTTaskResult -Name $taskName -Status "Skipped" -Reason "Admin required"
+    }
+    try {
+        $service = Get-Service -Name $serviceName -ErrorAction Stop
+        if ($service.Status -eq 'Running') {
+            Stop-Service -Name $serviceName -ErrorAction Stop
+            $restartService = $true
+        }
+        elseif ($service.Status -ne 'Stopped') {
+            return New-QOTTaskResult -Name $taskName -Status "Skipped" -Reason ("Service state: {0}" -f $service.Status)
+        }
+        $op = Invoke-QCleanPath -Path "$env:SystemRoot\SoftwareDistribution\Download" -Label $taskName
+        $result = Resolve-QOTTaskResult -Name $taskName -Operations @($op)
+    }
+    catch {
+        $result = New-QOTTaskResult -Name $taskName -Status "Failed" -Reason "Cleanup failed" -Error $_.Exception.Message
+    }
+    finally {
+        if ($restartService) {
+            try { Start-Service -Name $serviceName -ErrorAction Stop }
+            catch {
+                $result = New-QOTTaskResult -Name $taskName -Status "Failed" -Reason "Could not restart Windows Update" -Error $_.Exception.Message
+            }
+        }
+    }
+    return $result
 }
 
 # ------------------------------
@@ -258,12 +248,7 @@ function Invoke-QCleanTemp {
     $taskName = "Deep clean temporary folders"
     Write-QLog ("Now doing task: {0}" -f $taskName)
 
-    $ops = @(
-        Invoke-QCleanPath -Path $env:TEMP -Label "Current user temp files"
-        Invoke-QCleanPath -Path $env:TMP -Label "Current user tmp files"
-        Invoke-QCleanPath -Path "$env:SystemRoot\Temp" -Label "Windows temp files"
-    )
-
+    $tempPaths = @($env:TEMP, $env:TMP, (Join-Path $env:SystemRoot 'Temp'))
     $usersRoot = Join-Path $env:SystemDrive "Users"
     if (Test-Path -LiteralPath $usersRoot -ErrorAction SilentlyContinue) {
         try {
@@ -272,14 +257,17 @@ function Invoke-QCleanTemp {
                 if (-not $profileDir) { continue }
                 $profileTemp = Join-Path $profileDir.FullName "AppData\Local\Temp"
                 if (-not (Test-Path -LiteralPath $profileTemp -ErrorAction SilentlyContinue)) { continue }
-                $ops += Invoke-QCleanPath -Path $profileTemp -Label ("User temp files ({0})" -f $profileDir.Name)
+                $tempPaths += $profileTemp
             }
         }
         catch {
-            $ops += New-QOTOperationResult -Status "Skipped" -Reason "User profile temp scan unavailable"
+            Write-QLog "User profile temp scan unavailable" "WARN"
         }
     }
 
+    $ops = @(foreach ($path in ($tempPaths | Where-Object { $_ } | Sort-Object -Unique)) {
+        Invoke-QCleanPath -Path $path -Label "Temporary files ($path)" -TempFolder
+    })
     $result = Resolve-QOTTaskResult -Name $taskName -Operations $ops
     Write-QOTTaskOutcome -TaskName $taskName -Result $result
     return $result
@@ -331,15 +319,13 @@ function Invoke-QCleanErrorLogs {
 # Public: Setup / upgrade leftovers
 # ------------------------------
 function Invoke-QCleanSetupLeftovers {
-    Write-QLog "Cleaning: Setup/upgrade leftovers"
+    $taskName = "Archived Windows setup logs"
+    $setupLogRoot = Join-Path $env:SystemRoot 'Panther'
     $ops = @(
-        Invoke-QCleanPath -Path "$env:SystemDrive\Windows.old" -Label "Windows.old"
-        Invoke-QCleanPath -Path "$env:SystemDrive\`$WINDOWS.~BT" -Label "Setup cache (`$WINDOWS.~BT)"
-        Invoke-QCleanPath -Path "$env:SystemDrive\`$WINDOWS.~WS" -Label "Setup cache (`$WINDOWS.~WS)"
-        Invoke-QCleanPath -Path "$env:SystemDrive\ESD" -Label "Windows ESD"
-        Invoke-QCleanPath -Path "$env:SystemRoot\Panther" -Label "Setup log files"
+        Invoke-QCleanPathFiles -Path $setupLogRoot -Filter '*.log.bak' -Label $taskName
+        Invoke-QCleanPathFiles -Path $setupLogRoot -Filter '*.log.old' -Label $taskName
     )
-    return Resolve-QOTTaskResult -Name "Setup leftovers" -Operations $ops
+    return Resolve-QOTTaskResult -Name $taskName -Operations $ops
 }
 
 # ------------------------------
@@ -618,12 +604,12 @@ function Invoke-QCleanTeamsCache {
     $taskName = "Clear Microsoft Teams cache"
     Write-QLog ("Now doing task: {0}" -f $taskName)
 
+    if (Get-Process -Name 'Teams','ms-teams' -ErrorAction SilentlyContinue) {
+        return New-QOTTaskResult -Name $taskName -Status "Skipped" -Reason "Quit Teams before clearing its cache"
+    }
     $cachePaths = @(
-        "$env:APPDATA\Microsoft\Teams",
-        "$env:LOCALAPPDATA\Microsoft\Teams",
-        "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\LocalCache",
-        "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\AC\INetCache",
-        "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\TempState"
+        (Join-Path $env:APPDATA 'Microsoft\Teams')
+        (Join-Path $env:LOCALAPPDATA 'Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams')
     )
 
     $ops = @()

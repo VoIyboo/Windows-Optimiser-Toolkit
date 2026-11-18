@@ -11,19 +11,31 @@ if (-not (Test-Path -LiteralPath $introPath)) {
     throw "Missing Intro script at: $introPath"
 }
 
-$logDir = Join-Path $env:ProgramData "QuinnOptimiserToolkit\Logs"
-if (-not (Test-Path -LiteralPath $logDir)) {
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$introLog = $null
+foreach ($candidate in @($env:QOT_BOOTSTRAP_LOG_DIR,
+                         (Join-Path $env:ProgramData "QuinnOptimiserToolkit\Logs"),
+                         (Join-Path $env:LOCALAPPDATA "StudioVoly\QuinnToolkit\Logs"),
+                         (Join-Path $env:TEMP "QuinnOptimiserToolkit\Logs"))) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+    try {
+        $null = [IO.Directory]::CreateDirectory($candidate)
+        $candidateLog = Join-Path $candidate ("Intro_{0}_{1}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"), $PID)
+        $stream = [IO.File]::Open($candidateLog, 'CreateNew', 'Write', 'ReadWrite')
+        $stream.Dispose()
+        $introLog = $candidateLog
+        break
+    }
+    catch { continue }
 }
-$introLog = Join-Path $logDir ("Intro_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+if (!$introLog) { throw "No writable directory for the intro log." }
 
 $psExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
 $args = @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
     "-STA",
-    "-File", $introPath,
-    "-LogPath", $introLog
+    "-File", ('"{0}"' -f $introPath),
+    "-LogPath", ('"{0}"' -f $introLog)
 )
 
 if (-not $VerboseStartup) {

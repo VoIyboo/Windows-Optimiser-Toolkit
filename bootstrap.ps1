@@ -25,7 +25,6 @@ function New-QOTBootstrapUi {
 
     try {
         Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
-        try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue } catch { }
 
         [xml]$xaml = @"
 <Window
@@ -106,11 +105,9 @@ function New-QOTBootstrapUi {
         $window.Show()
 
         try {
-            if ([System.Windows.Forms.Screen]) {
-                $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-                $window.Left = $workingArea.Right - $window.Width - 10
-                $window.Top = $workingArea.Bottom - $window.Height - 10
-            }
+            $workingArea = [System.Windows.SystemParameters]::WorkArea
+            $window.Left = $workingArea.Right - $window.ActualWidth - 10
+            $window.Top = $workingArea.Bottom - $window.ActualHeight - 10
         }
         catch { }
 
@@ -133,18 +130,13 @@ function New-QOTBootstrapUi {
         # Match the intro widget behavior: stay topmost briefly so users notice
         # the loader, then stop pinning it above everything else.
         try {
-            $timer = New-Object System.Timers.Timer
-            $timer.Interval = 3000
-            $timer.AutoReset = $false
-            $timer.Add_Elapsed({
-                try {
-                    $window.Dispatcher.Invoke([action]{
-                        $window.Topmost = $false
-                    }, [System.Windows.Threading.DispatcherPriority]::Normal) | Out-Null
-                }
-                catch { }
-                try { $timer.Dispose() } catch { }
-            })
+            $timer = New-Object System.Windows.Threading.DispatcherTimer
+            $timer.Interval = [TimeSpan]::FromSeconds(3)
+            $timer.Add_Tick({
+                param($sender, $eventArgs)
+                $sender.Stop()
+                $Window.Topmost = $false
+            }.GetNewClosure())
             $timer.Start()
         }
         catch { }
@@ -252,7 +244,7 @@ function Close-QOTBootstrapUi {
                 $storyboardCopy.Add_Completed({
                     param($sender, $args)
                     try { $Ui.Window.Close() } catch { }
-                })
+                }.GetNewClosure())
                 $storyboardCopy.Begin($Ui.Window)
             }
             else {
@@ -474,7 +466,18 @@ function Write-QOTInstallState {
     }
 
     $json = $State | ConvertTo-Json -Depth 10
-    Set-Content -LiteralPath $StatePath -Value $json -Encoding UTF8
+    $tempFile = Join-Path $dir (".install-state-{0}.tmp" -f [guid]::NewGuid())
+    try {
+        Set-Content -LiteralPath $tempFile -Value $json -Encoding UTF8 -ErrorAction Stop
+        if (!(Test-Path -LiteralPath $StatePath)) {
+            try { [IO.File]::Move($tempFile, $StatePath); return }
+            catch [IO.IOException] { if (!(Test-Path -LiteralPath $StatePath)) { throw } }
+        }
+        [IO.File]::Replace($tempFile, $StatePath, [NullString]::Value)
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempFile) { Remove-Item -LiteralPath $tempFile -Force }
+    }
 }
 
 function Get-QOTInstalledToolkitRoot {
@@ -638,62 +641,42 @@ function Install-QOTFromGitHub {
         }
     }
 
-    $zipPath = Join-Path $Layout.DownloadRoot "repo.zip"
-    $extractRoot = Join-Path $Layout.DownloadRoot "extract"
-    $commitSegment = ""
-    try { $commitSegment = ([string]($RemoteInfo.CommitSha + "")).Trim() } catch { $commitSegment = "" }
-    if ([string]::IsNullOrWhiteSpace($commitSegment)) {
-        $commitSegment = (Get-Date -Format "yyyyMMdd_HHmmss")
-    }
-    $commitSegment = ($commitSegment -replace '[^A-Za-z0-9._-]', '').Trim()
-    if ([string]::IsNullOrWhiteSpace($commitSegment)) {
-        $commitSegment = [Guid]::NewGuid().ToString("N")
-    }
+    $attempt = [guid]::NewGuid().ToString("N")
+    $stage = Join-Path $Layout.StagingRoot $attempt
+    $zipPath = Join-Path $stage "repo.zip"
+    $extractRoot = Join-Path $stage "extract"
+    $null = New-Item -ItemType Directory -Path $stage -Force
+    $commit = [string]$RemoteInfo.CommitSha
+    try {
+        if ($RemoteInfo) {
+            if ($commit -notmatch '^[0-9a-f]{40}$') { throw "Invalid GitHub commit ID." }
+            $owner = $RemoteInfo.Owner
+            $urls = @("https://github.com/$owner/$RepoName/archive/$commit.zip",
+                      "https://codeload.github.com/$owner/$RepoName/zip/$commit")
+            $releaseRoot = Join-Path $Layout.ReleasesRoot $commit
+        }
+        else {
+            $owner = $Owners[0]
+            $urls = @("https://github.com/$owner/$RepoName/archive/refs/heads/$Branch.zip",
+                      "https://codeload.github.com/$owner/$RepoName/zip/refs/heads/$Branch")
+            $releaseRoot = Join-Path $Layout.ReleasesRoot $attempt
+        }
+        Write-Host "Downloading Quinn Optimiser Toolkit ($Branch)..."
+        Invoke-QOTDownloadRepoZip -Urls $urls -OutFile $zipPath
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot
+        $resolvedRoot = Find-QOTToolkitRoot -SearchRoot $extractRoot
+        if (!$resolvedRoot) { throw "Downloaded archive is missing src\Intro\Intro.ps1." }
 
-    $stagingCurrent = Join-Path $Layout.StagingRoot ("Current_{0}" -f $commitSegment)
-    $releaseRoot = Join-Path $Layout.ReleasesRoot $commitSegment
-
-    foreach ($path in @($extractRoot, $Layout.StagingRoot, $zipPath)) {
-        if (Test-Path -LiteralPath $path) {
-            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+        # Keep an active installation usable during a refresh and on write failures.
+        try { [IO.Directory]::Move($resolvedRoot, $releaseRoot) }
+        catch [IO.IOException] {
+            if (!(Test-Path -LiteralPath $releaseRoot)) { throw }
+            $releaseRoot = Join-Path $Layout.ReleasesRoot "$commit-$attempt"
+            [IO.Directory]::Move($resolvedRoot, $releaseRoot)
         }
     }
-
-    New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
-    New-Item -ItemType Directory -Path $Layout.StagingRoot -Force | Out-Null
-
-    $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $downloadUrls = New-Object System.Collections.Generic.List[string]
-    foreach ($owner in $Owners) {
-        $downloadUrls.Add("https://github.com/$owner/$RepoName/archive/refs/heads/$Branch.zip?cb=$cacheBust") | Out-Null
-        $downloadUrls.Add("https://codeload.github.com/$owner/$RepoName/zip/refs/heads/$Branch?cb=$cacheBust") | Out-Null
-    }
-
-    Write-Host "Downloading Quinn Optimiser Toolkit..."
-    Write-Host "Branch: $Branch"
-    Invoke-QOTDownloadRepoZip -Urls $downloadUrls -OutFile $zipPath
-    Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
-
-    $resolvedRoot = Find-QOTToolkitRoot -SearchRoot $extractRoot
-    if (-not $resolvedRoot) {
-        throw "Could not locate downloaded toolkit root after extraction (missing src\Intro\Intro.ps1)."
-    }
-
-    Copy-Item -LiteralPath $resolvedRoot -Destination $stagingCurrent -Recurse -Force
-
-    $stagedIntro = Join-Path $stagingCurrent "src\Intro\Intro.ps1"
-    if (-not (Test-Path -LiteralPath $stagedIntro)) {
-        throw "Staged toolkit is invalid: missing $stagedIntro"
-    }
-
-    if (Test-Path -LiteralPath $releaseRoot) {
-        Remove-Item -LiteralPath $releaseRoot -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    Move-Item -LiteralPath $stagingCurrent -Destination $releaseRoot -Force
-
-    if (Test-Path -LiteralPath $Layout.StagingRoot) {
-        Remove-Item -LiteralPath $Layout.StagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+    finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     $installedState = [pscustomobject]@{
@@ -733,6 +716,8 @@ function Start-QOTInstalledCopy {
         throw "Windows PowerShell executable was not found at: $psExe"
     }
 
+    $previousSignal = $env:QOT_BOOTSTRAP_HANDOFF_SIGNAL
+    $previousLogDir = $env:QOT_BOOTSTRAP_LOG_DIR
     $handoffSignalPath = Join-Path $env:TEMP ("QOT.StartupWidget.ready.{0}.signal" -f ([guid]::NewGuid().ToString("N")))
     try {
         [Environment]::SetEnvironmentVariable("QOT_BOOTSTRAP_HANDOFF_SIGNAL", $handoffSignalPath, "Process")
@@ -743,7 +728,7 @@ function Start-QOTInstalledCopy {
         $psArgs = @(
             "-NoProfile",
             "-ExecutionPolicy", "Bypass",
-            "-File", $runLocalPath
+            "-File", ('"{0}"' -f $runLocalPath)
         )
 
         if ($VerboseStartup) {
@@ -756,8 +741,8 @@ function Start-QOTInstalledCopy {
             "-NoProfile",
             "-ExecutionPolicy", "Bypass",
             "-STA",
-            "-File", $introPath,
-            "-LogPath", $introLog
+            "-File", ('"{0}"' -f $introPath),
+            "-LogPath", ('"{0}"' -f $introLog)
         )
 
         if (-not $VerboseStartup) {
@@ -770,29 +755,20 @@ function Start-QOTInstalledCopy {
     Write-Host "Data folder:  $env:LOCALAPPDATA\StudioVoly\QuinnToolkit"
     Write-Host ""
 
-    Set-Location $ToolkitRoot
 
     # Launch intro in its own hidden-console process so the startup widget can
     # present independently of the caller's PowerShell window.
-    $startedProcess = Start-Process -FilePath $psExe -ArgumentList $psArgs -WorkingDirectory $ToolkitRoot -WindowStyle Hidden -PassThru
-    if (-not $startedProcess) {
-        throw "Failed to start the Quinn intro process."
-    }
-
-    $handoffSeen = Wait-QOTBootstrapHandoff -SignalPath $handoffSignalPath -TimeoutMs 5000
-    if (-not $handoffSeen) {
-        Start-Sleep -Milliseconds 250
-    }
-
     try {
+        $env:QOT_BOOTSTRAP_LOG_DIR = $LogDir
+        $startedProcess = Start-Process -FilePath $psExe -ArgumentList $psArgs -WorkingDirectory $ToolkitRoot -WindowStyle Hidden -PassThru
+        if (-not $startedProcess) { throw "Failed to start the Quinn intro process." }
+        $null = Wait-QOTBootstrapHandoff -SignalPath $handoffSignalPath -TimeoutMs 5000
+    }
+    finally {
         Remove-Item -LiteralPath $handoffSignalPath -Force -ErrorAction SilentlyContinue
+        [Environment]::SetEnvironmentVariable("QOT_BOOTSTRAP_HANDOFF_SIGNAL", $previousSignal, "Process")
+        [Environment]::SetEnvironmentVariable("QOT_BOOTSTRAP_LOG_DIR", $previousLogDir, "Process")
     }
-    catch { }
-
-    try {
-        [Environment]::SetEnvironmentVariable("QOT_BOOTSTRAP_HANDOFF_SIGNAL", $null, "Process")
-    }
-    catch { }
 }
 
 $logDir = Get-QOTBootstrapLogDir
@@ -805,10 +781,7 @@ try {
     }
     catch { }
 
-    $repoOwners = @(
-        "VoIyboo",
-        "Volyboo"
-    )
+    $repoOwners = @("VoIyboo")
     $repoName = "Windows-Optimiser-Toolkit"
 
     if ([string]::IsNullOrWhiteSpace($Branch)) {
@@ -889,9 +862,15 @@ try {
         else {
             Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 52 -Status "Downloading Quinn..." -Detail "First-time setup: downloading the current toolkit from GitHub."
         }
-        $state = Install-QOTFromGitHub -Layout $layout -Owners $repoOwners -RepoName $repoName -Branch $Branch -RemoteInfo $remoteInfo
-        $hasInstalledCopy = $true
-        Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 78 -Status "Install complete" -Detail "Quinn Optimiser Toolkit is ready to open."
+        try {
+            $state = Install-QOTFromGitHub -Layout $layout -Owners $repoOwners -RepoName $repoName -Branch $Branch -RemoteInfo $remoteInfo
+            $hasInstalledCopy = $true
+            Update-QOTBootstrapUi -Ui $bootstrapUi -Progress 78 -Status "Install complete" -Detail "Quinn Optimiser Toolkit is ready to open."
+        }
+        catch {
+            if (!$hasInstalledCopy) { throw }
+            Write-Warning "Update failed. Launching the previously installed copy. $($_.Exception.Message)"
+        }
     }
     elseif ($hasInstalledCopy) {
         Write-Host "Installed copy is up to date. Launching local copy."

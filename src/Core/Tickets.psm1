@@ -51,9 +51,6 @@ $script:TicketBackupPath = $null
 $script:TicketStoreLockTimeoutSeconds = 5
 $script:TicketBackupMinIntervalSeconds = 90
 $script:TicketLastBackupUtc = [datetime]::MinValue
-$script:TicketStoreCompactionThresholdBytes = 50MB
-$script:TicketLargeInlineBodyLineThresholdChars = 12000
-$script:TicketCompactedBodyFileMaxChars = 12000
 $script:ValidTicketStatuses = @(
     "New",
     "In Progress",
@@ -161,12 +158,9 @@ function Get-QOTicketsCoreAppDataRoot {
 function Get-QOTicketsSettingsObject {
     $getSettingsCmd = Resolve-QOTicketsSettingsCommand -Name "Get-QOSettings"
     if ($getSettingsCmd) {
-        try {
-            $settings = & $getSettingsCmd
-            if ($settings) { return $settings }
-        } catch {
-            Write-QOTicketsCoreLog ("Tickets: Get-QOSettings failed, using fallback defaults. " + $_.Exception.Message) "WARN"
-        }
+        $settings = & $getSettingsCmd
+        if (!$settings) { throw "Unable to read ticket settings." }
+        return $settings
     }
 
     $newDefaultsCmd = Resolve-QOTicketsSettingsCommand -Name "New-QODefaultSettings"
@@ -224,43 +218,38 @@ function New-QODefaultTicketsFile {
     }
 }
 
-function Get-QOLatestTicketBackupPath {
-    param(
-        [Parameter(Mandatory)][string]$TicketPath,
-        [AllowNull()][string]$BackupDirectory
-    )
+function Get-QOTicketBackupCandidates {
+    param([Parameter(Mandatory)][string]$TicketPath, [string]$BackupDirectory)
 
-    $candidates = @()
-    $ticketName = Split-Path -Leaf $TicketPath
-    $backupPattern = "{0}.bak_*" -f $ticketName
-
-    if (-not [string]::IsNullOrWhiteSpace($BackupDirectory)) {
-        try {
-            if (Test-Path -LiteralPath $BackupDirectory) {
-                $candidates += Get-ChildItem -LiteralPath $BackupDirectory -Filter $backupPattern -File -ErrorAction SilentlyContinue
-            }
-        } catch { }
+    $storeDir = Split-Path -Parent $TicketPath
+    $pattern = (Split-Path -Leaf $TicketPath) + ".bak_*"
+    # Versions before the backup-folder fix wrote into a directory named Tickets.backup.json.
+    $folders = @($BackupDirectory, (Join-Path $storeDir "Tickets.backup.json"), $storeDir)
+    $files = foreach ($folder in ($folders | Select-Object -Unique)) {
+        if ($folder -and (Test-Path -LiteralPath $folder -PathType Container)) {
+            Get-ChildItem -LiteralPath $folder -Filter $pattern -File -ErrorAction SilentlyContinue
+        }
     }
+    $files | Sort-Object LastWriteTimeUtc -Descending
+}
 
-    $ticketDir = Split-Path -Parent $TicketPath
-    if (-not [string]::IsNullOrWhiteSpace($ticketDir)) {
-        try {
-            if (Test-Path -LiteralPath $ticketDir) {
-                $candidates += Get-ChildItem -LiteralPath $ticketDir -Filter $backupPattern -File -ErrorAction SilentlyContinue
-            }
-        } catch { }
+function ConvertFrom-QOTicketStoreJson {
+    param([AllowEmptyString()][string]$Json)
+    if ([string]::IsNullOrWhiteSpace($Json)) { throw "The ticket store is empty." }
+    $parseOptions = @{}
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+        # The queue stores round-trip timestamps as strings, including their UTC offset.
+        $parseOptions.DateKind = 'String'
     }
-
-    if (-not $candidates -or $candidates.Count -eq 0) {
-        return $null
+    $database = ConvertFrom-Json -InputObject $Json @parseOptions -ErrorAction Stop
+    if ($Json.TrimStart().StartsWith("[")) {
+        return [pscustomobject]@{ SchemaVersion = 1; Tickets = @($database | Where-Object { $null -ne $_ }) }
     }
-
-    $latest = $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($latest) {
-        return [string]$latest.FullName
+    if ($null -eq $database -or ($database.PSObject.Properties.Name -notcontains "Tickets" -and
+        $database.PSObject.Properties.Name -notcontains "Id")) {
+        throw "The JSON does not contain a ticket database."
     }
-
-    return $null
+    return $database
 }
 
 function Normalize-QOTicketDatabase {
@@ -950,226 +939,6 @@ function Resolve-QOTicketBodyFilePath {
     return $pathValue
 }
 
-function ConvertTo-QOTicketJsonStringLiteral {
-    param(
-        [AllowNull()][string]$Value
-    )
-
-    $text = [string]($Value + "")
-    if ([string]::IsNullOrEmpty($text)) { return "" }
-
-    $builder = New-Object System.Text.StringBuilder
-    foreach ($ch in $text.ToCharArray()) {
-        $code = [int][char]$ch
-        if ($code -eq 34) {
-            [void]$builder.Append('\"')
-        } elseif ($code -eq 92) {
-            [void]$builder.Append('\\')
-        } elseif ($code -eq 8) {
-            [void]$builder.Append('\b')
-        } elseif ($code -eq 9) {
-            [void]$builder.Append('\t')
-        } elseif ($code -eq 10) {
-            [void]$builder.Append('\n')
-        } elseif ($code -eq 12) {
-            [void]$builder.Append('\f')
-        } elseif ($code -eq 13) {
-            [void]$builder.Append('\r')
-        } elseif ($code -lt 32) {
-            [void]$builder.Append(("\u{0:x4}" -f $code))
-        } else {
-            [void]$builder.Append($ch)
-        }
-    }
-
-    return $builder.ToString()
-}
-
-function Get-QOTicketDecodedJsonStringPrefix {
-    param(
-        [Parameter(Mandatory)][string]$Line,
-        [int]$MaxChars = 600
-    )
-
-    if ($MaxChars -lt 1) { $MaxChars = 1 }
-
-    $colonIndex = $Line.IndexOf(":")
-    if ($colonIndex -lt 0) {
-        return [pscustomobject]@{ Text = ""; WasTruncated = $false }
-    }
-
-    $startQuote = $Line.IndexOf('"', $colonIndex + 1)
-    if ($startQuote -lt 0) {
-        return [pscustomobject]@{ Text = ""; WasTruncated = $false }
-    }
-
-    $builder = New-Object System.Text.StringBuilder
-    $closed = $false
-    $i = $startQuote + 1
-    while ($i -lt $Line.Length -and $builder.Length -lt $MaxChars) {
-        $ch = $Line[$i]
-        $code = [int][char]$ch
-
-        if ($code -eq 34) {
-            $closed = $true
-            break
-        }
-
-        if ($code -eq 92 -and ($i + 1) -lt $Line.Length) {
-            $i++
-            $esc = $Line[$i]
-            $escCode = [int][char]$esc
-            switch ($escCode) {
-                34 { [void]$builder.Append('"') }
-                92 { [void]$builder.Append('\') }
-                47 { [void]$builder.Append('/') }
-                98 { [void]$builder.Append([char]8) }
-                102 { [void]$builder.Append([char]12) }
-                110 { [void]$builder.Append("`n") }
-                114 { [void]$builder.Append("`r") }
-                116 { [void]$builder.Append("`t") }
-                117 {
-                    if (($i + 4) -lt $Line.Length) {
-                        $hex = $Line.Substring($i + 1, 4)
-                        try {
-                            [void]$builder.Append([char]([Convert]::ToInt32($hex, 16)))
-                            $i += 4
-                        } catch {
-                            [void]$builder.Append($esc)
-                        }
-                    } else {
-                        [void]$builder.Append($esc)
-                    }
-                }
-                default { [void]$builder.Append($esc) }
-            }
-        } else {
-            [void]$builder.Append($ch)
-        }
-
-        $i++
-    }
-
-    $wasTruncated = (-not $closed)
-    return [pscustomobject]@{
-        Text         = $builder.ToString()
-        WasTruncated = $wasTruncated
-    }
-}
-
-function Compress-QOTicketStoreLargeBodyLines {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [AllowNull()][string]$BackupDirectory,
-        [int]$LineLengthThresholdChars = $script:TicketLargeInlineBodyLineThresholdChars,
-        [int]$BodyFileMaxChars = $script:TicketCompactedBodyFileMaxChars,
-        [switch]$Quiet
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) { return $false }
-    if ($LineLengthThresholdChars -lt 1024) { $LineLengthThresholdChars = 1024 }
-    if ($BodyFileMaxChars -lt 600) { $BodyFileMaxChars = 600 }
-
-    $storeDir = Split-Path -Parent $Path
-    $bodiesDir = Join-Path $storeDir "Bodies"
-    $leaf = Split-Path -Leaf $Path
-    $timestamp = Get-Date -Format "yyyyMMddHHmmss"
-    $tempPath = Join-Path $storeDir ("{0}.compact.tmp.{1}.{2}" -f $leaf, $PID, ([guid]::NewGuid().ToString("N")))
-    $backupRoot = ([string]($BackupDirectory + "")).Trim()
-    if ([string]::IsNullOrWhiteSpace($backupRoot)) { $backupRoot = $storeDir }
-    $backupPath = Join-Path $backupRoot ("{0}.compact-backup-{1}" -f $leaf, $timestamp)
-
-    $reader = $null
-    $writer = $null
-    $changedCount = 0
-    $lineNo = 0
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-
-    try {
-        if (-not (Test-Path -LiteralPath $bodiesDir)) {
-            New-Item -ItemType Directory -Path $bodiesDir -Force | Out-Null
-        }
-        if (-not (Test-Path -LiteralPath $backupRoot)) {
-            New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
-        }
-
-        $reader = New-Object System.IO.StreamReader($Path, [System.Text.Encoding]::UTF8, $true, 1048576)
-        $writer = New-Object System.IO.StreamWriter($tempPath, $false, $utf8NoBom, 1048576)
-
-        while (($line = $reader.ReadLine()) -ne $null) {
-            $lineNo++
-            $trimmed = $line.TrimStart()
-            $isLargeInlineBody = (
-                $line.Length -gt $LineLengthThresholdChars -and
-                $trimmed.StartsWith('"Body"', [System.StringComparison]::Ordinal)
-            )
-
-            if (-not $isLargeInlineBody) {
-                $writer.WriteLine($line)
-                continue
-            }
-
-            $indentLength = $line.Length - $trimmed.Length
-            $indent = ""
-            if ($indentLength -gt 0) { $indent = $line.Substring(0, $indentLength) }
-            $hadTrailingComma = $line.TrimEnd().EndsWith(",", [System.StringComparison]::Ordinal)
-            $bodyPrefix = Get-QOTicketDecodedJsonStringPrefix -Line $line -MaxChars $BodyFileMaxChars
-            $bodyText = [string]$bodyPrefix.Text
-            if ($bodyPrefix.WasTruncated -or $line.Length -gt $BodyFileMaxChars) {
-                $bodyText = $bodyText.TrimEnd() + "`r`n`r`n[Body compacted because it was too large for the ticket store. Full original JSON is preserved in backup: $backupPath]"
-            }
-
-            $bodyFileName = "legacy-body-line-{0}.txt" -f $lineNo
-            $bodyPath = Join-Path $bodiesDir $bodyFileName
-            [System.IO.File]::WriteAllText($bodyPath, $bodyText, $utf8NoBom)
-
-            $previewText = Get-QOTicketBodyPreview -Body $bodyText -MaxChars 600
-            $encodedBodyPath = ConvertTo-QOTicketJsonStringLiteral -Value $bodyPath
-            $encodedPreview = ConvertTo-QOTicketJsonStringLiteral -Value $previewText
-            $previewComma = if ($hadTrailingComma) { "," } else { "" }
-
-            $writer.WriteLine($indent + '"Body":  "",')
-            $writer.WriteLine($indent + ('"BodyPath":  "{0}",' -f $encodedBodyPath))
-            $writer.WriteLine($indent + ('"BodyPreview":  "{0}"{1}' -f $encodedPreview, $previewComma))
-            $changedCount++
-        }
-    }
-    catch {
-        Write-QOTicketsCoreLog ("Tickets: Large body compaction failed. Error: {0}" -f $_.Exception.Message) "WARN"
-        return $false
-    }
-    finally {
-        if ($reader) { try { $reader.Dispose() } catch { } }
-        if ($writer) { try { $writer.Dispose() } catch { } }
-    }
-
-    if ($changedCount -le 0) {
-        try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch { }
-        return $false
-    }
-
-    try {
-        Copy-Item -LiteralPath $Path -Destination $backupPath -Force -ErrorAction Stop
-        try {
-            [System.IO.File]::Replace($tempPath, $Path, $null, $true)
-        } catch {
-            [System.IO.File]::Copy($tempPath, $Path, $true)
-            [System.IO.File]::Delete($tempPath)
-        }
-        if (-not $Quiet) {
-            Write-QOTicketsCoreLog ("Tickets: Compacted {0} oversized inline body entries. Backup={1}" -f $changedCount, $backupPath)
-        }
-        return $true
-    }
-    catch {
-        Write-QOTicketsCoreLog ("Tickets: Failed to replace ticket store after compaction. Error: {0}" -f $_.Exception.Message) "ERROR"
-        return $false
-    }
-    finally {
-        try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch { }
-    }
-}
-
 function Read-QOTicketStoreJsonText {
     param(
         [Parameter(Mandatory)][string]$Path
@@ -1478,12 +1247,7 @@ function Write-QOTicketsStoreFileAtomic {
         [System.IO.File]::WriteAllText($tempPath, $JsonContent, $utf8NoBom)
 
         if (Test-Path -LiteralPath $Path) {
-            try {
-                [System.IO.File]::Replace($tempPath, $Path, $null, $true)
-            } catch {
-                [System.IO.File]::Copy($tempPath, $Path, $true)
-                [System.IO.File]::Delete($tempPath)
-            }
+            [System.IO.File]::Replace($tempPath, $Path, [System.Management.Automation.Language.NullString]::Value, $true)
         } else {
             [System.IO.File]::Move($tempPath, $Path)
         }
@@ -1529,6 +1293,7 @@ function Ensure-QOTicketsStoreDirectory {
 function Reset-QOTicketStorageCache {
     $script:TicketStorePath = $null
     $script:TicketBackupPath = $null
+    $script:TicketLastBackupUtc = [datetime]::MinValue
     Initialize-QOTicketStorage
     return [pscustomobject]@{
         StorePath  = [string]$script:TicketStorePath
@@ -1665,7 +1430,7 @@ function Initialize-QOTicketStorage {
     $null = Save-QOTicketsSettingsObject -Settings $settings
 
     $script:TicketStorePath  = [string]$settings.TicketStorePath
-    $script:TicketBackupPath = Join-Path (Split-Path $script:TicketStorePath -Parent) "Tickets.backup.json"
+    $script:TicketBackupPath = [string]$settings.LocalTicketBackupPath
 
     # Ensure directories exist
     New-Item -ItemType Directory -Path (Split-Path -Parent $script:TicketStorePath) -Force | Out-Null
@@ -1684,7 +1449,7 @@ function Get-QOTickets {
     )
 
     $loadStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $saveStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $invalidStoreJson = $false
     try {
         if (-not $Quiet) { Write-QOTicketsCoreLog "Tickets: Resolve ticket store path" }
         Initialize-QOTicketStorage
@@ -1694,28 +1459,14 @@ function Get-QOTickets {
             if (-not $Quiet) { Write-QOTicketsCoreLog ("Tickets: Store file missing. Creating new store at {0}." -f $script:TicketStorePath) }
             New-QODefaultTicketsFile -Path $script:TicketStorePath
         }
-        try {
-            $storeInfo = Get-Item -LiteralPath $script:TicketStorePath -ErrorAction Stop
-            $compactThreshold = [int64]$script:TicketStoreCompactionThresholdBytes
-            if ($compactThreshold -lt 1MB) { $compactThreshold = 50MB }
-            if ($storeInfo.Length -gt $compactThreshold) {
-                if (-not $Quiet) { Write-QOTicketsCoreLog ("Tickets: Store is large ({0:n1} MB). Checking for oversized inline bodies." -f ($storeInfo.Length / 1MB)) }
-                $null = Compress-QOTicketStoreLargeBodyLines -Path $script:TicketStorePath -BackupDirectory $script:TicketBackupPath -Quiet:$Quiet
-            }
-        } catch {
-            Write-QOTicketsCoreLog ("Tickets: Store compaction pre-check failed. {0}" -f $_.Exception.Message) "WARN"
-        }
         $currentWriteUtc = [datetime]::MinValue
         try { $currentWriteUtc = [System.IO.File]::GetLastWriteTimeUtc($script:TicketStorePath) } catch { $currentWriteUtc = [datetime]::MinValue }
         $rawJson = Read-QOTicketStoreJsonText -Path $script:TicketStorePath
-        if ([string]::IsNullOrWhiteSpace($rawJson)) {
-            if (-not $Quiet) { Write-QOTicketsCoreLog "Tickets: JSON file empty. Treating as empty array." }
-            $rawJson = "[]"
-        }
-        if (-not $Quiet) { Write-QOTicketsCoreLog "Tickets: Parse JSON" }
-        $db = $rawJson | ConvertFrom-Json -ErrorAction Stop
-        if (-not $db) {
-            $db = New-QODefaultTicketDatabase
+        try {
+            $db = ConvertFrom-QOTicketStoreJson -Json $rawJson
+        } catch {
+            $invalidStoreJson = $true
+            throw
         }
 
         if (-not $Quiet) { Write-QOTicketsCoreLog "Tickets: Map to objects" }
@@ -1768,44 +1519,45 @@ function Get-QOTickets {
             ("Tickets: Failed to load ticket store from {0}. Error: {1}" -f $ticketPath, $msg),
             $_.Exception
         )
-        try {
-            $backupPath = Get-QOLatestTicketBackupPath -TicketPath $ticketPath -BackupDirectory $script:TicketBackupPath
-            if ($backupPath) {
-                Copy-Item -LiteralPath $backupPath -Destination $ticketPath -Force -ErrorAction SilentlyContinue
-                $db = Read-QOTicketStoreJsonText -Path $ticketPath | ConvertFrom-Json -ErrorAction Stop
-                if ($db) {
-                    $db = Normalize-QOTicketDatabase -Database $db
-                    $ticketCount = 0
-                    try { $ticketCount = @($db.Tickets).Count } catch { }
-                    Write-QOTicketsCoreLog ("Tickets: Restored from backup {0}. Loaded {1} tickets." -f $backupPath, $ticketCount)
-                    return $db
+        if ($invalidStoreJson -and $_.Exception.GetBaseException() -isnot [OutOfMemoryException]) {
+            # A writer may have repaired/replaced the store since this read failed.
+            $mutex = [Threading.Mutex]::new($false, (Get-QOTicketStoreMutexName -StorePath $ticketPath))
+            $locked = $false
+            try {
+                try { $locked = $mutex.WaitOne([TimeSpan]::FromSeconds($script:TicketStoreLockTimeoutSeconds)) }
+                catch [Threading.AbandonedMutexException] { $locked = $true }
+                if ($locked) {
+                    $latestJson = Read-QOTicketStoreJsonText -Path $ticketPath
+                    if ($latestJson -cne $rawJson) {
+                        return Normalize-QOTicketDatabase -Database (ConvertFrom-QOTicketStoreJson -Json $latestJson)
+                    }
+                    foreach ($backup in (Get-QOTicketBackupCandidates -TicketPath $ticketPath -BackupDirectory $script:TicketBackupPath)) {
+                        try {
+                            $backupJson = Read-QOTicketStoreJsonText -Path $backup.FullName
+                            $restored = Normalize-QOTicketDatabase -Database (ConvertFrom-QOTicketStoreJson -Json $backupJson)
+                        } catch { continue }
+                        # A snapshot predates later Outlook deliveries. Keep restored drafts for review.
+                        foreach ($ticket in $restored.Tickets) {
+                            foreach ($pending in $ticket.PendingReplies) {
+                                if ((Normalize-QOTTicketPendingReplyState $pending.SendState) -notin @("Queued", "Sending")) { continue }
+                                $note = "Restored from backup. Check Sent Items before resending."
+                                $pending | Add-Member -NotePropertyName SendState -NotePropertyValue "Failed" -Force
+                                $pending | Add-Member -NotePropertyName FailureNote -NotePropertyValue $note -Force
+                                $pending | Add-Member -NotePropertyName LastError -NotePropertyValue $note -Force
+                            }
+                        }
+                        $damagedPath = "$ticketPath.corrupt_$([guid]::NewGuid().ToString('N'))"
+                        Copy-Item -LiteralPath $ticketPath -Destination $damagedPath -ErrorAction Stop
+                        Write-QOTicketsStoreFileAtomic -Path $ticketPath -JsonContent (ConvertTo-Json -InputObject $restored -Depth 25)
+                        Write-QOTicketsCoreLog ("Tickets: Restored from {0}; damaged file retained at {1}." -f $backup.FullName, $damagedPath) "WARN"
+                        return $restored
+                    }
                 }
+            } finally {
+                if ($locked) { $mutex.ReleaseMutex() }
+                $mutex.Dispose()
             }
-        } catch { }
-        $isMemoryFailure = $false
-        try {
-            $errorText = ([string]$msg + " " + [string]$inner).ToLowerInvariant()
-            if ($errorText -match 'outofmemory|insufficient memory') {
-                $isMemoryFailure = $true
-            }
-        } catch { $isMemoryFailure = $false }
-
-        if ($isMemoryFailure) {
-            Write-QOTicketsCoreLog "Tickets: Skipping destructive reset because load failure appears to be memory-related." "WARN"
-            throw $errorToThrow
         }
-
-        try {
-            if (-not [string]::IsNullOrWhiteSpace($ticketPath)) {
-                if (Test-Path -LiteralPath $ticketPath) {
-                    $backupName = "{0}.bak_{1}" -f $ticketPath, (Get-Date -Format "yyyyMMddHHmmss")
-                    Copy-Item -LiteralPath $ticketPath -Destination $backupName -Force -ErrorAction SilentlyContinue
-                }
-
-                New-QODefaultTicketDatabase | ConvertTo-Json -Depth 8 |
-                    Set-Content -LiteralPath $ticketPath -Encoding UTF8
-            }
-        } catch { }
         throw $errorToThrow
     }
     finally {
@@ -1820,6 +1572,7 @@ function Save-QOTickets {
         [switch]$Quiet
     )
 
+    $saveStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Initialize-QOTicketStorage
 
     if (-not ($Database.PSObject.Properties.Name -contains "Tickets")) {
@@ -1870,6 +1623,24 @@ function Save-QOTickets {
             }
         }
 
+        $useFastIncomingSave = $false
+        if (-not (Test-Path -LiteralPath $script:TicketStorePath)) {
+            $useFastIncomingSave = $true
+        } elseif ($incomingStoreStampTicks -gt 0 -and $currentWriteTicks -gt 0 -and $incomingStoreStampTicks -eq $currentWriteTicks) {
+            $useFastIncomingSave = $true
+        }
+
+        $merged = $null
+        if ($useFastIncomingSave) {
+            $merged = $Database
+        } else {
+            $latestOnDisk = New-QODefaultTicketDatabase
+            if (Test-Path -LiteralPath $script:TicketStorePath) {
+                $rawJson = Read-QOTicketStoreJsonText -Path $script:TicketStorePath
+                $latestOnDisk = ConvertFrom-QOTicketStoreJson -Json $rawJson
+            }
+            $merged = Merge-QOTicketDatabases -BaseDatabase $latestOnDisk -IncomingDatabase $Database
+        }
         try {
             if (Test-Path -LiteralPath $script:TicketStorePath) {
                 $nowUtc = (Get-Date).ToUniversalTime()
@@ -1886,36 +1657,12 @@ function Save-QOTickets {
                     $ticketName = Split-Path -Leaf $script:TicketStorePath
                     $backupName = "{0}.bak_{1}" -f $ticketName, $timestamp
                     $backupPath = Join-Path $script:TicketBackupPath $backupName
-                    Copy-Item -LiteralPath $script:TicketStorePath -Destination $backupPath -Force -ErrorAction SilentlyContinue
+                    Copy-Item -LiteralPath $script:TicketStorePath -Destination $backupPath -Force -ErrorAction Stop
                     $script:TicketLastBackupUtc = $nowUtc
                 }
             }
-        } catch { }
+        } catch { Write-QOTicketsCoreLog ("Tickets: Backup failed. " + $_.Exception.Message) "WARN" }
 
-        $useFastIncomingSave = $false
-        if (-not (Test-Path -LiteralPath $script:TicketStorePath)) {
-            $useFastIncomingSave = $true
-        } elseif ($incomingStoreStampTicks -gt 0 -and $currentWriteTicks -gt 0 -and $incomingStoreStampTicks -eq $currentWriteTicks) {
-            $useFastIncomingSave = $true
-        }
-
-        $merged = $null
-        if ($useFastIncomingSave) {
-            $merged = $Database
-        } else {
-            $latestOnDisk = New-QODefaultTicketDatabase
-            if (Test-Path -LiteralPath $script:TicketStorePath) {
-                try {
-                    $rawJson = Read-QOTicketStoreJsonText -Path $script:TicketStorePath
-                    if ([string]::IsNullOrWhiteSpace($rawJson)) { $rawJson = "[]" }
-                    $latestOnDisk = $rawJson | ConvertFrom-Json -ErrorAction Stop
-                } catch {
-                    Write-QOTicketsCoreLog ("Tickets: Existing store read failed during save merge. Using default and continuing. Error: {0}" -f $_.Exception.Message) "WARN"
-                    $latestOnDisk = New-QODefaultTicketDatabase
-                }
-            }
-            $merged = Merge-QOTicketDatabases -BaseDatabase $latestOnDisk -IncomingDatabase $Database
-        }
         if (-not $SkipBodyOptimization) {
             Optimize-QOTicketBodyStorage -Database $merged
         }
@@ -3631,6 +3378,7 @@ function Add-QOTTicketPendingReply {
         if (-not $metadataTicket) { $metadataTicket = $ticket }
         $pendingMetadata = Get-QOTTicketPendingReplyMetadataFromTicket -Ticket $metadataTicket
         $contentKey = Get-QOTTicketPendingReplyContentKey -Subject $subjectValue -Body $bodyValue -To ([string]$pendingMetadata.To)
+        if ($ticket.Replies.ReplyId -contains $draftKey) { throw "This draft was already delivered." }
 
         $entryUpdated = $false
         foreach ($pending in $pendingReplies) {
@@ -3639,6 +3387,11 @@ function Add-QOTTicketPendingReply {
             try { if ($pending.PSObject.Properties.Name -contains "DraftId") { $pendingDraftId = ([string]($pending.DraftId + "")).Trim() } } catch { $pendingDraftId = "" }
             if (-not [string]::Equals($pendingDraftId, $draftKey, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
 
+            if ($pending.SendState -in @("Sending", "Sent", "Failed")) {
+                $existing = Get-QOTTicketPendingReply -TicketId $resolvedTicketId -DraftId $draftKey
+                $existing | Add-Member -NotePropertyName DuplicateSuppressed -NotePropertyValue $true -Force
+                return $existing
+            }
             try { $pending.ReplyId = $draftKey } catch { $pending | Add-Member -NotePropertyName ReplyId -NotePropertyValue $draftKey -Force }
             try { $pending.DraftId = $draftKey } catch { }
             try { $pending.Subject = $subjectValue } catch { }
@@ -3828,7 +3581,8 @@ function Set-QOTTicketPendingReplyState {
         [AllowNull()][string]$FailureNote,
         [int]$RetryCount = -1,
         [AllowNull()][string]$NextAttemptAt = "",
-        [AllowNull()][string]$SentAt = ""
+        [AllowNull()][string]$SentAt = "",
+        [AllowNull()]$DeliveryReceipt
     )
 
     $resolvedTicketId = ([string]($TicketId + "")).Trim()
@@ -3864,6 +3618,10 @@ function Set-QOTTicketPendingReplyState {
                     $previousStateValue = Normalize-QOTTicketPendingReplyState -SendState ([string]$pending.SendState)
                 }
             } catch { $previousStateValue = "" }
+            if ($stateValue -eq "Sending" -and $previousStateValue -ne "Queued") { return $null }
+            if ($stateValue -eq "Sent" -and $DeliveryReceipt) {
+                $pending | Add-Member -NotePropertyName DeliveryReceipt -NotePropertyValue $DeliveryReceipt -Force
+            }
             try { $pending.SendState = $stateValue } catch { $pending | Add-Member -NotePropertyName SendState -NotePropertyValue $stateValue -Force }
             try { $pending.LastAttemptAt = $nowStamp } catch { $pending | Add-Member -NotePropertyName LastAttemptAt -NotePropertyValue $nowStamp -Force }
             try { $pending.FailureNote = $failureNoteValue } catch { $pending | Add-Member -NotePropertyName FailureNote -NotePropertyValue $failureNoteValue -Force }
@@ -4007,36 +3765,11 @@ function Get-QOTNextPendingReply {
         $nextAttemptUtc = Get-QOTTicketPendingReplyTimestampUtc -Value $entry.NextAttemptAt
         if ($nextAttemptUtc -ne [datetime]::MinValue -and $nextAttemptUtc -gt $nowUtc) { continue }
 
-        $eligible = $false
-        $isStaleStale = $false
-        if ($stateValue -eq "Queued") {
-            $eligible = $true
-        } elseif ($stateValue -eq "Sending") {
-            if ($lastAttemptUtc -eq [datetime]::MinValue) {
-                $eligible = $true
-                $isStaleStale = $true
-            } else {
-                $elapsedSeconds = ($nowUtc - $lastAttemptUtc).TotalSeconds
-                if ($elapsedSeconds -ge $StaleSendingSeconds) {
-                    $eligible = $true
-                    $isStaleStale = $true
-                }
-            }
+        if ($stateValue -eq "Sending" -and ($nowUtc - $lastAttemptUtc).TotalSeconds -ge $StaleSendingSeconds) {
+            # Outlook may already have accepted it before the worker stopped.
+            $null = Set-QOTTicketPendingReplyState -TicketId $entry.TicketId -DraftId $entry.DraftId -SendState Failed -FailureNote "Delivery could not be confirmed. Check Sent Items before resending."
         }
-
-        if (-not $eligible) { continue }
-
-        # If this was a stale "Sending" reply, reset it to "Queued" in the database
-        # This prevents the entry from getting stuck in "Sending" state if the queue runner crashes
-        if ($isStaleStale) {
-            try {
-                $ticketId = [string]$entry.TicketId
-                $draftId = [string]$entry.DraftId
-                $retryCount = 0
-                try { $retryCount = [int]$entry.RetryCount } catch { $retryCount = 0 }
-                Set-QOTTicketPendingReplyState -TicketId $ticketId -DraftId $draftId -SendState "Queued" -FailureNote "" -RetryCount $retryCount -NextAttemptAt ""
-            } catch { }
-        }
+        if ($stateValue -ne "Queued") { continue }
 
         $candidates.Add([pscustomobject]@{
             TicketId       = [string]$entry.TicketId
@@ -4352,7 +4085,7 @@ function Repair-QOTPendingReplyQueueState {
             }
 
             if ([string]::Equals($stateValue, "Sending", [System.StringComparison]::OrdinalIgnoreCase) -and (($RecoverOrphanedSending -and -not $workerRunning) -or $isStaleSending)) {
-                $recoveryNote = "Reply marked failed because the previous background send stopped unexpectedly. Use Retry to queue a clean new attempt."
+                $recoveryNote = "Delivery could not be confirmed. Check Sent Items before resending."
                 try { $pending.SendState = "Failed" } catch { $pending | Add-Member -NotePropertyName SendState -NotePropertyValue "Failed" -Force }
                 try { $pending.FailureNote = $recoveryNote } catch { $pending | Add-Member -NotePropertyName FailureNote -NotePropertyValue $recoveryNote -Force }
                 try { $pending.LastError = $recoveryNote } catch { $pending | Add-Member -NotePropertyName LastError -NotePropertyValue $recoveryNote -Force }
@@ -4370,6 +4103,21 @@ function Repair-QOTPendingReplyQueueState {
 
     if ($updated) {
         Save-QOTickets -Database $db -SkipBodyOptimization -Quiet
+    }
+
+    if (-not $workerRunning) {
+        foreach ($ticket in $db.Tickets) {
+            foreach ($pending in @($ticket.PendingReplies)) {
+                if ($pending.SendState -ne "Sent") { continue }
+                # Rebuild local history from the delivery receipt without contacting Outlook.
+                $receipt = $pending.DeliveryReceipt
+                if (-not $receipt) { $receipt = [pscustomobject]@{ Success = $true } }
+                $completion = Complete-QOTTicketReplySend -Ticket $ticket -Subject $pending.Subject -Body $pending.Body -PendingReplyDraftId $pending.DraftId -SendResult $receipt -SentAt $pending.SentAt
+                if (-not $completion.Persisted) {
+                    Write-QOTicketsCoreLog ("Tickets: Unable to record delivered draft {0}: {1}" -f $pending.DraftId, $completion.PersistError) "WARN"
+                }
+            }
+        }
     }
 
     if (-not $Quiet -and ($updated -or $normalizedCount -gt 0 -or $recoveredCount -gt 0 -or $removedCount -gt 0)) {
@@ -4898,6 +4646,7 @@ function Retry-QOTTicketPendingReply {
     }
 
     $stateValue = Normalize-QOTTicketPendingReplyState -SendState ([string]$existingEntry.SendState)
+    if ($stateValue -eq "Sent") { throw "This reply was already sent." }
     if ($stateValue -eq "Sending" -and (Test-QOTicketsReplyQueueWorkerRunning)) {
         throw "Reply is already sending in the background."
     }
@@ -4971,6 +4720,9 @@ function Cancel-QOTTicketPendingReply {
     }
 
     $stateValue = Normalize-QOTTicketPendingReplyState -SendState ([string]$existingEntry.SendState)
+    if ($stateValue -eq "Sent") {
+        return [pscustomobject]@{ Cancelled = $false; Reason = "This reply was already delivered." }
+    }
     if ($stateValue -eq "Sending" -and (Test-QOTicketsReplyQueueWorkerRunning)) {
         return [pscustomobject]@{
             Cancelled = $false
@@ -4995,7 +4747,8 @@ function Complete-QOTTicketReplySend {
         [Parameter(Mandatory)][string]$Body,
         [Parameter(Mandatory)]$SendResult,
         [string]$Status,
-        [AllowNull()][string]$PendingReplyDraftId
+        [AllowNull()][string]$PendingReplyDraftId,
+        [AllowNull()][string]$SentAt
     )
 
     $result = $SendResult
@@ -5077,12 +4830,14 @@ function Complete-QOTTicketReplySend {
         try { if ($result.PSObject.Properties.Name -contains "SentEntryId") { $sentEntryId = ([string]($result.SentEntryId + "")).Trim() } } catch { $sentEntryId = "" }
         try { if ($result.PSObject.Properties.Name -contains "SentStoreId") { $sentStoreId = ([string]($result.SentStoreId + "")).Trim() } } catch { $sentStoreId = "" }
 
+        $sentUtc = Get-QOTTicketPendingReplyTimestampUtc -Value $SentAt
+        if ($sentUtc -eq [datetime]::MinValue) { $sentUtc = [datetime]::UtcNow }
         $replyEntry = [pscustomobject]@{
             ReplyId        = ([string]($PendingReplyDraftId + "")).Trim()
             Subject        = $subjectValue
             Body           = $bodyValue
-            CreatedAt      = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-            SentAt         = (Get-Date).ToUniversalTime().ToString("o")
+            CreatedAt      = $sentUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
+            SentAt         = $sentUtc.ToString("o")
             Type           = "TechnicianReply"
             EntryType      = "TechnicianReply"
             To             = $replyRecipient
@@ -5099,8 +4854,9 @@ function Complete-QOTTicketReplySend {
             }
         } catch { $existingReplies = @() }
 
-        $updatedReplies = @(Merge-QOTTicketActivityEntries -PrimaryEntries @($existingReplies) -SecondaryEntries @($replyEntry))
-        $ticketToUpdate.Replies = @($updatedReplies)
+        if (-not $PendingReplyDraftId -or $existingReplies.ReplyId -notcontains $PendingReplyDraftId) {
+            $ticketToUpdate.Replies = @(Merge-QOTTicketActivityEntries -PrimaryEntries @($existingReplies) -SecondaryEntries @($replyEntry))
+        }
 
         try {
             $firstResponseExists = $false
@@ -5200,7 +4956,9 @@ function Complete-QOTTicketReplySend {
         } else {
             $ticketToUpdate | Add-Member -NotePropertyName UpdatedAt -NotePropertyValue $updatedAtStamp -Force
         }
-        $null = Update-QOTicket -Ticket $ticketToUpdate
+        if (-not (Update-QOTicket -Ticket $ticketToUpdate)) {
+            throw "The ticket could not be found while recording the sent reply."
+        }
 
         if ($Ticket -and ($Ticket -ne $ticketToUpdate)) {
             try {
@@ -5251,7 +5009,8 @@ function Send-QOTicketReply {
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$Body,
         [string]$Status,
-        [AllowNull()][string]$PendingReplyDraftId
+        [AllowNull()][string]$PendingReplyDraftId,
+        [switch]$TransportOnly
     )
 
     $subjectValue = ([string]$Subject).Trim()
@@ -5327,6 +5086,21 @@ function Send-QOTicketReply {
         }
     } catch { $ticketToUpdate = $Ticket }
 
+    if ($TransportOnly -and $PendingReplyDraftId) {
+        $draft = $ticketToUpdate.PendingReplies | Where-Object DraftId -eq $PendingReplyDraftId | Select-Object -First 1
+        if (-not $draft -or $draft.SendState -ne "Sending") {
+            return [pscustomobject]@{ Success = $false; Note = "This draft is no longer awaiting delivery." }
+        }
+        $route = Get-QOTTicketPendingReplyMetadataFromTicket -Ticket $ticketToUpdate
+        if (-not $draft.To -and -not $draft.SourceMessageId -and -not $draft.MessageId) {
+            return [pscustomobject]@{ Success = $false; Note = "The saved reply has no recipient or Outlook reference. Review the ticket before resending." }
+        }
+        foreach ($field in "To","SenderMailbox","SourceMessageId","MessageId","ConversationId") {
+            if ([string]$draft.$field -ne [string]$route.$field) {
+                return [pscustomobject]@{ Success = $false; Note = "The ticket recipient, sending mailbox or original message changed. Review the ticket before resending." }
+            }
+        }
+    }
     $result = $null
     $null = Import-QOTOutlookIntegrationModule
     $preferredSenderMailbox = Get-QOTicketPreferredSenderMailbox -Ticket $ticketToUpdate
@@ -5417,7 +5191,7 @@ function Send-QOTicketReply {
     $success = $false
     try { $success = [bool]$result.Success } catch { $success = $false }
 
-    if ($success) {
+    if ($success -and -not $TransportOnly) {
         $result = Complete-QOTTicketReplySend -Ticket $Ticket -Subject $subjectValue -Body $bodyValue -SendResult $result -Status $Status -PendingReplyDraftId $PendingReplyDraftId
     }
 

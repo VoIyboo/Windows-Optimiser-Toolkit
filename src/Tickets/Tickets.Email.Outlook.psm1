@@ -682,23 +682,6 @@ function Normalize-QOTEmailAddress {
     return ""
 }
 
-function Get-QOTNormalizedEmailThreadSubject {
-    param([AllowNull()][string]$Subject)
-
-    $value = ([string]($Subject + "")).Trim().ToLowerInvariant()
-    if ([string]::IsNullOrWhiteSpace($value)) { return "" }
-
-    $changed = $true
-    while ($changed) {
-        $before = $value
-        $value = ($value -replace '^\s*(re|fw|fwd)\s*:\s*', '').Trim()
-        $changed = ($value -ne $before)
-    }
-
-    $value = ($value -replace '\s+', ' ').Trim()
-    return $value
-}
-
 function Limit-QOTOutlookText {
     param(
         [AllowNull()][string]$Value,
@@ -825,7 +808,6 @@ function Get-QOTTicketIdentityKeys {
     $conversationId = ""
     $emailFrom = ""
     $emailTo = ""
-    $senderEmail = ""
     $subject = ""
     $emailReceived = ""
 
@@ -845,7 +827,6 @@ function Get-QOTTicketIdentityKeys {
     } catch { }
     try { if ($Ticket.PSObject.Properties.Name -contains "EmailFrom") { $emailFrom = ([string]($Ticket.EmailFrom + "")).Trim().ToLowerInvariant() } } catch { }
     try { if ($Ticket.PSObject.Properties.Name -contains "EmailTo") { $emailTo = ([string]($Ticket.EmailTo + "")).Trim().ToLowerInvariant() } } catch { }
-    try { if ($Ticket.PSObject.Properties.Name -contains "SenderEmail") { $senderEmail = ([string]($Ticket.SenderEmail + "")).Trim().ToLowerInvariant() } } catch { }
     try {
         if ($Ticket.PSObject.Properties.Name -contains "Subject") {
             $subject = ([string]($Ticket.Subject + "")).Trim().ToLowerInvariant()
@@ -883,25 +864,10 @@ function Get-QOTTicketIdentityKeys {
         }
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($subject) -and
+    if ($keys.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($subject) -and
         -not [string]::IsNullOrWhiteSpace($emailFrom) -and
         -not [string]::IsNullOrWhiteSpace($emailReceived)) {
-        $keys.Add(("fallback:{0}|{1}|{2}" -f $emailFrom, $subject, $emailReceived.ToLowerInvariant())) | Out-Null
-    }
-
-    $threadSubject = Get-QOTNormalizedEmailThreadSubject -Subject $subject
-    if (-not [string]::IsNullOrWhiteSpace($threadSubject)) {
-        $participants = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($candidate in @($emailFrom, $emailTo, $senderEmail)) {
-            $email = Normalize-QOTEmailAddress -Value $candidate
-            if (-not [string]::IsNullOrWhiteSpace($email)) {
-                [void]$participants.Add($email)
-            }
-        }
-
-        foreach ($email in $participants) {
-            $keys.Add(("thread:{0}|{1}" -f $email, $threadSubject)) | Out-Null
-        }
+        $keys.Add(("fallback:{0}|{1}|{2}|{3}" -f $emailFrom, $emailTo, $subject, $emailReceived.ToLowerInvariant())) | Out-Null
     }
 
     $unique = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)

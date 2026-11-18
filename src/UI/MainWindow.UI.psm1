@@ -9,8 +9,6 @@ $script:AppsUIInitialised = $false
 $script:MainWindow = $null
 $script:SummaryTextBlock = $null
 $script:SummaryTimer = $null
-$script:PlayButtonTimer = $null
-$script:IsPlayRunning = $false
 $script:GlobalExceptionHandlersRegistered = $false
 $script:DispatcherUnhandledExceptionHandler = $null
 $script:AppDomainUnhandledExceptionHandler = $null
@@ -21,11 +19,7 @@ $script:QOTTaskbarIdentityApplied = $false
 $script:QOT_LogsButton = $null
 $script:QOT_LogsButtonHandler = $null
 $script:QOT_QuickSafeCleanupHandler = $null
-$script:QOT_QuickSafeCleanupResetInProgress = $false
 $script:QOT_RailNavigationSelectionHandler = $null
-$script:QOT_RailDragSource = $null
-$script:QOT_RailDragStartPoint = $null
-$script:QOT_RailIsDragging = $false
 $script:QOT_TaskResultsWindow = $null
 $script:QOT_TaskResultsSummaryText = $null
 $script:QOT_TaskResultsGrid = $null
@@ -677,10 +671,11 @@ function Sync-QOTRailNavigationState {
 }
 
 function Register-QOTRailIconReordering {
-    param([AllowNull()]$Host)
+    param([Alias('Host')][AllowNull()]$RailPanel)
 
-    if (-not ($Host -is [System.Windows.Controls.Panel])) { return }
+    if (-not ($RailPanel -is [System.Windows.Controls.Panel])) { return }
 
+    $dragState = @{ Source = $null; StartPoint = $null; IsDragging = $false }
     $dragDataFormat = "QuinnOptimiserToolkit.RailIcon"
     $getRailIconCurrentOrderCmd = ${function:Get-QOTRailIconCurrentOrder}
     $moveRailIconOrderCmd = ${function:Move-QOTRailIconOrder}
@@ -693,16 +688,16 @@ function Register-QOTRailIconReordering {
 
     $clearDragState = {
         try {
-            if ($script:QOT_RailDragSource -is [System.Windows.FrameworkElement]) {
-                try { $script:QOT_RailDragSource.Opacity = 1.0 } catch { }
-                try { $script:QOT_RailDragSource.RenderTransform = $null } catch { }
-                try { [System.Windows.Controls.Panel]::SetZIndex($script:QOT_RailDragSource, 0) } catch { }
-                try { $script:QOT_RailDragSource.ReleaseMouseCapture() } catch { }
+            if ($dragState.Source -is [System.Windows.FrameworkElement]) {
+                try { $dragState.Source.Opacity = 1.0 } catch { }
+                try { $dragState.Source.RenderTransform = $null } catch { }
+                try { [System.Windows.Controls.Panel]::SetZIndex($dragState.Source, 0) } catch { }
+                try { $dragState.Source.ReleaseMouseCapture() } catch { }
             }
         } catch { }
-        $script:QOT_RailDragSource = $null
-        $script:QOT_RailDragStartPoint = $null
-        $script:QOT_RailIsDragging = $false
+        $dragState.Source = $null
+        $dragState.StartPoint = $null
+        $dragState.IsDragging = $false
     }.GetNewClosure()
 
     $applyDragReorder = {
@@ -714,7 +709,7 @@ function Register-QOTRailIconReordering {
 
         $currentOrder = @()
         if ($getRailIconCurrentOrderCmd) {
-            $currentOrder = @(& $getRailIconCurrentOrderCmd -Host $Host)
+            $currentOrder = @(& $getRailIconCurrentOrderCmd -Host $RailPanel)
         }
         if ($currentOrder.Count -eq 0 -or -not ($currentOrder -contains $SourceName) -or -not ($currentOrder -contains $TargetName)) {
             return $false
@@ -728,20 +723,20 @@ function Register-QOTRailIconReordering {
 
         $appliedOrder = @()
         if ($applyRailIconOrderCmd) {
-            $appliedOrder = @(& $applyRailIconOrderCmd -Host $Host -Order $finalOrder)
+            $appliedOrder = @(& $applyRailIconOrderCmd -Host $RailPanel -Order $finalOrder)
         }
         if ($saveRailIconOrderCmd) {
             try { & $saveRailIconOrderCmd -Order $appliedOrder } catch { }
         }
         if ($updateRailIconHostLayoutCmd) {
-            try { & $updateRailIconHostLayoutCmd -Host $Host } catch { }
+            try { & $updateRailIconHostLayoutCmd -Host $RailPanel } catch { }
         }
         return $true
     }.GetNewClosure()
 
-    try { $Host.AllowDrop = $true } catch { }
+    try { $RailPanel.AllowDrop = $true } catch { }
 
-    foreach ($child in @($Host.Children)) {
+    foreach ($child in @($RailPanel.Children)) {
         if (-not ($child -is [System.Windows.FrameworkElement])) { continue }
 
         $sourceChild = $child
@@ -762,35 +757,35 @@ function Register-QOTRailIconReordering {
             if (-not ($dragSurface -is [System.Windows.FrameworkElement])) { continue }
 
             $dragSurface.Add_PreviewMouseLeftButtonDown({
-                param($sender, $args)
+                param($sender, $eventArgs)
                 & $clearDragState
-                $script:QOT_RailDragSource = $sourceChild
-                try { $script:QOT_RailDragStartPoint = $args.GetPosition($Host) } catch { $script:QOT_RailDragStartPoint = $null }
-                $script:QOT_RailIsDragging = $false
+                $dragState.Source = $sourceChild
+                try { $dragState.StartPoint = $eventArgs.GetPosition($RailPanel) } catch { $dragState.StartPoint = $null }
+                $dragState.IsDragging = $false
             }.GetNewClosure())
 
             $dragSurface.Add_PreviewMouseMove({
-                param($sender, $args)
-                if ($args.LeftButton -ne [System.Windows.Input.MouseButtonState]::Pressed) { return }
-                if ($script:QOT_RailDragSource -ne $sourceChild) { return }
+                param($sender, $eventArgs)
+                if ($eventArgs.LeftButton -ne [System.Windows.Input.MouseButtonState]::Pressed) { return }
+                if ($dragState.Source -ne $sourceChild) { return }
 
                 $sourceName = ""
                 if ($getRailHostChildKeyCmd) {
                     try { $sourceName = [string](& $getRailHostChildKeyCmd -Child $sourceChild) } catch { $sourceName = "" }
                 }
-                if ([string]::IsNullOrWhiteSpace($sourceName) -or -not $script:QOT_RailDragStartPoint) { return }
+                if ([string]::IsNullOrWhiteSpace($sourceName) -or -not $dragState.StartPoint) { return }
 
                 $currentPoint = $null
-                try { $currentPoint = $args.GetPosition($Host) } catch { $currentPoint = $null }
+                try { $currentPoint = $eventArgs.GetPosition($RailPanel) } catch { $currentPoint = $null }
                 if (-not $currentPoint) { return }
 
-                $deltaX = [math]::Abs($currentPoint.X - $script:QOT_RailDragStartPoint.X)
-                $deltaY = [math]::Abs($currentPoint.Y - $script:QOT_RailDragStartPoint.Y)
-                if ($deltaX -lt [SystemParameters]::MinimumHorizontalDragDistance -and $deltaY -lt [SystemParameters]::MinimumVerticalDragDistance) {
+                $deltaX = [math]::Abs($currentPoint.X - $dragState.StartPoint.X)
+                $deltaY = [math]::Abs($currentPoint.Y - $dragState.StartPoint.Y)
+                if ($deltaX -lt [System.Windows.SystemParameters]::MinimumHorizontalDragDistance -and $deltaY -lt [System.Windows.SystemParameters]::MinimumVerticalDragDistance) {
                     return
                 }
 
-                $script:QOT_RailIsDragging = $true
+                $dragState.IsDragging = $true
                 try { $sourceChild.Opacity = 0.55 } catch { }
                 try { [System.Windows.Controls.Panel]::SetZIndex($sourceChild, 20) } catch { }
 
@@ -798,7 +793,7 @@ function Register-QOTRailIconReordering {
                 try { $dragData.SetData($dragDataFormat, $sourceName) } catch { }
 
                 try {
-                    try { $args.Handled = $true } catch { }
+                    try { $eventArgs.Handled = $true } catch { }
                     $null = [System.Windows.DragDrop]::DoDragDrop(
                         $sourceChild,
                         $dragData,
@@ -811,22 +806,22 @@ function Register-QOTRailIconReordering {
             }.GetNewClosure())
 
             $dragSurface.Add_PreviewMouseLeftButtonUp({
-                param($sender, $args)
-                if ($script:QOT_RailDragSource -eq $sourceChild -and $script:QOT_RailIsDragging) {
-                    try { $args.Handled = $true } catch { }
+                param($sender, $eventArgs)
+                if ($dragState.Source -eq $sourceChild -and $dragState.IsDragging) {
+                    try { $eventArgs.Handled = $true } catch { }
                 }
-                if ($script:QOT_RailDragSource -eq $sourceChild) {
+                if ($dragState.Source -eq $sourceChild) {
                     & $clearDragState
                 }
             }.GetNewClosure())
         }
 
         $child.Add_DragOver({
-            param($sender, $args)
+            param($sender, $eventArgs)
             $sourceName = ""
             try {
-                if ($args.Data.GetDataPresent($dragDataFormat)) {
-                    $sourceName = [string]$args.Data.GetData($dragDataFormat)
+                if ($eventArgs.Data.GetDataPresent($dragDataFormat)) {
+                    $sourceName = [string]$eventArgs.Data.GetData($dragDataFormat)
                 }
             } catch { $sourceName = "" }
 
@@ -836,17 +831,17 @@ function Register-QOTRailIconReordering {
             }
 
             try {
-                $args.Effects = $(if ((-not [string]::IsNullOrWhiteSpace($sourceName)) -and $sourceName -ne $targetName) { [System.Windows.DragDropEffects]::Move } else { [System.Windows.DragDropEffects]::None })
+                $eventArgs.Effects = $(if ((-not [string]::IsNullOrWhiteSpace($sourceName)) -and $sourceName -ne $targetName) { [System.Windows.DragDropEffects]::Move } else { [System.Windows.DragDropEffects]::None })
             } catch { }
-            try { $args.Handled = $true } catch { }
+            try { $eventArgs.Handled = $true } catch { }
         }.GetNewClosure())
 
         $child.Add_Drop({
-            param($sender, $args)
+            param($sender, $eventArgs)
             $sourceName = ""
             try {
-                if ($args.Data.GetDataPresent($dragDataFormat)) {
-                    $sourceName = [string]$args.Data.GetData($dragDataFormat)
+                if ($eventArgs.Data.GetDataPresent($dragDataFormat)) {
+                    $sourceName = [string]$eventArgs.Data.GetData($dragDataFormat)
                 }
             } catch { $sourceName = "" }
 
@@ -857,7 +852,7 @@ function Register-QOTRailIconReordering {
 
             if (-not [string]::IsNullOrWhiteSpace($sourceName) -and -not [string]::IsNullOrWhiteSpace($targetName) -and $sourceName -ne $targetName) {
                 $dropPoint = $null
-                try { $dropPoint = $args.GetPosition($sourceChild) } catch { $dropPoint = $null }
+                try { $dropPoint = $eventArgs.GetPosition($sourceChild) } catch { $dropPoint = $null }
                 $placement = "Before"
                 if ($dropPoint) {
                     $targetHeight = 0.0
@@ -870,38 +865,38 @@ function Register-QOTRailIconReordering {
             }
 
             & $clearDragState
-            try { $args.Handled = $true } catch { }
+            try { $eventArgs.Handled = $true } catch { }
         }.GetNewClosure())
     }
 
-    $Host.Add_DragOver({
-        param($sender, $args)
+    $RailPanel.Add_DragOver({
+        param($sender, $eventArgs)
         $sourceName = ""
         try {
-            if ($args.Data.GetDataPresent($dragDataFormat)) {
-                $sourceName = [string]$args.Data.GetData($dragDataFormat)
+            if ($eventArgs.Data.GetDataPresent($dragDataFormat)) {
+                $sourceName = [string]$eventArgs.Data.GetData($dragDataFormat)
             }
         } catch { $sourceName = "" }
 
         try {
-            $args.Effects = $(if (-not [string]::IsNullOrWhiteSpace($sourceName)) { [System.Windows.DragDropEffects]::Move } else { [System.Windows.DragDropEffects]::None })
+            $eventArgs.Effects = $(if (-not [string]::IsNullOrWhiteSpace($sourceName)) { [System.Windows.DragDropEffects]::Move } else { [System.Windows.DragDropEffects]::None })
         } catch { }
-        try { $args.Handled = $true } catch { }
+        try { $eventArgs.Handled = $true } catch { }
     }.GetNewClosure())
 
-    $Host.Add_Drop({
-        param($sender, $args)
+    $RailPanel.Add_Drop({
+        param($sender, $eventArgs)
         $sourceName = ""
         try {
-            if ($args.Data.GetDataPresent($dragDataFormat)) {
-                $sourceName = [string]$args.Data.GetData($dragDataFormat)
+            if ($eventArgs.Data.GetDataPresent($dragDataFormat)) {
+                $sourceName = [string]$eventArgs.Data.GetData($dragDataFormat)
             }
         } catch { $sourceName = "" }
 
         if (-not [string]::IsNullOrWhiteSpace($sourceName)) {
             $currentOrder = @()
             if ($getRailIconCurrentOrderCmd) {
-                $currentOrder = @(& $getRailIconCurrentOrderCmd -Host $Host)
+                $currentOrder = @(& $getRailIconCurrentOrderCmd -Host $RailPanel)
             }
             if ($currentOrder.Count -gt 0 -and $currentOrder[-1] -ne $sourceName) {
                 $finalOrder = @()
@@ -909,15 +904,15 @@ function Register-QOTRailIconReordering {
                     $finalOrder = @(& $moveRailIconOrderCmd -Order $currentOrder -SourceName $sourceName -Placement "End")
                 }
                 if ($applyRailIconOrderCmd) {
-                    $appliedOrder = @(& $applyRailIconOrderCmd -Host $Host -Order $finalOrder)
+                    $appliedOrder = @(& $applyRailIconOrderCmd -Host $RailPanel -Order $finalOrder)
                     try { & $saveRailIconOrderCmd -Order $appliedOrder } catch { }
-                    try { & $updateRailIconHostLayoutCmd -Host $Host } catch { }
+                    try { & $updateRailIconHostLayoutCmd -Host $RailPanel } catch { }
                 }
             }
         }
 
         & $clearDragState
-        try { $args.Handled = $true } catch { }
+        try { $eventArgs.Handled = $true } catch { }
     }.GetNewClosure())
 }
 
@@ -1788,7 +1783,7 @@ function Show-QOTTaskResultsWindow {
                 [System.Windows.MessageBox]::Show("Log file was not found yet.", "Task Results", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
                 return
             }
-            Start-Process -FilePath "notepad.exe" -ArgumentList @($logPath) | Out-Null
+            Start-Process -FilePath "notepad.exe" -ArgumentList ('"{0}"' -f $logPath) | Out-Null
         } catch { }
     })
     $actions.Children.Add($btnOpenFile) | Out-Null
@@ -1796,7 +1791,7 @@ function Show-QOTTaskResultsWindow {
     $btnClose = New-Object System.Windows.Controls.Button
     $btnClose.Content = "Close"
     $btnClose.MinWidth = 90
-    $btnClose.Add_Click({ param($sender,$args) try { $window.Close() } catch { } })
+    $btnClose.Add_Click({ param($sender,$args) [System.Windows.Window]::GetWindow($sender).Close() })
     $actions.Children.Add($btnClose) | Out-Null
 
     $root.Children.Add($actions) | Out-Null
@@ -1804,10 +1799,13 @@ function Show-QOTTaskResultsWindow {
     $script:QOT_TaskResultsWindow = $window
     try {
         $window.Add_Closed({
-            try { $script:QOT_TaskResultsWindow = $null } catch { }
-            try { $script:QOT_TaskResultsSummaryText = $null } catch { }
-            try { $script:QOT_TaskResultsGrid = $null } catch { }
-        }.GetNewClosure())
+            param($sender,$eventArgs)
+            if ([object]::ReferenceEquals($sender, $script:QOT_TaskResultsWindow)) {
+                $script:QOT_TaskResultsWindow = $null
+                $script:QOT_TaskResultsSummaryText = $null
+                $script:QOT_TaskResultsGrid = $null
+            }
+        })
     } catch { }
 
     Update-QOTTaskResultsWindowLiveState
@@ -2396,7 +2394,6 @@ function Run-QOTSelectedTasks {
         throw 'Get-QOTActionDefinition is unavailable. Action registry did not load correctly.'
     }
 
-    $selectedEntries = @()
     if ($PSBoundParameters.ContainsKey('SelectedEntries') -and $null -ne $SelectedEntries) {
         $selectedEntries = @($SelectedEntries)
     }
@@ -2450,6 +2447,7 @@ function Run-QOTSelectedTasks {
         } catch { }
     }.GetNewClosure()
 
+    $writeWaitLog = ${function:Write-QOTRuntimeLogSafe}
     $invokeTaskWithUiPump = {
         param(
             [Parameter(Mandatory)][string]$ScriptPath,
@@ -2473,6 +2471,7 @@ function Run-QOTSelectedTasks {
         try {
             $async = $ps.BeginInvoke()
             $startedAt = Get-Date
+            $timedOut = $false
 
             while ($true) {
                 if ($async.IsCompleted) { break }
@@ -2486,17 +2485,19 @@ function Run-QOTSelectedTasks {
                     try { $sender.Stop() } catch { }
                     try { $frame.Continue = $false } catch { }
                 }.GetNewClosure())
-                try { Register-QOTMainWindowTimer -Timer $yieldTimer } catch { }
                 try { $yieldTimer.Start() } catch { }
-                [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+                try { [System.Windows.Threading.Dispatcher]::PushFrame($frame) }
+                finally { $yieldTimer.Stop() }
 
-                if (((Get-Date) - $startedAt).TotalSeconds -ge $TimeoutSeconds) {
-                    try { $ps.Stop() } catch { }
-                    throw ("Timed out after {0} seconds" -f [int]$TimeoutSeconds)
+                if (!$async.IsCompleted -and !$timedOut -and ((Get-Date) - $startedAt).TotalSeconds -ge $TimeoutSeconds) {
+                    $timedOut = $true
+                    try { & $writeWaitLog "Action exceeded its time limit. Waiting for it to finish before continuing." 'WARN' } catch { }
                 }
             }
 
-            return @($ps.EndInvoke($async))
+            $output = @($ps.EndInvoke($async))
+            if ($timedOut) { throw ("Timed out after {0} seconds. The action has now finished." -f $TimeoutSeconds) }
+            return $output
         }
         finally {
             try { $ps.Dispose() } catch { }
@@ -2710,7 +2711,6 @@ function Start-QOTSelectedTasksAsync {
         throw 'Get-QOTActionDefinition is unavailable. Action registry did not load correctly.'
     }
 
-    $selectedEntries = @()
     if ($PSBoundParameters.ContainsKey('SelectedEntries') -and $null -ne $SelectedEntries) {
         $selectedEntries = @($SelectedEntries)
     }
@@ -2836,6 +2836,7 @@ function Start-QOTSelectedTasksAsync {
         CurrentActionId = ""
         CurrentTaskName = ""
         CurrentTaskStartedAt = $null
+        TimeoutReason   = $null
         TaskTimeoutSeconds = $taskTimeoutSeconds
         WorkerRunspace  = $null
         WorkerPowerShell = $null
@@ -2870,7 +2871,9 @@ function Start-QOTSelectedTasksAsync {
         } catch { }
     }.GetNewClosure()
 
-    $script:QOT_TaskRunnerState = $state
+    $runnerVariable = Get-Variable -Name QOT_TaskRunnerState -Scope Script
+    $timersVariable = Get-Variable -Name ActiveTimers -Scope Script
+    $runnerVariable.Value = $state
 
     $disposeWorkerInvocation = {
         if ($state.WorkerPowerShell) {
@@ -2990,10 +2993,14 @@ function Start-QOTSelectedTasksAsync {
         }
 
         if ($state.PollTimer) {
-            try { $state.PollTimer.Stop() } catch { }
+            $state.PollTimer.Stop()
+            $state.PollTimer.Remove_Tick($state.PollTickHandler)
+            $timersVariable.Value.Remove($state.PollTimer)
+            $state.PollTickHandler = $null
+            $state.PollTimer = $null
         }
         & $disposeWorker
-        $script:QOT_TaskRunnerState = $null
+        $runnerVariable.Value = $null
 
         try {
             if ($state.OnCompleted) {
@@ -3010,7 +3017,6 @@ function Start-QOTSelectedTasksAsync {
         }
     }.GetNewClosure()
 
-    $startNext = $null
     $startNext = {
         while ($true) {
             $total = [int]@($state.SelectedEntries).Count
@@ -3025,7 +3031,7 @@ function Start-QOTSelectedTasksAsync {
             if ([string]::IsNullOrWhiteSpace($actionId)) {
                 $state.CurrentActionId = "<missing>"
                 $state.CurrentTaskName = "Unknown task"
-                & $applyOutcome @([pscustomobject]@{ Status = "FAILED"; Reason = "Missing action id" })
+                & $applyOutcome ([pscustomobject]@{ Status = "FAILED"; Reason = "Missing action id" })
                 $state.CurrentIndex++
                 & $updateProgress
                 continue
@@ -3035,7 +3041,7 @@ function Start-QOTSelectedTasksAsync {
             if (-not $definition) {
                 $state.CurrentActionId = $actionId
                 $state.CurrentTaskName = $actionId
-                & $applyOutcome @([pscustomobject]@{ Status = "FAILED"; Reason = "Action definition missing: $actionId" })
+                & $applyOutcome ([pscustomobject]@{ Status = "FAILED"; Reason = "Action definition missing: $actionId" })
                 $state.CurrentIndex++
                 & $updateProgress
                 continue
@@ -3046,12 +3052,13 @@ function Start-QOTSelectedTasksAsync {
             $state.CurrentActionId = $actionId
             $state.CurrentTaskName = $taskName
             $state.CurrentTaskStartedAt = Get-Date
+            $state.TimeoutReason = $null
 
             & $writeRuntimeSafe ("Now doing task: {0}" -f $taskName) 'INFO'
 
             if ([string]::IsNullOrWhiteSpace($scriptPath) -or (-not (Test-Path -LiteralPath $scriptPath))) {
                 $reason = if ([string]::IsNullOrWhiteSpace($scriptPath)) { "No script path found for action '$actionId'." } else { "Script path does not exist: $scriptPath" }
-                & $applyOutcome @([pscustomobject]@{ Status = "FAILED"; Reason = $reason })
+                & $applyOutcome ([pscustomobject]@{ Status = "FAILED"; Reason = $reason })
                 $state.CurrentIndex++
                 & $updateProgress
                 continue
@@ -3072,14 +3079,14 @@ function Start-QOTSelectedTasksAsync {
                 }
 
                 $appsOutcome = if ($null -ne $resolveOutcomeCmd) { & $resolveOutcomeCmd -Result $appsResult -Error $appsError } else { Resolve-QOTTaskExecutionOutcome -Result $appsResult -Error $appsError }
-                & $applyOutcome @($appsOutcome)
+                & $applyOutcome $appsOutcome
                 $state.CurrentIndex++
                 & $updateProgress
                 continue
             }
 
             if (-not (& $ensureWorkerRunspace)) {
-                & $applyOutcome @([pscustomobject]@{ Status = "FAILED"; Reason = "Worker runspace could not be initialised." })
+                & $applyOutcome ([pscustomobject]@{ Status = "FAILED"; Reason = "Worker runspace could not be initialised." })
                 $state.CurrentIndex++
                 & $updateProgress
                 continue
@@ -3095,73 +3102,6 @@ function Start-QOTSelectedTasksAsync {
 
             $state.WorkerPowerShell = $ps
             $state.WorkerAsyncResult = $ps.BeginInvoke()
-            if (-not $state.PollTimer) {
-                $state.PollTimer = [System.Windows.Threading.DispatcherTimer]::new()
-                $state.PollTimer.Interval = [TimeSpan]::FromMilliseconds(150)
-                $state.PollTickHandler = {
-                    if ($null -eq $state.WorkerAsyncResult) { return }
-                    if ($state.CurrentTaskStartedAt) {
-                        try {
-                            $elapsedSeconds = ((Get-Date) - ([datetime]$state.CurrentTaskStartedAt)).TotalSeconds
-                            if ($elapsedSeconds -ge [double]$state.TaskTimeoutSeconds) {
-                                try { $state.PollTimer.Stop() } catch { }
-                                try { & $disposeWorker } catch { }
-                                $timeoutReason = ("Timed out after {0} seconds" -f [int]$state.TaskTimeoutSeconds)
-                                try { & $writeRuntimeSafe ("Task timed out: {0} ({1})" -f $state.CurrentTaskName, $timeoutReason) 'ERROR' } catch { }
-                                try { & $applyOutcome @([pscustomobject]@{ Status = "FAILED"; Reason = $timeoutReason }) } catch { }
-                                try { $state.CurrentIndex++ } catch { }
-                                try { & $updateProgress } catch { }
-                                try { & $startNext } catch { try { & $completeRun } catch { } }
-                                return
-                            }
-                        } catch { }
-                    }
-                    if (-not $state.WorkerAsyncResult.IsCompleted) { return }
-
-                    try { $state.PollTimer.Stop() } catch { }
-
-                    $workerResult = $null
-                    $workerError = $null
-                    try {
-                        $output = @($state.WorkerPowerShell.EndInvoke($state.WorkerAsyncResult))
-                        if ($output.Count -gt 0) {
-                            $workerResult = $output
-                        }
-                    }
-                    catch {
-                        $workerError = $_.Exception
-                    }
-                    finally {
-                        try { & $disposeWorkerInvocation } catch { }
-                        $state.CurrentTaskStartedAt = $null
-                    }
-
-                    try {
-                        $outcome = if ($null -ne $resolveOutcomeCmd) { & $resolveOutcomeCmd -Result $workerResult -Error $workerError } else { Resolve-QOTTaskExecutionOutcome -Result $workerResult -Error $workerError }
-                        & $applyOutcome @($outcome)
-                    }
-                    catch {
-                        try {
-                            & $writeRuntimeSafe ("Async task runner callback failed for task '{0}': {1}" -f $state.CurrentTaskName, $_.Exception.Message) 'ERROR'
-                        } catch { }
-                        try { $state.FailedCount++ } catch { }
-                        try {
-                            if ($null -ne $addTaskLogEntryCmd) {
-                                & $addTaskLogEntryCmd -TaskName $state.CurrentTaskName -Status 'FAILED' -Reason $_.Exception.Message
-                            } else {
-                                Add-QOTTaskRunLogEntry -TaskName $state.CurrentTaskName -Status 'FAILED' -Reason $_.Exception.Message
-                            }
-                        } catch { }
-                    }
-
-                    try { $state.CurrentIndex++ } catch { }
-                    try { & $updateProgress } catch { }
-                    try { & $startNext } catch { try { & $completeRun } catch { } }
-                }.GetNewClosure()
-                $state.PollTimer.Add_Tick($state.PollTickHandler)
-                try { Register-QOTMainWindowTimer -Timer $state.PollTimer } catch { }
-            }
-
             try { $state.PollTimer.Start() } catch { }
             return
         }
@@ -3174,6 +3114,67 @@ function Start-QOTSelectedTasksAsync {
         & $completeRun
         return $true
     }
+
+    $state.PollTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $state.PollTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+    $state.PollTickHandler = {
+        if ($null -eq $state.WorkerAsyncResult) { return }
+        if (-not $state.WorkerAsyncResult.IsCompleted) {
+            if (!$state.TimeoutReason -and ((Get-Date) - $state.CurrentTaskStartedAt).TotalSeconds -ge $state.TaskTimeoutSeconds) {
+                # Dispose/Stop can wait on an uninterruptible native or .NET call.
+                # Keep the dispatcher alive and serialize the remaining actions.
+                $state.TimeoutReason = "Timed out after $($state.TaskTimeoutSeconds) seconds"
+                & $writeRuntimeSafe ("{0}: {1}. Waiting for the action to finish." -f $state.CurrentTaskName, $state.TimeoutReason) 'WARN'
+            }
+            return
+        }
+
+        try { $state.PollTimer.Stop() } catch { }
+
+        $workerResult = $null
+        $workerError = $null
+        try {
+            $output = @($state.WorkerPowerShell.EndInvoke($state.WorkerAsyncResult))
+            if ($output.Count -gt 0) {
+                $workerResult = $output
+            }
+        }
+        catch {
+            $workerError = $_.Exception
+        }
+        finally {
+            try { & $disposeWorkerInvocation } catch { }
+            $state.CurrentTaskStartedAt = $null
+        }
+
+        try {
+            $outcome = if ($null -ne $resolveOutcomeCmd) { & $resolveOutcomeCmd -Result $workerResult -Error $workerError } else { Resolve-QOTTaskExecutionOutcome -Result $workerResult -Error $workerError }
+            if ($state.TimeoutReason) {
+                $detail = "$($state.TimeoutReason). Final action result: $($outcome.Status) $($outcome.Reason)".Trim()
+                $outcome = [pscustomobject]@{ Status='FAILED'; Reason=$detail }
+            }
+            & $applyOutcome $outcome
+        }
+        catch {
+            try {
+                & $writeRuntimeSafe ("Async task runner callback failed for task '{0}': {1}" -f $state.CurrentTaskName, $_.Exception.Message) 'ERROR'
+            } catch { }
+            try { $state.FailedCount++ } catch { }
+            try {
+                if ($null -ne $addTaskLogEntryCmd) {
+                    & $addTaskLogEntryCmd -TaskName $state.CurrentTaskName -Status 'FAILED' -Reason $_.Exception.Message
+                } else {
+                    Add-QOTTaskRunLogEntry -TaskName $state.CurrentTaskName -Status 'FAILED' -Reason $_.Exception.Message
+                }
+            } catch { }
+        }
+
+        try { $state.CurrentIndex++ } catch { }
+        try { & $updateProgress } catch { }
+        try { & $startNext } catch { try { & $completeRun } catch { } }
+    }.GetNewClosure()
+    $state.PollTimer.Add_Tick($state.PollTickHandler)
+    try { Register-QOTMainWindowTimer -Timer $state.PollTimer } catch { }
 
     & $startNext
     return $true
@@ -4111,18 +4112,18 @@ function Start-QOTMainWindow {
     foreach ($dragSurface in @($windowDragSurface, $headerContentDragSurface)) {
         if (-not $dragSurface) { continue }
         $dragSurface.Add_PreviewMouseLeftButtonDown({
-            param($sender, $args)
-            if (& $isWindowChromeButtonSource -Element $args.OriginalSource) { return }
+            param($sender, $eventArgs)
+            if (& $isWindowChromeButtonSource -Element $eventArgs.OriginalSource) { return }
 
-            if ($args.ClickCount -ge 2) {
+            if ($eventArgs.ClickCount -ge 2) {
                 & $toggleWindowStateSafe
-                try { $args.Handled = $true } catch { }
+                try { $eventArgs.Handled = $true } catch { }
                 return
             }
 
             try {
                 $window.DragMove()
-                $args.Handled = $true
+                $eventArgs.Handled = $true
             } catch { }
         }.GetNewClosure())
     }
@@ -4435,7 +4436,6 @@ function Start-QOTMainWindow {
         $setUiEnabledCmd = Resolve-QOTInvokableCommand -Name "Set-QOTUIEnabledState" -LookupErrorAction Stop
         $setHitTestVisibilityCmd = Resolve-QOTInvokableCommand -Name "Set-QOTHitTestVisibility" -LookupErrorAction Stop
         $getSelectedActionsCmd = Resolve-QOTInvokableCommand -Name "Get-QOTSelectedActionsInExecutionOrder" -LookupErrorAction SilentlyContinue
-        $testAnyActionsSelectedCmd = Resolve-QOTInvokableCommand -Name "Test-QOTAnyActionsSelected" -LookupErrorAction SilentlyContinue
         $startSelectedTasksAsyncCmd = Resolve-QOTInvokableCommand -Name "Start-QOTSelectedTasksAsync" -LookupErrorAction SilentlyContinue
         $runSelectedTasksCmd = Resolve-QOTInvokableCommand -Name "Run-QOTSelectedTasks" -LookupErrorAction Stop
         $playCompletionSoundCmd = Resolve-QOTInvokableCommand -Name "Invoke-QOTPlayCompletionSound" -LookupErrorAction Stop
@@ -4467,140 +4467,69 @@ function Start-QOTMainWindow {
         $null = & $setHitTestVisibilityCmd -Control $btnPlay -IsHitTestVisible $true
         & $setPlayProgressSafe 0
 
-        $playClickHandler = [System.Windows.RoutedEventHandler]{
-            param($sender, $args)
+        # The routed events and worker completion execute in separate closure scopes.
+        # Share one object so Play and Quick clean cannot start overlapping batches.
+        $playState = @{ Running = $false }
+        $finishPlay = {
+            param([bool]$PlaySound = $true)
+            if (!$playState.Running) { return }
+            $playState.Running = $false
+            & $setPlayProgressSafe 0
+            $null = & $setUiEnabledCmd -Control $btnPlay -IsEnabled $true
+            $null = & $setHitTestVisibilityCmd -Control $btnPlay -IsHitTestVisible $true
+            if ($quickSafeCleanup) {
+                $quickSafeCleanup.IsChecked = $false
+                $quickSafeCleanup.IsEnabled = $true
+            }
+            if ($PlaySound) { try { & $playCompletionSoundCmd } catch { } }
+        }.GetNewClosure()
 
-            & $runtimeLoggerSafe "User clicked Play button" "INFO"
-            $playRunCompleted = $false
-            $completePlayRun = {
-                param([bool]$PlaySound = $true)
-                if ($playRunCompleted) { return }
-                $playRunCompleted = $true
-
-                if ($script:PlayButtonTimer) {
-                    try { $script:PlayButtonTimer.Stop() } catch { }
-                    $script:PlayButtonTimer = $null
-                }
-                & $setPlayProgressSafe 0
-                $script:IsPlayRunning = $false
-                $null = & $setUiEnabledCmd -Control $btnPlay -IsEnabled $true
-                $null = & $setHitTestVisibilityCmd -Control $btnPlay -IsHitTestVisible $true
-                if ($PlaySound) {
-                    try { & $playCompletionSoundCmd } catch { }
-                }
-            }.GetNewClosure()
-
-            try {
-                if ($script:IsPlayRunning) {
-                    & $runtimeLoggerSafe "Play click ignored because tasks are already running." "DEBUG"
-                    return
-                }
-
-                $activeWindow = $script:MainWindow
-                if (-not $activeWindow) {
-                    $activeWindow = [System.Windows.Window]::GetWindow($sender)
-                }
-                if (-not $activeWindow) {
-                    throw "Main window reference is not available for Play button execution."
-                }
-
-                $selectedCount = $null
-                try {
-                    if ($getSelectedActionsCmd) {
-                        $selectedCount = @(& $getSelectedActionsCmd -Window $activeWindow).Count
-                    }
-                    elseif ($testAnyActionsSelectedCmd) {
-                        $selectedCount = if ([bool](& $testAnyActionsSelectedCmd -Window $activeWindow)) { 1 } else { 0 }
-                    }
-                }
-                catch {
-                    $selectedCount = $null
-                    & $runtimeLoggerSafe ("Failed to inspect selected actions before Play: {0}" -f $_.Exception.Message) "WARN"
-                }
-
-                if ($null -ne $selectedCount -and [int]$selectedCount -le 0) {
-                    if ($executionMessage) {
-                        $executionMessage.Text = "Select at least one option before pressing Play."
-                        $executionMessage.Visibility = [System.Windows.Visibility]::Visible
-                    }
-                    & $runtimeLoggerSafe "Play click ignored because no actions are selected." "INFO"
-                    $script:IsPlayRunning = $false
-                    $null = & $setUiEnabledCmd -Control $btnPlay -IsEnabled $true
-                    $null = & $setHitTestVisibilityCmd -Control $btnPlay -IsHitTestVisible $true
-                    & $setPlayProgressSafe 0
-                    return
-                }
-
+        $beginPlay = {
+            param([object[]]$Entries)
+            if ($playState.Running) { return }
+            if ($Entries.Count -eq 0) {
                 if ($executionMessage) {
-                    $executionMessage.Visibility = [System.Windows.Visibility]::Collapsed
-                    $executionMessage.Text = ""
+                    $executionMessage.Text = "Select at least one option before pressing Play."
+                    $executionMessage.Visibility = [System.Windows.Visibility]::Visible
                 }
+                return
+            }
 
-                $script:IsPlayRunning = $true
+            $playState.Running = $true
+            try {
+                if ($executionMessage) { $executionMessage.Visibility = [System.Windows.Visibility]::Collapsed }
                 & $setPlayProgressSafe 0
-
                 $null = & $setUiEnabledCmd -Control $btnPlay -IsEnabled $false
                 $null = & $setHitTestVisibilityCmd -Control $btnPlay -IsHitTestVisible $false
+                if ($quickSafeCleanup) { $quickSafeCleanup.IsEnabled = $false }
 
-                $asyncStarted = $false
-                if ($startSelectedTasksAsyncCmd) {
-                    try {
-                        $onCompleted = {
-                            try { & $completePlayRun $true } catch { }
-                        }.GetNewClosure()
-                        $asyncStarted = [bool](& $startSelectedTasksAsyncCmd -Window $activeWindow -ProgressPath $playProgressPath -ProgressClip $playProgressClip -OnCompleted $onCompleted)
-                        if ($asyncStarted) {
-                            if ($script:PlayButtonTimer) {
-                                try { $script:PlayButtonTimer.Stop() } catch { }
-                                $script:PlayButtonTimer = $null
-                            }
-
-                            $watchdog = [System.Windows.Threading.DispatcherTimer]::new()
-                            $watchdog.Interval = [TimeSpan]::FromMilliseconds(350)
-                            $watchdog.Add_Tick({
-                                if (-not $script:IsPlayRunning) {
-                                    try { $watchdog.Stop() } catch { }
-                                    $script:PlayButtonTimer = $null
-                                    return
-                                }
-
-                                if ($script:QOT_TaskRunnerState) {
-                                    return
-                                }
-
-                                $isDisabled = $false
-                                try { $isDisabled = -not [bool]$btnPlay.IsEnabled } catch { $isDisabled = $false }
-                                if (-not $isDisabled) {
-                                    try { $watchdog.Stop() } catch { }
-                                    $script:PlayButtonTimer = $null
-                                    return
-                                }
-
-                                & $runtimeLoggerSafe "Play button watchdog restoring UI after async runner completed without a clean callback." "WARN"
-                                try { $watchdog.Stop() } catch { }
-                                $script:PlayButtonTimer = $null
-                                try { & $completePlayRun $false } catch { }
-                            }.GetNewClosure())
-
-                            $script:PlayButtonTimer = $watchdog
-                            try { Register-QOTMainWindowTimer -Timer $script:PlayButtonTimer } catch { }
-                            try { $script:PlayButtonTimer.Start() } catch { }
-                        }
-                    } catch {
-                        $asyncStarted = $false
-                        & $runtimeLoggerSafe ("Async runner start failed; falling back to sync runner. {0}" -f $_.Exception.Message) "WARN"
-                    }
+                $runArgs = @{
+                    Window = $window
+                    ProgressPath = $playProgressPath
+                    ProgressClip = $playProgressClip
+                    SelectedEntries = $Entries
                 }
-
-                if (-not $asyncStarted) {
-                    & $runSelectedTasksCmd -Window $activeWindow -ProgressPath $playProgressPath -ProgressClip $playProgressClip
-                    & $completePlayRun $true
+                if ($startSelectedTasksAsyncCmd) {
+                    $null = & $startSelectedTasksAsyncCmd @runArgs -OnCompleted $finishPlay
+                }
+                else {
+                    & $runSelectedTasksCmd @runArgs
+                    & $finishPlay
                 }
             }
             catch {
-                & $runtimeLoggerSafe ("Play button handler failed: {0}" -f $_.Exception.Message) "ERROR"
-                & $completePlayRun $false
+                & $runtimeLoggerSafe ("Could not run selected tasks: {0}" -f $_.Exception.Message) "ERROR"
+                & $finishPlay $false
             }
+        }.GetNewClosure()
+
+        $playClickHandler = [System.Windows.RoutedEventHandler]{
+            if ($playState.Running) { return }
+            try {
+                $entries = @(& $getSelectedActionsCmd -Window $window)
+                & $beginPlay -Entries $entries
+            }
+            catch { & $runtimeLoggerSafe ("Could not read selected tasks: {0}" -f $_.Exception.Message) "ERROR" }
         }.GetNewClosure()
 
         $btnPlay.Add_Click($playClickHandler)
@@ -4627,96 +4556,11 @@ function Start-QOTMainWindow {
             $quickSafeCleanupHandler = [System.Windows.RoutedEventHandler]{
                 param($sender, $args)
 
-                if ($script:QOT_QuickSafeCleanupResetInProgress) { return }
-                if (-not ($sender -is [System.Windows.Controls.CheckBox]) -or $sender.IsChecked -ne $true) { return }
-
-                & $runtimeLoggerSafe "User clicked Quick clean." "INFO"
-
-                $quickRunCompleted = $false
-                $completeQuickRun = {
-                    param([bool]$PlaySound = $true)
-                    if ($quickRunCompleted) { return }
-                    $quickRunCompleted = $true
-
-                    & $setPlayProgressSafe 0
-                    $script:IsPlayRunning = $false
-                    $null = & $setUiEnabledCmd -Control $btnPlay -IsEnabled $true
-                    $null = & $setHitTestVisibilityCmd -Control $btnPlay -IsHitTestVisible $true
-                    try { $quickSafeCleanup.IsEnabled = $true } catch { }
-
-                    $script:QOT_QuickSafeCleanupResetInProgress = $true
-                    try { $quickSafeCleanup.IsChecked = $false } catch { }
-                    finally { $script:QOT_QuickSafeCleanupResetInProgress = $false }
-
-                    if ($PlaySound) {
-                        try { & $playCompletionSoundCmd } catch { }
-                    }
-                }.GetNewClosure()
-
-                try {
-                    if ($script:IsPlayRunning) {
-                        & $runtimeLoggerSafe "Quick clean ignored because tasks are already running." "DEBUG"
-                        $script:QOT_QuickSafeCleanupResetInProgress = $true
-                        try { $quickSafeCleanup.IsChecked = $false } catch { }
-                        finally { $script:QOT_QuickSafeCleanupResetInProgress = $false }
-                        return
-                    }
-
-                    $activeWindow = $script:MainWindow
-                    if (-not $activeWindow) {
-                        $activeWindow = [System.Windows.Window]::GetWindow($sender)
-                    }
-                    if (-not $activeWindow) {
-                        throw "Main window reference is not available for Quick clean execution."
-                    }
-
-                    $quickEntries = @(
-                        foreach ($actionId in $quickSafeActionIds) {
-                            [pscustomobject]@{
-                                Group    = "Quick Safe Cleanup"
-                                ActionId = [string]$actionId
-                                Item     = [pscustomobject]@{
-                                    ActionId = [string]$actionId
-                                    Label    = [string]$actionId
-                                }
-                            }
-                        }
-                    )
-
-                    if ($executionMessage) {
-                        $executionMessage.Visibility = [System.Windows.Visibility]::Collapsed
-                        $executionMessage.Text = ""
-                    }
-
-                    $script:IsPlayRunning = $true
-                    & $setPlayProgressSafe 0
-                    $null = & $setUiEnabledCmd -Control $btnPlay -IsEnabled $false
-                    $null = & $setHitTestVisibilityCmd -Control $btnPlay -IsHitTestVisible $false
-                    try { $quickSafeCleanup.IsEnabled = $false } catch { }
-
-                    $asyncStarted = $false
-                    if ($startSelectedTasksAsyncCmd) {
-                        try {
-                            $onCompleted = {
-                                try { & $completeQuickRun $true } catch { }
-                            }.GetNewClosure()
-                            $asyncStarted = [bool](& $startSelectedTasksAsyncCmd -Window $activeWindow -ProgressPath $playProgressPath -ProgressClip $playProgressClip -OnCompleted $onCompleted -SelectedEntries $quickEntries)
-                        }
-                        catch {
-                            $asyncStarted = $false
-                            & $runtimeLoggerSafe ("Quick clean async start failed; falling back to sync runner. {0}" -f $_.Exception.Message) "WARN"
-                        }
-                    }
-
-                    if (-not $asyncStarted) {
-                        & $runSelectedTasksCmd -Window $activeWindow -ProgressPath $playProgressPath -ProgressClip $playProgressClip -SelectedEntries $quickEntries
-                        & $completeQuickRun $true
-                    }
-                }
-                catch {
-                    & $runtimeLoggerSafe ("Quick clean handler failed: {0}" -f $_.Exception.Message) "ERROR"
-                    & $completeQuickRun $false
-                }
+                if ($playState.Running -or $sender.IsChecked -ne $true) { return }
+                $quickEntries = @(foreach ($actionId in $quickSafeActionIds) {
+                    [pscustomobject]@{ ActionId = $actionId; Group = "Quick Safe Cleanup" }
+                })
+                & $beginPlay -Entries $quickEntries
             }.GetNewClosure()
 
             $script:QOT_QuickSafeCleanupHandler = $quickSafeCleanupHandler
@@ -4919,18 +4763,19 @@ function Start-QOTMainWindow {
         $btnSettings = $btnSettingsNav
         $btnHelp     = $btnHelpNav
         
+        $openHiddenTab = ${function:Open-QOTHiddenTab}
         if ($btnSettings -and $tabs -and $tabSettings) {
             $btnSettings.Add_Click({
-                Open-QOTHiddenTab -Tabs $tabs -Tab $tabSettings
+                & $openHiddenTab -Tabs $tabs -Tab $tabSettings
                 & $syncRailNavigationSafe
-            })
+            }.GetNewClosure())
         }
 
         if ($btnHelp -and $tabs -and $tabHelp) {
             $btnHelp.Add_Click({
-                Open-QOTHiddenTab -Tabs $tabs -Tab $tabHelp
+                & $openHiddenTab -Tabs $tabs -Tab $tabHelp
                 & $syncRailNavigationSafe
-            })
+            }.GetNewClosure())
         }
     }
     else {
@@ -5137,16 +4982,11 @@ function Start-QOTMainWindow {
 
             # Belt-and-braces: clear the named script-level references too so the
             # rest of the cleanup logic below knows the timers have been stopped.
-            if ($script:PlayButtonTimer) {
-                try { $script:PlayButtonTimer.Stop() } catch { }
-                $script:PlayButtonTimer = $null
-            }
             if ($script:SummaryTimer) {
                 try { $script:SummaryTimer.Stop() } catch { }
                 $script:SummaryTimer = $null
             }
 
-            $script:IsPlayRunning = $false
             $script:MainWindow = $null
             $script:SummaryTextBlock = $null
             $script:QOT_LogsButton = $null
@@ -5247,7 +5087,7 @@ function Start-QOTMainWindow {
             # Some hosts create a bootstrap WPF app where ShowDialog can return
             # almost immediately without a visible window. Recover by forcing a
             # modeless show and waiting on a local dispatcher frame.
-            if ($showDialogCompleted -and (-not $window.IsVisible) -and $showDialogStopwatch.ElapsedMilliseconds -lt 1500) {
+            if ($showDialogCompleted -and $script:MainWindow -and (-not $window.IsVisible) -and $showDialogStopwatch.ElapsedMilliseconds -lt 1500) {
                 Write-QOTStartupTrace ("MainWindow.ShowDialog() returned in {0} ms with IsVisible={1}; forcing modeless fallback show." -f [math]::Round($showDialogStopwatch.Elapsed.TotalMilliseconds), $window.IsVisible) 'WARN'
                 try {
                     $window.Show()

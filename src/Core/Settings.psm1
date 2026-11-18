@@ -81,22 +81,64 @@ function Get-QOSettingsPath {
     return $script:SettingsPath
 }
 
-function Save-QOSettings {
+function Read-QOSettingsText {
+    param([string]$Path)
+
+    $stream = [IO.File]::Open($Path, 'Open', 'Read', ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        $reader = [IO.StreamReader]::new($stream, $true)
+        try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
+function Write-QOSettingsFile {
     param(
-        [Parameter(Mandatory)]
-        $Settings
+        [string]$Path,
+        [string]$Json,
+        [switch]$IfMissing,
+        [AllowEmptyString()][string]$DamagedText
     )
 
-    $path = Get-QOSettingsPath
-
-    $dir = Split-Path -Parent $path
-    if (-not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $dir = Split-Path -Parent $Path
+    $null = [IO.Directory]::CreateDirectory($dir)
+    $temp = Join-Path $dir ('.settings-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($Path).ToUpperInvariant())
+        $key = [BitConverter]::ToString($hash.ComputeHash($bytes)).Replace('-', '')
+    } finally { $hash.Dispose() }
+    $mutex = [Threading.Mutex]::new($false, ('Global\QOTSettings_' + $key))
+    $locked = $false
+    try {
+        try { $locked = $mutex.WaitOne([TimeSpan]::FromSeconds(10)) }
+        catch [Threading.AbandonedMutexException] { $locked = $true }
+        if (!$locked) { throw 'Timed out waiting to save toolkit settings.' }
+        $exists = [IO.File]::Exists($Path)
+        if ($IfMissing -and $exists) { return $false }
+        $backup = [System.Management.Automation.Language.NullString]::Value
+        if ($PSBoundParameters.ContainsKey('DamagedText')) {
+            # A writer may have replaced the settings since the original read.
+            if (!$exists -or (Read-QOSettingsText $Path) -cne $DamagedText) { return $false }
+            $backup = "$Path.bak_$([guid]::NewGuid().ToString('N'))"
+        }
+        [IO.File]::WriteAllText($temp, $Json, [Text.UTF8Encoding]::new($true))
+        if ($exists) { [IO.File]::Replace($temp, $Path, $backup) }
+        else { [IO.File]::Move($temp, $Path) }
+        return $true
+    } finally {
+        try { [IO.File]::Delete($temp) }
+        finally {
+            if ($locked) { $mutex.ReleaseMutex() }
+            $mutex.Dispose()
+        }
     }
+}
 
-    # Depth must be high enough for nested structures
-    $json = $Settings | ConvertTo-Json -Depth 20
-    Set-Content -LiteralPath $path -Value $json -Encoding UTF8
+function Save-QOSettings {
+    param([Parameter(Mandatory)]$Settings)
+
+    $json = ConvertTo-Json -InputObject $Settings -Depth 20
+    $null = Write-QOSettingsFile -Path (Get-QOSettingsPath) -Json $json
 }
 
 function New-QODefaultSettings {
@@ -232,23 +274,23 @@ function Confirm-QOSettingsNestedObject {
 
 function Get-QOSettings {
     $path = Get-QOSettingsPath
-    if (-not (Test-Path -LiteralPath $path)) {
-        return New-QODefaultSettings
-    }
-
-    try {
-        $json = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($json)) {
-            return New-QODefaultSettings
+    while ($true) {
+        try { $json = Read-QOSettingsText $path }
+        catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {
+            $defaults = New-QODefaultSettings -NoSave
+            if (Write-QOSettingsFile -Path $path -Json (ConvertTo-Json $defaults -Depth 20) -IfMissing) { return $defaults }
+            continue
         }
-
-        $settings = $json | ConvertFrom-Json -ErrorAction Stop
-
-        # If the JSON root parses as something that is NOT a structured object
-        # (e.g. a number, string, or array because the file is corrupt), we
-        # cannot meaningfully merge into it - rebuild from defaults.
-        if (-not (Test-QOSettingsIsObject -Value $settings)) {
-            return New-QODefaultSettings
+        # Windows PowerShell unwraps a single-element JSON array. Check the root as well.
+        $settings = $null
+        if ($json.TrimStart().StartsWith('{')) {
+            try { $settings = ConvertFrom-Json -InputObject $json -ErrorAction Stop }
+            catch [ArgumentException], [InvalidOperationException] { $settings = $null }
+        }
+        if (-not (Test-QOSettingsIsObject $settings)) {
+            $defaults = New-QODefaultSettings -NoSave
+            if (Write-QOSettingsFile -Path $path -Json (ConvertTo-Json $defaults -Depth 20) -DamagedText $json) { return $defaults }
+            continue
         }
 
         # Merge defaults so missing keys get added
@@ -361,15 +403,6 @@ function Get-QOSettings {
 
 
         return $settings
-    }
-    catch {
-        # Backup corrupted file then recreate
-        try {
-            $backupName = "{0}.bak_{1}" -f $path, (Get-Date -Format "yyyyMMddHHmmss")
-            Copy-Item -LiteralPath $path -Destination $backupName -ErrorAction SilentlyContinue
-        } catch { }
-
-        return New-QODefaultSettings
     }
 }
 
@@ -530,7 +563,7 @@ function Get-QOMonitoredMailboxAddresses {
 function Set-QOMonitoredMailboxAddresses {
     param(
         [Parameter(Mandatory)]
-        [string[]]$Addresses
+        [AllowEmptyCollection()][string[]]$Addresses
     )
 
     $s = Get-QOSettings
@@ -886,7 +919,7 @@ function Set-QOTabVisibilitySettings {
 function Set-QOMonitoredAddresses {
     param(
         [Parameter(Mandatory)]
-        [string[]]$Addresses
+        [AllowEmptyCollection()][string[]]$Addresses
     )
     return (Set-QOMonitoredMailboxAddresses -Addresses $Addresses)
 }
