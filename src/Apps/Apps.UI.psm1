@@ -197,7 +197,7 @@ function Initialize-QOTAppsGridsColumns {
 
         $AppsGrid.Columns.Add((New-Object System.Windows.Controls.DataGridTextColumn -Property @{
             Header     = "App"
-            Binding    = (New-Object System.Windows.Data.Binding "Name")
+            Binding    = (New-Object System.Windows.Data.Binding "DisplayName")
             Width      = "*"
             IsReadOnly = $true
         }))

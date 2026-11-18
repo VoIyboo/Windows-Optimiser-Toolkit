@@ -51,42 +51,61 @@ function Test-QOTWingetAvailable {
 function Get-QOTWingetInstalledIdSet {
     param(
         [int]$CacheMinutes = 10,
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 20,
         [switch]$ForceRefresh
     )
 
     if (-not $ForceRefresh) {
-        if ($script:QOT_WingetInstalledCache -and ((Get-Date) - $script:QOT_WingetInstalledCacheTime).TotalMinutes -lt $CacheMinutes) {
-            return $script:QOT_WingetInstalledCache
+        if (((Get-Date) - $script:QOT_WingetInstalledCacheTime).TotalMinutes -lt $CacheMinutes) {
+            return ,$script:QOT_WingetInstalledCache
         }
     }
 
     $set = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
 
-    if (-not (Test-QOTWingetAvailable)) {
-        $script:QOT_WingetInstalledCache     = $set
-        $script:QOT_WingetInstalledCacheTime = Get-Date
-        return $set
-    }
-
+    # Unavailable is distinct from a successful inventory containing zero packages.
+    $script:QOT_WingetInstalledCache = $null
+    $script:QOT_WingetInstalledCacheTime = Get-Date
     $winget = Get-QOTWingetPath
-
+    if (!$winget) { return $null }
+    $exportPath = Join-Path ([IO.Path]::GetTempPath()) ("qot-winget-{0}.json" -f [guid]::NewGuid())
+    $proc = [Diagnostics.Process]::new()
     try {
-        # Best effort parsing. Called only when requested.
-        $lines = @(& $winget list 2>$null)
-
-        foreach ($line in $lines) {
-            if ($line -match "([A-Za-z0-9]+\.[A-Za-z0-9][A-Za-z0-9\.\-_]+)") {
-                [void]$set.Add($matches[1])
+        $proc.StartInfo.FileName = $winget
+        $proc.StartInfo.Arguments = ('export --output "{0}" --disable-interactivity' -f $exportPath)
+        $proc.StartInfo.UseShellExecute = $false
+        $proc.StartInfo.CreateNoWindow = $true
+        $proc.StartInfo.RedirectStandardOutput = $true
+        $proc.StartInfo.RedirectStandardError = $true
+        [void]$proc.Start()
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+        if (!$proc.WaitForExit($TimeoutSeconds * 1000)) {
+            $proc.Kill()
+            [void]$proc.WaitForExit(1000)
+            throw "winget inventory timed out after $TimeoutSeconds seconds."
+        }
+        if ($proc.ExitCode -ne 0) { throw "winget export returned exit code $($proc.ExitCode)" }
+        $inventory = Get-Content -LiteralPath $exportPath -Encoding UTF8 -Raw | ConvertFrom-Json
+        if ($null -eq $inventory.Sources) { throw "Unrecognised winget inventory format." }
+        foreach ($source in $inventory.Sources) {
+            foreach ($package in $source.Packages) {
+                if ($package.PackageIdentifier) { [void]$set.Add($package.PackageIdentifier) }
             }
         }
     }
     catch {
-        try { Write-QLog ("winget list failed: {0}" -f $_.Exception.Message) "WARN" } catch { }
+        try { Write-QLog ("winget inventory unavailable: {0}" -f $_.Exception.Message) "WARN" } catch { }
+        return $null
+    }
+    finally {
+        $proc.Dispose()
+        if (Test-Path -LiteralPath $exportPath) { Remove-Item -LiteralPath $exportPath -Force -ErrorAction SilentlyContinue }
     }
 
     $script:QOT_WingetInstalledCache     = $set
     $script:QOT_WingetInstalledCacheTime = Get-Date
-    return $set
+    return ,$set
 }
 
 function Test-QOTWingetAppInstalled {
@@ -96,7 +115,7 @@ function Test-QOTWingetAppInstalled {
     )
 
     $set = Get-QOTWingetInstalledIdSet
-    return $set.Contains($WingetId)
+    return ($null -ne $set -and $set.Contains($WingetId))
 }
 
 # -------------------------------------------------------------------
@@ -110,7 +129,7 @@ function Get-QOTCommonAppsCatalogue {
         .NOTES
             - This function does NOT call winget.
             - Keeps the UI fast.
-            - Status defaults to Available.
+            - The grid shows Unknown until its background scan finishes.
     #>
 
     $apps = @(
@@ -147,7 +166,7 @@ function Get-QOTCommonAppsCatalogue {
         [pscustomobject]@{ IsSelected=$false; Name="Visual Studio Code";   WingetId="Microsoft.VisualStudioCode";  Category="Dev" }
         [pscustomobject]@{ IsSelected=$false; Name="Git";                  WingetId="Git.Git";                     Category="Dev" }
         [pscustomobject]@{ IsSelected=$false; Name="GitHub Desktop";       WingetId="GitHub.GitHubDesktop";        Category="Dev" }
-        [pscustomobject]@{ IsSelected=$false; Name="Python 3";             WingetId="Python.Python.3";             Category="Dev" }
+        [pscustomobject]@{ IsSelected=$false; Name="Python 3.14";          WingetId="Python.Python.3.14";             Category="Dev" }
         [pscustomobject]@{ IsSelected=$false; Name="Node.js LTS";          WingetId="OpenJS.NodeJS.LTS";           Category="Dev" }
         [pscustomobject]@{ IsSelected=$false; Name="PuTTY";                WingetId="PuTTY.PuTTY";                 Category="Dev" }
         [pscustomobject]@{ IsSelected=$false; Name="WinSCP";               WingetId="WinSCP.WinSCP";               Category="Dev" }
@@ -155,7 +174,7 @@ function Get-QOTCommonAppsCatalogue {
 
         # Cloud
         [pscustomobject]@{ IsSelected=$false; Name="OneDrive";             WingetId="Microsoft.OneDrive";          Category="Cloud" }
-        [pscustomobject]@{ IsSelected=$false; Name="Google Drive";         WingetId="Google.Drive";                Category="Cloud" }
+        [pscustomobject]@{ IsSelected=$false; Name="Google Drive";         WingetId="Google.GoogleDrive";                Category="Cloud" }
         [pscustomobject]@{ IsSelected=$false; Name="Dropbox";              WingetId="Dropbox.Dropbox";             Category="Cloud" }
     )
 
@@ -180,9 +199,9 @@ function Get-QOTCommonApps {
     if (-not $IncludeStatus) {
         foreach ($app in $catalogue) {
             if ($null -eq $app.PSObject.Properties["Status"]) {
-                $app | Add-Member -NotePropertyName Status -NotePropertyValue "Available" -Force
+                $app | Add-Member -NotePropertyName Status -NotePropertyValue "Unknown" -Force
             } else {
-                if ([string]::IsNullOrWhiteSpace([string]$app.Status)) { $app.Status = "Available" }
+                if ([string]::IsNullOrWhiteSpace([string]$app.Status)) { $app.Status = "Unknown" }
             }
 
             if ($null -eq $app.PSObject.Properties["IsInstallable"]) {
@@ -197,15 +216,13 @@ function Get-QOTCommonApps {
         return $catalogue
     }
 
-    $wingetOk = Test-QOTWingetAvailable
-    $set = $null
-    if ($wingetOk) { $set = Get-QOTWingetInstalledIdSet }
+    $set = Get-QOTWingetInstalledIdSet
 
     foreach ($app in $catalogue) {
         $installed = $false
         $status    = "Unknown"
 
-        if ($wingetOk) {
+        if ($null -ne $set) {
             $installed = $set.Contains($app.WingetId)
             $status = if ($installed) { "Installed" } else { "Available" }
         }
@@ -249,10 +266,12 @@ function Install-QOTCommonApp {
         "--id", $WingetId,
         "-e",
         "--silent",
+        "--disable-interactivity",
         "--accept-source-agreements",
         "--accept-package-agreements"
     )
 
+    if ($WingetId -notmatch '^[A-Za-z0-9][A-Za-z0-9.+_-]*$') { throw "Invalid winget package identifier." }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName               = $winget
     $psi.Arguments              = ($args -join " ")
@@ -264,21 +283,26 @@ function Install-QOTCommonApp {
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
 
-    [void]$proc.Start()
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
-
+    try {
+        [void]$proc.Start()
+        $outputRead = $proc.StandardOutput.ReadToEndAsync()
+        $errorRead = $proc.StandardError.ReadToEndAsync()
+        if (-not $proc.WaitForExit(600000)) { throw "winget is still running after 10 minutes. Check its status before retrying." }
+        $stdout = $outputRead.GetAwaiter().GetResult()
+        $stderr = $errorRead.GetAwaiter().GetResult()
+        $exitCode = $proc.ExitCode
+    }
+    finally { $proc.Dispose() }
     if ($stdout) { try { Write-QLog ("winget output: {0}" -f $stdout.Trim()) "DEBUG" } catch { } }
 
-    if ($proc.ExitCode -ne 0) {
+    if ($exitCode -ne 0) {
         if ($stderr) { try { Write-QLog ("winget error: {0}" -f $stderr.Trim()) "ERROR" } catch { } }
-        throw ("winget returned exit code {0} while installing {1} [{2}]." -f $proc.ExitCode, $Name, $WingetId)
+        throw ("winget returned exit code {0} while installing {1} [{2}]." -f $exitCode, $Name, $WingetId)
     }
 
     try { Write-QLog ("Install succeeded: {0} [{1}]" -f $Name, $WingetId) "INFO" } catch { }
 
-    try { $null = Get-QOTWingetInstalledIdSet -ForceRefresh } catch { }
+    if ($null -ne $script:QOT_WingetInstalledCache) { [void]$script:QOT_WingetInstalledCache.Add($WingetId) }
 }
 
 Export-ModuleMember -Function `

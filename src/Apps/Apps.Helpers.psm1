@@ -30,7 +30,7 @@ function Get-QOTNormalizedAppName {
 
     if ([string]::IsNullOrWhiteSpace($Name)) { return "" }
     $normalized = $Name.ToLowerInvariant()
-    $normalized = $normalized -replace "[^a-z0-9]", ""
+    $normalized = $normalized -replace "[^\p{L}\p{Nd}+#]", ""
     return $normalized
 }
 
@@ -48,7 +48,7 @@ function Get-QOTInstalledAppNameSet {
         }
     }
 
-    return $set
+    return ,$set
 }
 
 function Get-QOTInstalledAppDataset {
@@ -134,6 +134,10 @@ function Update-QOTCommonAppsInstallStatus {
     foreach ($item in $commonApps) {
         if (-not $item) { continue }
         $installed = Test-QOTCommonAppInstalled -CommonApp $item -InstalledDataset $dataset
+        if (-not $installed -and $null -ne $Global:QOT_ScannedWingetIds -and $item.WingetId) {
+            $installed = $Global:QOT_ScannedWingetIds.Contains([string]$item.WingetId)
+        }
+        if (-not $Global:QOT_WingetInventoryAvailable -and $item.Status -eq "Installed") { $installed = $true }
 
         if ($null -eq $item.PSObject.Properties["Status"]) {
             $item | Add-Member -NotePropertyName Status -NotePropertyValue "" -Force
@@ -145,7 +149,13 @@ function Update-QOTCommonAppsInstallStatus {
             $item | Add-Member -NotePropertyName StatusText -NotePropertyValue "" -Force
         }
 
-        $item.Status = if ($installed) { "Installed" } else { "Available" }
+        if ($installed) {
+            $item.Status = "Installed"
+            $item.IsSelected = $false
+        }
+        elseif ($item.Status -ne "Failed") {
+            $item.Status = if ($Global:QOT_WingetInventoryAvailable) { "Available" } else { "Unknown" }
+        }
         $item.IsInstallable = -not $installed
         $item.StatusText = ("Status: {0}" -f $item.Status)
     }
@@ -163,22 +173,13 @@ function Resolve-QOTPathTokenFromCommandLine {
         $candidate = $candidate.Substring(1).Trim()
     }
 
-    if ($candidate.StartsWith('"')) {
-        $m = [regex]::Match($candidate, '^"([^"]+)"')
-        if ($m.Success) { $candidate = $m.Groups[1].Value }
+    if ($candidate -match '^"([^"]+)"') {
+        $candidate = $Matches[1]
     }
-    else {
-        if ($candidate -match '^[^ ]+\.(exe|ico|png|jpg|jpeg|bmp)') {
-            $candidate = $Matches[0]
-        }
-        else {
-            $candidate = ($candidate -split '\s+')[0]
-        }
+    elseif ($candidate -match '^(.+?\.(?:exe|ico|png|jpg|jpeg|bmp))(?=\s|,\s*-?\d+\s*$|$)') {
+        $candidate = $Matches[1]
     }
-
-    if ($candidate.Contains(',')) {
-        $candidate = ($candidate -split ',')[0]
-    }
+    else { return $null }
 
     $candidate = $candidate.Trim().Trim('"')
     if ([string]::IsNullOrWhiteSpace($candidate)) { return $null }
@@ -273,15 +274,17 @@ function ConvertTo-QOTAppIconImageSource {
             Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
             $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($Path)
             if ($ico) {
-                $bmp = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
-                    $ico.Handle,
-                    [System.Windows.Int32Rect]::Empty,
-                    [System.Windows.Media.Imaging.BitmapSizeOptions]::FromWidthAndHeight(20, 20)
-                )
-                if ($bmp) {
-                    $bmp.Freeze()
-                    $iconSource = $bmp
-                }
+                try {
+                    $bmp = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
+                        $ico.Handle,
+                        [System.Windows.Int32Rect]::Empty,
+                        [System.Windows.Media.Imaging.BitmapSizeOptions]::FromWidthAndHeight(20, 20)
+                    )
+                    if ($bmp) {
+                        $bmp.Freeze()
+                        $iconSource = $bmp
+                    }
+                } finally { $ico.Dispose() }
             }
         }
     }
@@ -298,6 +301,9 @@ function Ensure-QOTInstalledAppForGrid {
 
     if ($null -eq $App.PSObject.Properties["IsSelected"]) {
         $App | Add-Member -NotePropertyName IsSelected -NotePropertyValue $false -Force
+    }
+    if ($null -eq $App.PSObject.Properties["DisplayName"]) {
+        $App | Add-Member -NotePropertyName DisplayName -NotePropertyValue $App.Name
     }
     if ($null -eq $App.PSObject.Properties["Publisher"]) {
         $App | Add-Member -NotePropertyName Publisher -NotePropertyValue "" -Force
@@ -388,7 +394,7 @@ function Ensure-QOTCommonAppForGrid {
 function Write-QOTAppsCollectionDiagnostics {
     param(
         [Parameter(Mandatory)][string]$Label,
-        [Parameter(Mandatory)][object[]]$Items,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
         [object[]]$SourceItems
     )
 
@@ -433,6 +439,7 @@ function Start-QOTInstalledAppsScanAsync {
             } catch { $isCacheFresh = $false }
         }
 
+        $cachedResults = $null
         if (-not $ForceScan -and $Global:QOT_InstalledAppsCache -and $Global:QOT_InstalledAppsCache.Count -gt 0 -and $isCacheFresh) {
             $cachedResults = @($Global:QOT_InstalledAppsCache)
             $dispatcher.Invoke([action]{
@@ -448,24 +455,18 @@ function Start-QOTInstalledAppsScanAsync {
             Write-QOTAppsCollectionDiagnostics -Label "Installed Apps" -Items @($Global:QOT_InstalledAppsCollection) -SourceItems $cachedResults
 
             try { Write-QLog ("Installed apps loaded from cache ({0} items)." -f $cachedResults.Count) "DEBUG" } catch { }
-            return
+            # Intro prefetches Win32/Store rows without winget. Fill in its missing
+            # inventory off the UI thread while the cached rows are already visible.
+            if ($Global:QOT_WingetInventoryAvailable) { return }
         }
 
         if ($script:QOT_InstalledAppsScanTimer) {
-            try { $script:QOT_InstalledAppsScanTimer.Stop() } catch { }
-            $script:QOT_InstalledAppsScanTimer = $null
+            if ($ForceScan) { $script:QOT_InstalledAppsScanTimer.Tag.Rescan = $true }
+            return
         }
-        if ($script:QOT_InstalledAppsScanPowerShell) {
-            try { $script:QOT_InstalledAppsScanPowerShell.Dispose() } catch { }
-            $script:QOT_InstalledAppsScanPowerShell = $null
-        }
-        if ($script:QOT_InstalledAppsScanRunspace) {
-            try { $script:QOT_InstalledAppsScanRunspace.Dispose() } catch { }
-            $script:QOT_InstalledAppsScanRunspace = $null
-        }
-        $script:QOT_InstalledAppsScanAsyncResult = $null
 
         $installedAppsModulePath = Join-Path $PSScriptRoot "InstalledApps.psm1"
+        $installModulePath = Join-Path $PSScriptRoot "InstallCommonApps.psm1"
         $script:QOT_InstalledAppsScanRunspace = [runspacefactory]::CreateRunspace()
         $script:QOT_InstalledAppsScanRunspace.Open()
 
@@ -474,6 +475,8 @@ function Start-QOTInstalledAppsScanAsync {
         $null = $script:QOT_InstalledAppsScanPowerShell.AddScript({
             param(
                 [string]$InstalledAppsModulePath,
+                [string]$InstallModulePath,
+                [object[]]$Prefetched,
                 [bool]$ForceRefresh
             )
 
@@ -482,16 +485,24 @@ function Start-QOTInstalledAppsScanAsync {
                 Import-Module -Name $InstalledAppsModulePath -Force -ErrorAction Stop
             }
 
-            @(Get-QOTInstalledAppsCached -ForceRefresh:$ForceRefresh)
-        }).AddArgument($installedAppsModulePath).AddArgument([bool]$ForceScan.IsPresent)
+            $apps = $Prefetched
+            if ($null -eq $apps) { $apps = @(Get-QOTInstalledAppsCached -ForceRefresh:$ForceRefresh) }
+            Import-Module $InstallModulePath -ErrorAction Stop
+            [pscustomobject]@{
+                Apps = $apps
+                WingetIds = Get-QOTWingetInstalledIdSet
+            }
+        }).AddArgument($installedAppsModulePath).AddArgument($installModulePath).AddArgument($cachedResults).AddArgument([bool]$ForceScan.IsPresent)
 
         $script:QOT_InstalledAppsScanAsyncResult = $script:QOT_InstalledAppsScanPowerShell.BeginInvoke()
 
         $scanTimer = [System.Windows.Threading.DispatcherTimer]::new()
         $scanTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+        $scanTimer.Tag = @{ Grid = $AppsGrid; Rescan = $false }
         $scanTimer.Add_Tick({
+            param($sender, $eventArgs)
             if (-not $script:QOT_InstalledAppsScanAsyncResult) {
-                $scanTimer.Stop()
+                $sender.Stop()
                 return
             }
 
@@ -499,13 +510,16 @@ function Start-QOTInstalledAppsScanAsync {
                 return
             }
 
-            $scanTimer.Stop()
+            $sender.Stop()
 
             $results = @()
             $scanError = $null
 
             try {
-                $results = @($script:QOT_InstalledAppsScanPowerShell.EndInvoke($script:QOT_InstalledAppsScanAsyncResult))
+                $scan = $script:QOT_InstalledAppsScanPowerShell.EndInvoke($script:QOT_InstalledAppsScanAsyncResult)[0]
+                $results = $scan.Apps
+                $Global:QOT_WingetInventoryAvailable = $null -ne $scan.WingetIds
+                if ($Global:QOT_WingetInventoryAvailable) { $Global:QOT_ScannedWingetIds = $scan.WingetIds }
             }
             catch {
                 $scanError = $_.Exception
@@ -525,17 +539,21 @@ function Start-QOTInstalledAppsScanAsync {
             }
 
             try {
+                $selectedKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                foreach ($old in $Global:QOT_InstalledAppsCollection) {
+                    if ($old.IsSelected -and $old.RegistryKeyPath) { [void]$selectedKeys.Add($old.RegistryKeyPath) }
+                }
                 $Global:QOT_InstalledAppsCache = $results
                 $Global:QOT_InstalledAppsCacheTimestamp = Get-Date
 
-                $dispatcher.Invoke([action]{
-                    $Global:QOT_InstalledAppsCollection.Clear()
-                    foreach ($app in $results) {
-                        Ensure-QOTInstalledAppForGrid -App $app
-                        $Global:QOT_InstalledAppsCollection.Add($app)
-                    }
-                })
+                $Global:QOT_InstalledAppsCollection.Clear()
+                foreach ($app in $results) {
+                    Ensure-QOTInstalledAppForGrid -App $app
+                    if ($app.RegistryKeyPath -and $selectedKeys.Contains($app.RegistryKeyPath)) { $app.IsSelected = $true }
+                    $Global:QOT_InstalledAppsCollection.Add($app)
+                }
                 Update-QOTCommonAppsInstallStatus -InstalledApps $results
+                if ($Global:QOT_CommonAppsCollection) { [Windows.Data.CollectionViewSource]::GetDefaultView($Global:QOT_CommonAppsCollection).Refresh() }
                 $installedRows = @($Global:QOT_InstalledAppsCollection).Count
                 try { Write-QLog ("Installed Apps grid populated: {0} rows" -f $installedRows) "INFO" } catch { }
                 Write-QOTAppsCollectionDiagnostics -Label "Installed Apps" -Items @($Global:QOT_InstalledAppsCollection) -SourceItems $results
@@ -545,7 +563,8 @@ function Start-QOTInstalledAppsScanAsync {
             catch {
                 try { Write-QLog ("Installed apps scan completion handler failed: {0}" -f $_.Exception.Message) "ERROR" } catch { }
             }
-        }.GetNewClosure())
+            if ($sender.Tag.Rescan) { Start-QOTInstalledAppsScanAsync -AppsGrid $sender.Tag.Grid -ForceScan }
+        })
 
         $script:QOT_InstalledAppsScanTimer = $scanTimer
         try { Write-QLog "Starting installed apps scan" "INFO" } catch { }

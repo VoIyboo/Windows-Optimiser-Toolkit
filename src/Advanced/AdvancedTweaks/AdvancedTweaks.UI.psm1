@@ -15,7 +15,6 @@ $script:QOTAdvancedSelectAllLoadedHandler = $null
 $script:QOTAdvancedSectionSelectorSyncInProgress = $false
 $script:QOTAdvancedSectionSelectorHandlers = @{}
 $script:QOTAdvancedSectionChildHandlers = @{}
-$script:QOTAdvancedSectionLastBulkActions = @{}
 $script:QOTAdvancedInstantToggleState = [pscustomobject]@{
     Handlers = @{}
     Metadata = @{}
@@ -23,7 +22,7 @@ $script:QOTAdvancedInstantToggleState = [pscustomobject]@{
     Busy = @{}
     Operations = @{}
 }
-$script:QOTAdvancedInstantToggleMouseHandler = $null
+$script:QOTAdvancedInstantToggleClickHandler = $null
 
 function Resolve-QOTAdvancedToggleStateCommand {
     param(
@@ -547,39 +546,10 @@ function Register-QOTAdvancedInstantToggleHandlers {
     $setToggleStateCmd = Resolve-QOTAdvancedToggleStateCommand -Name "Set-QOToggleActionState"
     $getLiveStateCmd = Get-Command Get-QOTAdvancedLiveToggleState -ErrorAction SilentlyContinue | Select-Object -First 1
     $state = $script:QOTAdvancedInstantToggleState
-    if (-not $script:QOTAdvancedInstantToggleMouseHandler) {
-        $script:QOTAdvancedInstantToggleMouseHandler = [System.Windows.Input.MouseButtonEventHandler]{
+    if (-not $script:QOTAdvancedInstantToggleClickHandler) {
+        $script:QOTAdvancedInstantToggleClickHandler = [System.Windows.RoutedEventHandler]{
             param($sender, $args)
-            try {
-                if ($sender -is [System.Windows.Controls.CheckBox]) {
-                    if (-not $sender.IsEnabled) { return }
-
-                    $state = $script:QOTAdvancedInstantToggleState
-                    $controlName = [string]$sender.Name
-                    if ($state.Busy[$controlName]) {
-                        try { $args.Handled = $true } catch { }
-                        return
-                    }
-
-                    $previousRestoreFlag = [bool]$state.RestoreInProgress
-                    $state.RestoreInProgress = $true
-                    try {
-                        $sender.IsChecked = (-not [bool]$sender.IsChecked)
-                    }
-                    finally {
-                        $state.RestoreInProgress = $previousRestoreFlag
-                    }
-
-                    try { $sender.Focus() | Out-Null } catch { }
-                    try { $args.Handled = $true } catch { }
-                    try { $sender.UpdateLayout() } catch { }
-                    try { $sender.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render) | Out-Null } catch { }
-                    Invoke-QOTAdvancedInstantToggle -Sender $sender
-                }
-            }
-            catch {
-                try { Write-QLog ("Advanced mouse handler error: {0}" -f $_.Exception.ToString()) "ERROR" } catch { }
-            }
+            if ($sender.IsEnabled) { Invoke-QOTAdvancedInstantToggle -Sender $sender }
         }
     }
 
@@ -594,7 +564,7 @@ function Register-QOTAdvancedInstantToggleHandlers {
 
         $existingHandlers = $state.Handlers[[string]$action.Name]
         if ($existingHandlers) {
-            try { $control.RemoveHandler([System.Windows.UIElement]::PreviewMouseLeftButtonUpEvent, $existingHandlers.MouseUp) } catch { }
+            try { $control.Remove_Click($existingHandlers.Click) } catch { }
         }
 
         $state.Metadata[[string]$action.Name] = @{
@@ -642,84 +612,15 @@ function Register-QOTAdvancedInstantToggleHandlers {
         }
 
         try {
-            $control.AddHandler([System.Windows.UIElement]::PreviewMouseLeftButtonUpEvent, $script:QOTAdvancedInstantToggleMouseHandler, $true)
+            $control.Add_Click($script:QOTAdvancedInstantToggleClickHandler)
         }
         catch {
-            try { Write-QLog ("Advanced mouse handler attach failed for {0}: {1}" -f $action.ActionId, $_.Exception.ToString()) "ERROR" } catch { }
+            try { Write-QLog ("Advanced click handler attach failed for {0}: {1}" -f $action.ActionId, $_.Exception.ToString()) "ERROR" } catch { }
         }
 
         $state.Handlers[[string]$action.Name] = @{
-            MouseUp = $script:QOTAdvancedInstantToggleMouseHandler
+            Click = $script:QOTAdvancedInstantToggleClickHandler
         }
-    }
-}
-
-function Invoke-QOTAdvancedSectionOneShotAction {
-    param(
-        [Parameter(Mandatory)][string]$ActionId,
-        [AllowNull()]$Window
-    )
-
-    if ([string]::IsNullOrWhiteSpace($ActionId)) { return $false }
-
-    if ([string]::Equals([string]$env:QOT_UI_TOGGLE_TEST_MODE, "1", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $current = [string]$env:QOT_UI_TEST_SECTION_ONESHOT_ACTIONS
-        if ([string]::IsNullOrWhiteSpace($current)) {
-            $env:QOT_UI_TEST_SECTION_ONESHOT_ACTIONS = $ActionId
-        }
-        else {
-            $env:QOT_UI_TEST_SECTION_ONESHOT_ACTIONS = ($current + ";" + $ActionId)
-        }
-        try { Write-QLog ("Advanced section one-shot action skipped in test mode: {0}" -f $ActionId) "DEBUG" } catch { }
-        return $true
-    }
-
-    $definition = $null
-    try { $definition = Get-QOTActionDefinition -ActionId $ActionId } catch { $definition = $null }
-    if (-not $definition) {
-        try { Write-QLog ("Advanced section one-shot action has no definition: {0}" -f $ActionId) "WARN" } catch { }
-        return $false
-    }
-
-    $scriptPath = [string]$definition.ScriptPath
-    if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath)) {
-        try { Write-QLog ("Advanced section one-shot action script missing for {0}: {1}" -f $ActionId, $scriptPath) "ERROR" } catch { }
-        return $false
-    }
-
-    try {
-        try { Write-QLog ("Advanced section one-shot action starting: {0}" -f $ActionId) "INFO" } catch { }
-        $result = & $scriptPath -Window $Window
-
-        $status = ""
-        $reason = ""
-        $errorText = ""
-        foreach ($entry in @($result)) {
-            if (-not $entry) { continue }
-            if ($entry.PSObject.Properties.Name -contains "Status") {
-                $status = [string]$entry.Status
-                if ($entry.PSObject.Properties.Name -contains "Reason") { $reason = [string]$entry.Reason }
-                if ($entry.PSObject.Properties.Name -contains "Error") { $errorText = [string]$entry.Error }
-                break
-            }
-        }
-
-        if ($status -eq "Failed") {
-            $message = if (-not [string]::IsNullOrWhiteSpace($errorText)) { $errorText } else { $reason }
-            try { Write-QLog ("Advanced section one-shot action failed: {0}. {1}" -f $ActionId, $message) "ERROR" } catch { }
-            return $false
-        }
-        if ($status -eq "Skipped") {
-            try { Write-QLog ("Advanced section one-shot action skipped: {0}. {1}" -f $ActionId, $reason) "WARN" } catch { }
-            return $true
-        }
-
-        try { Write-QLog ("Advanced section one-shot action completed: {0}" -f $ActionId) "INFO" } catch { }
-        return $true
-    }
-    catch {
-        try { Write-QLog ("Advanced section one-shot action errored: {0}. {1}" -f $ActionId, $_.Exception.Message) "ERROR" } catch { }
-        return $false
     }
 }
 
@@ -759,8 +660,7 @@ function Set-QOTAdvancedSectionOptionsState {
     param(
         [Parameter(Mandatory)][System.Windows.Window]$Window,
         [Parameter(Mandatory)][string[]]$OptionNames,
-        [Parameter(Mandatory)][bool]$IsChecked,
-        [hashtable]$ActionMap = @{}
+        [Parameter(Mandatory)][bool]$IsChecked
     )
 
     $updated = 0
@@ -781,13 +681,6 @@ function Set-QOTAdvancedSectionOptionsState {
             try { $metadata = $script:QOTAdvancedInstantToggleState.Metadata[[string]$control.Name] } catch { $metadata = $null }
             if ($metadata) {
                 Invoke-QOTAdvancedInstantToggle -Sender $control
-            }
-            elseif ($IsChecked) {
-                $actionId = $null
-                try { $actionId = [string]$ActionMap[[string]$control.Name] } catch { $actionId = $null }
-                if (-not [string]::IsNullOrWhiteSpace($actionId)) {
-                    Invoke-QOTAdvancedSectionOneShotAction -ActionId $actionId -Window $Window | Out-Null
-                }
             }
             $updated++
         }
@@ -844,14 +737,12 @@ function Update-QOTAdvancedSectionSelectorStates {
 function Register-QOTAdvancedSectionSelectors {
     param(
         [Parameter(Mandatory)][System.Windows.Window]$Window,
-        [Parameter(Mandatory)][hashtable[]]$Sections,
-        [hashtable]$ActionMap = @{}
+        [Parameter(Mandatory)][hashtable[]]$Sections
     )
 
     $sectionsSnapshot = @($Sections)
     $updateAllFn = ${function:Update-QOTAdvancedSectionSelectorStates}
     $setSectionFn = ${function:Set-QOTAdvancedSectionOptionsState}
-    $actionMap = if ($ActionMap) { $ActionMap } else { @{} }
 
     foreach ($section in $sectionsSnapshot) {
         if (-not $section -or [string]::IsNullOrWhiteSpace([string]$section.HeaderName)) { continue }
@@ -862,8 +753,7 @@ function Register-QOTAdvancedSectionSelectors {
 
         if ($script:QOTAdvancedSectionSelectorHandlers.ContainsKey($headerName)) {
             $oldHandler = $script:QOTAdvancedSectionSelectorHandlers[$headerName]
-            try { $header.Remove_Checked($oldHandler) } catch { }
-            try { $header.Remove_Unchecked($oldHandler) } catch { }
+            try { $header.Remove_Click($oldHandler) } catch { }
         }
 
         $sectionSnapshot = $section
@@ -873,36 +763,14 @@ function Register-QOTAdvancedSectionSelectors {
             if ($script:QOTAdvancedSectionSelectorSyncInProgress) { return }
             $targetState = ($sender -is [System.Windows.Controls.CheckBox] -and $sender.IsChecked -eq $true)
 
-            $nowTicks = [Environment]::TickCount64
-            if (-not ($script:QOTAdvancedSectionLastBulkActions -is [hashtable])) {
-                $script:QOTAdvancedSectionLastBulkActions = @{}
-            }
-            $lastBulkAction = $null
-            try { $lastBulkAction = $script:QOTAdvancedSectionLastBulkActions[$headerName] } catch { $lastBulkAction = $null }
-            if ($lastBulkAction) {
-                $lastTargetState = $null
-                $lastTicks = 0
-                try { $lastTargetState = [bool]$lastBulkAction.TargetState } catch { $lastTargetState = $null }
-                try { $lastTicks = [int64]$lastBulkAction.Ticks } catch { $lastTicks = 0 }
-                if ($null -ne $lastTargetState -and $lastTargetState -eq $targetState -and ($nowTicks - $lastTicks) -lt 2000) {
-                    try { Write-QLog ("Advanced section {0} duplicate {1} event ignored." -f $sectionSnapshot.HeaderName, $targetState) "DEBUG" } catch { }
-                    return
-                }
-            }
-            $script:QOTAdvancedSectionLastBulkActions[$headerName] = [pscustomobject]@{
-                TargetState = $targetState
-                Ticks = $nowTicks
-            }
-
-            $updated = & $setSectionFn -Window $Window -OptionNames ([string[]]$sectionSnapshot.OptionNames) -IsChecked $targetState -ActionMap $actionMap
+            $updated = & $setSectionFn -Window $Window -OptionNames ([string[]]$sectionSnapshot.OptionNames) -IsChecked $targetState
             & $updateAllFn -Window $Window -Sections $sectionsSnapshot
             $actionLabel = if ($targetState) { "checked" } else { "unchecked" }
             try { Write-QLog ("Advanced section {0} {1} {2} boxes." -f $sectionSnapshot.HeaderName, $actionLabel, $updated) "DEBUG" } catch { }
         }.GetNewClosure()
 
         $script:QOTAdvancedSectionSelectorHandlers[$headerName] = $handler
-        try { $header.Add_Checked($handler) } catch { }
-        try { $header.Add_Unchecked($handler) } catch { }
+        try { $header.Add_Click($handler) } catch { }
     }
 
     foreach ($section in $sectionsSnapshot) {
@@ -958,7 +826,7 @@ function Initialize-QOTAdvancedTweaksUI {
             @{ Name = "CbAdvDeepCacheCleanup"; Label = "Deep cache/component store cleanup"; ActionId = "Invoke-QAdvancedDeepCache" },
             @{ Name = "CbAdvCleanComponentStore"; Label = "Clean Windows Component Store"; ActionId = "Invoke-QCleanComponentStore" },
             @{ Name = "CbAdvAggressiveComponentStoreCleanup"; Label = "Aggressive component store cleanup"; ActionId = "Invoke-QAggressiveComponentStoreCleanup" },
-            @{ Name = "CbAdvScanUnusedDeviceDrivers"; Label = "Scan unused device drivers (report only)"; ActionId = "Invoke-QScanUnusedDeviceDrivers" },
+            @{ Name = "CbAdvScanUnusedDeviceDrivers"; Label = "Count third-party driver packages (report only)"; ActionId = "Invoke-QScanUnusedDeviceDrivers" },
             @{ Name = "CbAdvDisableTelemetryScheduledTasks"; Label = "Disable telemetry scheduled tasks"; ActionId = "Invoke-QDisableTelemetryScheduledTasks" },
             @{ Name = "CbAdvNetworkReset"; Label = "Network reset"; ActionId = "Invoke-QNetworkReset" },
             @{ Name = "CbAdvRepairNetworkAdapter"; Label = "Repair network adapter"; ActionId = "Invoke-QRepairAdapter"; Available = $false; DisabledToolTip = "Temporarily unavailable in this build while the backend implementation is completed." },
@@ -979,41 +847,14 @@ function Initialize-QOTAdvancedTweaksUI {
 
             try { $control.Content = [string]$action.Label } catch { }
 
-            $isAvailable = $true
-            try {
-                if ($action.PSObject.Properties.Name -contains "Available") {
-                    $isAvailable = [bool]$action.Available
-                }
-            } catch { $isAvailable = $true }
-
-            if (-not $isAvailable) {
-                try { $control.IsChecked = $false } catch { }
-                try { $control.IsEnabled = $false } catch { }
-                try {
-                    if ($action.PSObject.Properties.Name -contains "DisabledToolTip") {
-                        $control.ToolTip = [string]$action.DisabledToolTip
-                    }
-                } catch { }
+            if ($action.ContainsKey('Available') -and -not $action.Available) {
+                $control.IsChecked = $false
+                $control.IsEnabled = $false
+                $control.ToolTip = $action.DisabledToolTip
             }
         }
 
-        $actionsSnapshot = @(
-            $actions |
-                Where-Object {
-                    $isAvailable = $true
-                    try {
-                        if ($_.PSObject.Properties.Name -contains "Available") {
-                            $isAvailable = [bool]$_.Available
-                        }
-                    } catch { $isAvailable = $true }
-                    $isAvailable
-                }
-        )
-        $sectionActionMap = @{}
-        foreach ($action in @($actionsSnapshot)) {
-            if (-not $action -or [string]::IsNullOrWhiteSpace([string]$action.Name)) { continue }
-            $sectionActionMap[[string]$action.Name] = [string]$action.ActionId
-        }
+        $actionsSnapshot = @($actions | Where-Object { -not $_.ContainsKey('Available') -or $_.Available })
         $sectionSelectors = @(
             @{
                 HeaderName = "CbAdvSectionAppBrowserControls"
@@ -1042,13 +883,16 @@ function Initialize-QOTAdvancedTweaksUI {
         )
 
         Register-QOTAdvancedInstantToggleHandlers -Window $Window -Actions $actionsSnapshot
-        Register-QOTAdvancedSectionSelectors -Window $Window -Sections $sectionSelectors -ActionMap $sectionActionMap
+        Register-QOTAdvancedSectionSelectors -Window $Window -Sections $sectionSelectors
 
+        $queuedActions = @($actionsSnapshot | Where-Object {
+            -not (Get-QOTAdvancedInstantToggleCommandNames -ActionId $_.ActionId)
+        })
         Register-QOTActionGroup -Name "Advanced" -GetItems ({
             param($Window)
 
             $items = @()
-            foreach ($action in $actionsSnapshot) {
+            foreach ($action in $queuedActions) {
                 $actionName = $action.Name
                 $actionLabel = $action.Label
                 $actionId = $action.ActionId
@@ -1059,7 +903,7 @@ function Initialize-QOTAdvancedTweaksUI {
                     IsSelected = ({
                         param($window)
                         $control = $window.FindName($actionName)
-                        $control -and $control.IsChecked -eq $true
+                        $control -and $control.IsEnabled -and $control.IsChecked -eq $true
                     }).GetNewClosure()
                 }
             }

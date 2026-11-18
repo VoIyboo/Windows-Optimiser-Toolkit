@@ -109,37 +109,23 @@ function Show-QOTStartupWidget {
     if (-not $Window) { return }
 
     try {
-        # Show fully rendered right away so it can cleanly replace the bootstrap
-        # loader without a second half-fade or visual blink.
-        $Window.Opacity = 1
+        # WPF measures the auto-sized window on Show. Keep that first layout
+        # transparent until the widget is at its final screen position.
+        $Window.Opacity = 0
         $Window.Show()
-        try {
-            $Window.Topmost = $true
-            $Window.Activate() | Out-Null
-            $Window.Focus() | Out-Null
-        }
-        catch { }
-
-        # Position widget in bottom-right corner before fading in
-        $Window.Dispatcher.Invoke({
-            Move-QOTStartupWidgetToBottomRight -Window $Window
-        }, [System.Windows.Threading.DispatcherPriority]::Input) | Out-Null
         $Window.UpdateLayout()
+        Move-QOTStartupWidgetToBottomRight -Window $Window
+        $Window.Opacity = 1
         $Window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render) | Out-Null
 
         # Auto-disable Topmost after 3 seconds
-        $timer = New-Object System.Timers.Timer
-        $timer.Interval = 3000
-        $timer.AutoReset = $false
-        $timer.Add_Elapsed({
-            try {
-                $Window.Dispatcher.Invoke({
-                    $Window.Topmost = $false
-                }, [System.Windows.Threading.DispatcherPriority]::Normal)
-            }
-            catch { }
-            $timer.Dispose()
-        })
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [TimeSpan]::FromSeconds(3)
+        $timer.Add_Tick({
+            param($sender, $eventArgs)
+            $sender.Stop()
+            $Window.Topmost = $false
+        }.GetNewClosure())
         $timer.Start()
     }
     catch {
@@ -155,19 +141,9 @@ function Move-QOTStartupWidgetToBottomRight {
     if (-not $Window) { return }
 
     try {
-        # Ensure Windows.Forms is loaded
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-
-        # Get screen working area (excludes taskbar)
-        $screen = [System.Windows.Forms.Screen]::PrimaryScreen
-        $workingArea = $screen.WorkingArea
-
-        # Position: Right edge - widget width - margin, Bottom edge - widget height - margin
-        $marginRight = 10
-        $marginBottom = 10
-        $left = $workingArea.Right - $Window.Width - $marginRight
-        $top = $workingArea.Bottom - $Window.Height - $marginBottom
-
+        $workingArea = [System.Windows.SystemParameters]::WorkArea
+        $left = $workingArea.Right - $Window.ActualWidth - 10
+        $top = $workingArea.Bottom - $Window.ActualHeight - 10
         $Window.Left = $left
         $Window.Top = $top
     }
@@ -238,11 +214,8 @@ function Close-QOTStartupWidget {
                     $storyboardCopy.Add_Completed({
                         param($sender, $args)
                         try { $Window.Close() } catch { }
-                    })
-                    # Fire animation on background thread to avoid blocking
-                    $Window.Dispatcher.BeginInvoke({
-                        $storyboardCopy.Begin($Window)
-                    }, [System.Windows.Threading.DispatcherPriority]::Background) | Out-Null
+                    }.GetNewClosure())
+                    $storyboardCopy.Begin($Window)
                 }
                 else {
                     $Window.Close()

@@ -134,7 +134,28 @@ function Invoke-QOTActionById {
     Write-QOTActionConsoleLog -ActionId $ActionId -Status "START" -Message $label
     try { Write-QLog ("Running action: {0} ({1})" -f $label, $ActionId) "INFO" } catch { }
     try {
-        & $scriptPath -Window $Window
+        $output = @(& $scriptPath -Window $Window)
+        $skipped = $null
+        foreach ($entry in $output) {
+            if ($null -eq $entry -or -not $entry.PSObject.Properties['Status']) { continue }
+            switch ([string]$entry.Status) {
+                'Success' { }
+                'Skipped' { $skipped = $entry }
+                'Failed' {
+                    $detail = (@($entry.Reason, $entry.Error) | Where-Object { $_ }) -join ' - '
+                    Write-QOTActionConsoleLog -ActionId $ActionId -Status 'ERROR' -Message $detail
+                    return $false
+                }
+                default {
+                    Write-QOTActionConsoleLog -ActionId $ActionId -Status 'ERROR' -Message ("Unknown result status: {0}" -f $entry.Status)
+                    return $false
+                }
+            }
+        }
+        if ($skipped) {
+            Write-QOTActionConsoleLog -ActionId $ActionId -Status 'SKIPPED' -Message $skipped.Reason
+            return $true
+        }
         try { Write-QLog ("Action complete: {0} ({1})" -f $label, $ActionId) "INFO" } catch { }
         Write-QOTActionConsoleLog -ActionId $ActionId -Status "SUCCESS" -Message $label
         return $true
@@ -274,7 +295,7 @@ function Invoke-QOTRegisteredActions {
         [Parameter(Mandatory)]$Window,
         [scriptblock]$OnProgress
     )
-    $selectedItems = Get-QOTSelectedActionsInExecutionOrder -Window $Window
+    $selectedItems = @(Get-QOTSelectedActionsInExecutionOrder -Window $Window)
 
     try {
         $registeredCount = Get-QOTActionDefinitionCount
@@ -460,7 +481,7 @@ function Test-QOTAnyActionsSelected {
     )
 
     try {
-        $selected = Get-QOTSelectedActions -Window $Window
+        $selected = @(Get-QOTSelectedActions -Window $Window)
         return ($selected.Count -gt 0)
     }
     catch {

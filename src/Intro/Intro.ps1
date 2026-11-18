@@ -11,55 +11,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Console window hide/show functions
-function Hide-ConsoleWindow {
-    try {
-        Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public class ConsoleHelper {
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetConsoleWindow();
-
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-}
-"@ -ErrorAction SilentlyContinue | Out-Null
-
-        $consolePtr = [ConsoleHelper]::GetConsoleWindow()
-        if ($consolePtr -ne [IntPtr]::Zero) {
-            [ConsoleHelper]::ShowWindow($consolePtr, 0) | Out-Null  # 0 = SW_HIDE
-        }
-    }
-    catch { }
-}
-
-function Show-ConsoleWindow {
-    if ($Quiet) { return }
-
-    try {
-        Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public class ConsoleHelper {
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetConsoleWindow();
-
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-}
-"@ -ErrorAction SilentlyContinue | Out-Null
-
-        $consolePtr = [ConsoleHelper]::GetConsoleWindow()
-        if ($consolePtr -ne [IntPtr]::Zero) {
-            [ConsoleHelper]::ShowWindow($consolePtr, 5) | Out-Null  # 5 = SW_SHOW
-        }
-    }
-    catch { }
-}
-
 # Keep startup noise out of interactive PowerShell; logs are written to file.
 [Environment]::SetEnvironmentVariable('QOT_QUIET_CONSOLE', '1', 'Process')
 [Environment]::SetEnvironmentVariable('QOT_APP_USER_MODEL_ID', 'StudioVoly.QuinnOptimiserToolkit', 'Process')
@@ -141,9 +92,7 @@ public static class QOTShellAppIdIntro {
 
 $oldWarningPreference = $WarningPreference
 $WarningPreference    = "SilentlyContinue"
-
-# Hide the console window for clean user experience
-Hide-ConsoleWindow
+$launchProperties = $null
 
 try {
     Set-QOTProcessTaskbarIdentity
@@ -172,7 +121,7 @@ try {
     & $script:QOTLog ("[STARTUP] Widget module path: {0}" -f $widgetUIModule) "DEBUG"
     & $script:QOTLog ("[STARTUP] Widget module exists: {0}" -f (Test-Path $widgetUIModule)) "DEBUG"
 
-    if (Test-Path $widgetUIModule) {
+    if (-not $SkipSplash -and (Test-Path -LiteralPath $widgetUIModule)) {
         try {
             Import-Module $widgetUIModule -Force -ErrorAction Stop
             & $script:QOTLog "[STARTUP] Widget module imported successfully" "DEBUG"
@@ -187,7 +136,7 @@ try {
     $widgetApp = $null
 
     $widgetXaml = Join-Path $rootPath "src\Intro\StartupWidget\StartupWidget.xaml"
-    if (Test-Path $widgetXaml) {
+    if (-not $SkipSplash -and (Test-Path -LiteralPath $widgetXaml)) {
         try {
             # Application was already created at the top of this script with proper ShutdownMode
             # Just create and show the widget
@@ -213,7 +162,7 @@ try {
             throw
         }
     }
-    else {
+    elseif (-not $SkipSplash) {
         & $script:QOTLog "[STARTUP] Startup widget XAML not found at: $widgetXaml" "ERROR"
         throw "Startup widget XAML not found"
     }
@@ -446,6 +395,7 @@ try {
             Percent   = 70
             Status    = "Preparing startup tasks..."
             Completed = $false
+            TimedOut  = $false
             Error     = $null
         })
 
@@ -575,7 +525,6 @@ try {
         $startupFrame = New-Object System.Windows.Threading.DispatcherFrame
         $startupTimer = New-Object System.Windows.Threading.DispatcherTimer
         $startupTimeoutMs = 45000
-        $startupTimeoutHit = $false
         $startupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $startupTimer.Interval = [TimeSpan]::FromMilliseconds(120)
         $startupTimer.Add_Tick({
@@ -589,7 +538,7 @@ try {
             }
 
             if ($startupStopwatch.ElapsedMilliseconds -ge $startupTimeoutMs) {
-                $startupTimeoutHit = $true
+                $startupState.TimedOut = $true
                 $startupState.Status = "Startup warmup timed out, continuing..."
                 $startupTimer.Stop()
                 $startupFrame.Continue = $false
@@ -599,7 +548,7 @@ try {
             [System.Windows.Threading.Dispatcher]::PushFrame($startupFrame)
 
             try {
-                if ($startupTimeoutHit) {
+                if ($startupState.TimedOut) {
                     try {
                         $startupPs.Stop()
                     } catch { }
@@ -654,341 +603,35 @@ try {
     & $script:QOTLog "Starting main window" "INFO"
     & $script:QOTLog "[STARTUP] MainWindow launch started" "INFO"
 
-    # MainWindow initialisation is wrapped in its own try/catch so that if every
-    # fallback path (Start-QOTMain -> in-process fallback -> rescue launch) fails,
-    # the user sees a friendly error dialog instead of a silent black-screen exit.
-    # On fatal init failure we set $script:MainWindowInitFatal so the main loop
-    # below skips the app.Run() call and the process exits cleanly.
-    $script:MainWindowInitFatal = $false
-    $mainWindowInitError = $null
+    # Start-QOTMain owns the WPF message loop. Closing the main window ends
+    # this launch, even if a later cleanup step fails.
+    $launchProperties = $introApp.Properties
+    $launchProperties['QOT.MainWindowClosed'] = $false
     try {
-
-    # Keep the startup widget open during main window initialization
-    # It will fade out once the main window is visible
-
-    # Route through Start-QOTMain without WarmupOnly so the window lifecycle
-    # is owned by MainWindow.UI.psm1 (Show + app.Run) on a single code path.
-    #
-    # Some deployments have reported Start-QOTMain returning immediately after
-    # startup logs report "Starting main window", leaving users with no visible
-    # UI. If that happens in the first couple seconds, attempt a direct
-    # Start-QOTMainWindow fallback path so the app can still recover.
-    $shouldAttemptFallbackLaunch = $false
-    $startMainThrew = $false
-    $mainWindowLaunchTimer = [System.Diagnostics.Stopwatch]::StartNew()
-
-    try {
-        # Hand the startup widget to MainWindow so it can replace it cleanly
-        # as soon as the main UI is ready to render.
         Start-QOTMain -RootPath $rootPath -SplashWindow $widget
     }
     catch {
-        $startMainErrorDetail = if ($_.Exception) { $_.Exception.ToString() } else { $_.ToString() }
-        & $script:QOTLog ("[STARTUP] Start-QOTMain threw; attempting direct MainWindow fallback launch.`n{0}" -f $startMainErrorDetail) "ERROR"
-        $shouldAttemptFallbackLaunch = $true
-        $startMainThrew = $true
-    }
-    finally {
-        if ($mainWindowLaunchTimer) {
-            $mainWindowLaunchTimer.Stop()
-        }
-    }
-    if (-not $startMainThrew -and -not $shouldAttemptFallbackLaunch) {
-        try {
-            $visibleWindowCount = 0
-            $visibleNonSplashWindowCount = 0
-            $app = [System.Windows.Application]::Current
-            if ($app) {
-                $visibleWindows = @($app.Windows | Where-Object { $_ -and $_.IsVisible })
-                $visibleWindowCount = $visibleWindows.Count
-                $visibleNonSplashWindowCount = @(
-                    $visibleWindows | Where-Object {
-                        if (-not $_) { return $false }
-                        if ($widget -and [object]::ReferenceEquals($_, $widget)) { return $false }
-                        return $true
-                    }
-                ).Count
-            }
-
-            if ($visibleNonSplashWindowCount -gt 0) {
-                & $script:QOTLog ("[STARTUP] Start-QOTMain returned after {0} ms and detected {1} visible WPF window(s) ({2} excluding widget); skipping fallback launch." -f [math]::Round($mainWindowLaunchTimer.Elapsed.TotalMilliseconds), $visibleWindowCount, $visibleNonSplashWindowCount) "INFO"
-            }
-            else {
-                & $script:QOTLog ("[STARTUP] Start-QOTMain returned after {0} ms with no visible non-widget window (visible windows total: {1}); attempting direct MainWindow fallback launch." -f [math]::Round($mainWindowLaunchTimer.Elapsed.TotalMilliseconds), $visibleWindowCount) "WARN"
-                $shouldAttemptFallbackLaunch = $true
-            }
-        }
-        catch {
-            & $script:QOTLog ("[STARTUP] Could not verify WPF window visibility after Start-QOTMain returned: {0}`nAttempting fallback launch as a safeguard." -f $_.Exception.Message) "WARN"
-            $shouldAttemptFallbackLaunch = $true
-        }
-    }
-    
-    if ($shouldAttemptFallbackLaunch) {
+        if ($launchProperties['QOT.MainWindowClosed']) { throw }
+        & $script:QOTLog ("[STARTUP] Main window launch failed. Trying the UI module directly. {0}" -f $_.Exception.Message) "WARN"
         $mainWindowModulePath = Join-Path $rootPath "src\UI\MainWindow.UI.psm1"
-        if (-not (Test-Path -LiteralPath $mainWindowModulePath)) {
-            throw "MainWindow UI module not found for fallback launch: $mainWindowModulePath"
-        }
-
-        & $script:QOTLog "[STARTUP] Attempting in-process fallback MainWindow launch." "WARN"
         $fallbackModule = Import-Module -Name $mainWindowModulePath -Force -PassThru -ErrorAction Stop
-        if (-not $fallbackModule) {
-            throw "MainWindow UI module import failed during fallback launch: $mainWindowModulePath"
-        }
-
-        & $fallbackModule {
-            param($SplashWindow)
-            $cmd = Get-Command -Name 'Start-QOTMainWindow' -ErrorAction Stop
-            $invokeArgs = @{}
-            if ($cmd.Parameters.ContainsKey('SplashWindow')) { $invokeArgs['SplashWindow'] = $SplashWindow }
-            if ($cmd.Parameters.ContainsKey('Issues')) {
-                $requiresNonEmptyIssues = $false
-                try {
-                    foreach ($attr in @($cmd.Parameters['Issues'].Attributes)) {
-                        if ($attr -is [System.Management.Automation.ValidateNotNullOrEmptyAttribute]) {
-                            $requiresNonEmptyIssues = $true
-                            break
-                        }
-                    }
-                }
-                catch { }
-                $invokeArgs['Issues'] = if ($requiresNonEmptyIssues) { @("Startup fallback launch") } else { @() }
-            }
-
-            try {
-                Start-QOTMainWindow @invokeArgs
-            }
-            catch [System.Management.Automation.ParameterBindingException] {
-                $bindingMessage = $_.Exception.Message
-                $issuesBindingProblem = ($bindingMessage -match "parameter name 'Issues'") -or (($bindingMessage -match "parameter 'Issues'") -and ($bindingMessage -match "empty collection"))
-                if ($issuesBindingProblem) {
-                    $invokeArgs['Issues'] = @("Startup fallback launch")
-                    Start-QOTMainWindow @invokeArgs
-                }
-                else {
-                    throw
-                }
-            }
-        } $widget
-        return
+        & $fallbackModule { param($Splash) Start-QOTMainWindow -SplashWindow $Splash } $widget
     }
-
-    # Final safeguard: if startup unexpectedly returns with no visible
-    # main window, run one in-process rescue launch (no new process).
-    $visibleNonWidgetAfterLaunch = 0
-    try {
-        $app = [System.Windows.Application]::Current
-        if ($app) {
-            $visibleNonWidgetAfterLaunch = @(
-                $app.Windows | Where-Object {
-                    if (-not $_) { return $false }
-                    if (-not $_.IsVisible) { return $false }
-                    if ($widget -and [object]::ReferenceEquals($_, $widget)) { return $false }
-                    return $true
-                }
-            ).Count
-        }
-    }
-    catch {
-        & $script:QOTLog ("[STARTUP] Failed to verify post-launch window visibility: {0}" -f $_.Exception.Message) "WARN"
-    }
-
-    if ($visibleNonWidgetAfterLaunch -lt 1) {
-        $mainWindowModulePath = Join-Path $rootPath "src\UI\MainWindow.UI.psm1"
-
-        if (Test-Path -LiteralPath $mainWindowModulePath) {
-            & $script:QOTLog "[STARTUP] No visible MainWindow detected after launch path; attempting in-process rescue launch." "WARN"
-            $rescueModule = Import-Module -Name $mainWindowModulePath -Force -PassThru -ErrorAction Stop
-            if (-not $rescueModule) {
-                throw "MainWindow UI module import failed during rescue launch: $mainWindowModulePath"
-            }
-
-            & $rescueModule {
-                param($SplashWindow)
-                $cmd = Get-Command -Name 'Start-QOTMainWindow' -ErrorAction Stop
-                $invokeArgs = @{}
-                if ($cmd.Parameters.ContainsKey('SplashWindow')) { $invokeArgs['SplashWindow'] = $SplashWindow }
-                if ($cmd.Parameters.ContainsKey('Issues')) {
-                    $requiresNonEmptyIssues = $false
-                    try {
-                        foreach ($attr in @($cmd.Parameters['Issues'].Attributes)) {
-                            if ($attr -is [System.Management.Automation.ValidateNotNullOrEmptyAttribute]) {
-                                $requiresNonEmptyIssues = $true
-                                break
-                            }
-                        }
-                    }
-                    catch { }
-                    $invokeArgs['Issues'] = if ($requiresNonEmptyIssues) { @("Startup rescue launch") } else { @() }
-                }
-
-                try {
-                    Start-QOTMainWindow @invokeArgs
-                }
-                catch [System.Management.Automation.ParameterBindingException] {
-                    $bindingMessage = $_.Exception.Message
-                    $issuesBindingProblem = ($bindingMessage -match "parameter name 'Issues'") -or (($bindingMessage -match "parameter 'Issues'") -and ($bindingMessage -match "empty collection"))
-                    if ($issuesBindingProblem) {
-                        $invokeArgs['Issues'] = @("Startup rescue launch")
-                        Start-QOTMainWindow @invokeArgs
-                    }
-                    else {
-                        throw
-                    }
-                }
-            } $widget
-            return
-        }
-        else {
-            & $script:QOTLog "[STARTUP] Rescue launcher skipped because MainWindow.UI.psm1 is missing." "ERROR"
-        }
-    }
-
-    }  # End of MainWindow init try block
-    catch {
-        # Every fallback launch path has failed. Capture details, log them, and
-        # show a single friendly error dialog before exiting. Do not retry - the
-        # process is in a known-bad state and another attempt will fail the
-        # same way.
-        $mainWindowInitError = $_
-        $script:MainWindowInitFatal = $true
-
-        $initErrMsg = if ($_.Exception) { $_.Exception.Message } else { [string]$_ }
-        $initErrFull = if ($_.Exception) { $_.Exception.ToString() } else { [string]$_ }
-        & $script:QOTLog ("[STARTUP] MainWindow initialisation FAILED after all fallback paths exhausted: {0}" -f $initErrMsg) "ERROR"
-        & $script:QOTLog ("[STARTUP] MainWindow init error detail:`n{0}" -f $initErrFull) "ERROR"
-
-        # Close the startup widget so the error dialog isn't hidden behind it.
-        if ($widget) {
-            try { $widget.Close() } catch { }
-        }
-
-        $logPathHint = if ($script:QOTLogPath) { $script:QOTLogPath } else { (Join-Path $env:ProgramData "QuinnOptimiserToolkit\Logs") }
-        $dialogBody = @(
-            "Quinn Optimiser Toolkit could not start the main window."
-            ""
-            "Reason: $initErrMsg"
-            ""
-            "Full log: $logPathHint"
-            ""
-            "The application will now close. If this keeps happening, please share the log file when reporting it."
-        ) -join "`r`n"
-
-        try {
-            [System.Windows.MessageBox]::Show(
-                $dialogBody,
-                "Quinn Optimiser Toolkit - Could not start",
-                [System.Windows.MessageBoxButton]::OK,
-                [System.Windows.MessageBoxImage]::Error
-            ) | Out-Null
-        }
-        catch {
-            # WPF dialog failed too - fall back to the console so the user still
-            # sees something rather than a silent exit.
-            try { Show-ConsoleWindow } catch { }
-            Write-Host ""
-            Write-Host "============================================================" -ForegroundColor Red
-            Write-Host "Quinn Optimiser Toolkit - MainWindow init failed" -ForegroundColor Red
-            Write-Host "============================================================" -ForegroundColor Red
-            Write-Host $initErrMsg -ForegroundColor Yellow
-            Write-Host ""
-            Write-Host "See log: $logPathHint" -ForegroundColor Gray
-        }
-    }
-
-    if ($script:MainWindowInitFatal) {
-        & $script:QOTLog "[STARTUP] Skipping Application.Run() because MainWindow init was fatal." "WARN"
-        Stop-StartupChunk "MainWindow launch"
-        return
-    }
-
-    # Run the Application main loop to keep the window open
-    try {
-        $app = [System.Windows.Application]::Current
-        if ($app) {
-            $mainWindows = @($app.Windows | Where-Object { $_ -and $_.Title -notlike "*widget*" })
-
-            if ($mainWindows.Count -gt 0) {
-                $mainWindow = $mainWindows[0]
-
-                # Ensure window is visible and on screen
-                try {
-                    $mainWindow.Visibility = [System.Windows.Visibility]::Visible
-                    $mainWindow.Show()
-                    # Don't activate/focus - let user continue working
-                    # $mainWindow.Activate()
-                    # $mainWindow.BringIntoView()
-                    # $mainWindow.Focus() | Out-Null
-
-                    # Set reasonable position if off-screen
-                    if ($mainWindow.Left -lt -1000 -or $mainWindow.Top -lt -1000) {
-                        $mainWindow.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterScreen
-                        $mainWindow.Left = 100
-                        $mainWindow.Top = 100
-                    }
-                }
-                catch {
-                    & $script:QOTLog ("[STARTUP] Warning: Could not configure window visibility: {0}" -f $_) "WARN"
-                }
-
-                # Wait a moment at 100% for user to see completion
-                Write-StartupMark "Progress complete, waiting before transition"
-                Start-Sleep -Milliseconds 1500
-
-                # Fade out the startup widget now that main window is visible
-                if ($widget) {
-                    try {
-                        $widget.Dispatcher.Invoke({
-                            $fadeOutStoryboard = $widget.FindResource("FadeOutAnimation")
-                            if ($fadeOutStoryboard) {
-                                $fadeOutStoryboard.Add_Completed({
-                                    param($sender, $args)
-                                    try { $widget.Close() } catch { }
-                                })
-                                $fadeOutStoryboard.Begin($widget)
-                            }
-                            else {
-                                $widget.Close()
-                            }
-                        }, [System.Windows.Threading.DispatcherPriority]::Normal) | Out-Null
-                        & $script:QOTLog "[STARTUP] Startup widget fading out." "INFO"
-                    }
-                    catch {
-                        & $script:QOTLog ("[STARTUP] Failed to fade out startup widget: {0}" -f $_.Exception.Message) "WARN"
-                        try { $widget.Close() } catch { }
-                    }
-                }
-
-                Write-StartupMark "Main window detected, running application loop"
-                & $script:QOTLog "[STARTUP] Main window visible; running application main loop." "INFO"
-
-                # Set ShutdownMode to OnLastWindowClose so the app exits when user closes the main window
-                $app.ShutdownMode = [System.Windows.ShutdownMode]::OnLastWindowClose
-
-                # Run the application main loop - this blocks until the main window is closed
-                $app.Run() | Out-Null
-
-                # Show console window again after app closes for testing/debugging
-                Show-ConsoleWindow
-            }
-        }
-    }
-    catch {
-        & $script:QOTLog ("[STARTUP] Error in application loop: {0}" -f $_.Exception.Message) "WARN"
-        # Show console window if there was an error
-        Show-ConsoleWindow
-    }
-
     Write-StartupMark "MainWindow run loop exited"
     & $script:QOTLog "MainWindow run loop exited" "INFO"
     Stop-StartupChunk "MainWindow launch"
 }
 catch {
+    if ($launchProperties -and $launchProperties['QOT.MainWindowClosed']) {
+        & $script:QOTLog ("[SHUTDOWN] Error after the main window closed: {0}" -f $_.Exception.ToString()) "ERROR"
+        throw
+    }
     $fatalError = $_.Exception.Message
     $fatalStack = if ($_.Exception) { $_.Exception.StackTrace } else { "" }
     & $script:QOTLog ("[STARTUP] FATAL ERROR - Application startup failed: {0}" -f $fatalError) "ERROR"
     if ($fatalStack) { & $script:QOTLog ("[STARTUP] Stack trace: {0}" -f $fatalStack) "ERROR" }
 
+    if ($widget) { try { $widget.Close() } catch { } }
     # Attempt to show user-facing error dialog
     try {
         [System.Windows.MessageBox]::Show(
@@ -1003,12 +646,8 @@ catch {
         Write-Host "FATAL ERROR: $fatalError" -ForegroundColor Red
         Write-Host "Check logs for details" -ForegroundColor Red
     }
-
-    # Ensure console is visible for error messages
-    Show-ConsoleWindow
+    throw
 }
 finally {
     $WarningPreference = $oldWarningPreference
-    # Ensure console is visible at the end for any final messages or errors
-    Show-ConsoleWindow
 }

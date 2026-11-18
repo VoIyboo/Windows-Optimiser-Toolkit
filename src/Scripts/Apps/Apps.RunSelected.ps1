@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-Import-Module "$PSScriptRoot\..\..\Apps\Apps.Actions.psm1" -Force -ErrorAction Stop
+Import-Module "$PSScriptRoot\..\..\Apps\Apps.Actions.psm1" -ErrorAction Stop
 
 function Find-QOTControlByNameDeepLocal {
     param(

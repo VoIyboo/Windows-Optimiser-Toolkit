@@ -20,20 +20,14 @@ $script:QOTTweaksInstantToggleRefreshHandler = $null
 $script:QOTTweaksSectionSelectorSyncInProgress = $false
 $script:QOTTweaksSectionSelectorHandlers = @{}
 $script:QOTTweaksSectionChildHandlers = @{}
-$script:QOTTweaksSectionLastBulkActions = @{}
 $script:QOTTweaksInstantToggleState = [pscustomobject]@{
     Handlers = @{}
     Metadata = @{}
     RestoreInProgress = $false
     Busy = @{}
     Operations = @{}
-    ActiveExplorerRestartBatchId = 0
-    NextExplorerRestartBatchId = 0
-    ExplorerRestartBatches = @{}
-    DeferredExplorerRestartPending = $false
-    DeferredExplorerRestartTimer = $null
 }
-$script:QOTTweaksInstantToggleMouseHandler = $null
+$script:QOTTweaksInstantToggleClickHandler = $null
 
 function Resolve-QOTTweaksToggleStateCommand {
     param(
@@ -434,361 +428,6 @@ function Get-QOTTweaksInstantToggleCommandNames {
     }
 }
 
-function Test-QOTTweakRequiresExplorerRestart {
-    param(
-        [Parameter(Mandatory)][string]$ActionId
-    )
-
-    switch ($ActionId) {
-        "Invoke-QTweakStartMenuRecommendations" { return $true }
-        "Invoke-QTweakSuggestedApps" { return $true }
-        "Invoke-QTweakTipsInStart" { return $true }
-        "Invoke-QTweakBingSearch" { return $true }
-        "Invoke-QTweakClassicContextMenu" { return $true }
-        "Invoke-QTweakWidgets" { return $true }
-        "Invoke-QTweakNewsAndInterests" { return $true }
-        "Invoke-QTweakMeetNow" { return $true }
-        default { return $false }
-    }
-}
-
-function Restart-QOTExplorerShell {
-    if ([string]::Equals([string]$env:QOT_UI_TOGGLE_TEST_MODE, "1", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $restartCount = 0
-        try { $restartCount = [int]$env:QOT_UI_TOGGLE_TEST_EXPLORER_RESTARTS } catch { $restartCount = 0 }
-        $env:QOT_UI_TOGGLE_TEST_EXPLORER_RESTARTS = [string]($restartCount + 1)
-        try { Write-QLog "Tweaks: Explorer restart skipped in UI toggle test mode." "DEBUG" } catch { }
-        return $true
-    }
-
-    $explorerPath = Join-Path $env:WINDIR "explorer.exe"
-    $explorerStopped = $false
-
-    try {
-        $explorerProcesses = @(Get-Process -Name "explorer" -ErrorAction SilentlyContinue)
-        if ($explorerProcesses.Count -gt 0) {
-            foreach ($process in $explorerProcesses) {
-                try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
-            }
-            $explorerStopped = $true
-            Start-Sleep -Milliseconds 700
-        }
-
-        $autoRestarted = $false
-        for ($i = 0; $i -lt 20; $i++) {
-            Start-Sleep -Milliseconds 250
-            $running = @(Get-Process -Name "explorer" -ErrorAction SilentlyContinue)
-            if ($running.Count -gt 0) {
-                $autoRestarted = $true
-                break
-            }
-        }
-
-        if ($autoRestarted) {
-            try { Write-QLog "Tweaks: Explorer auto-restarted by Windows to apply shell changes." "INFO" } catch { }
-            return $true
-        }
-
-        Start-Process -FilePath $explorerPath -WorkingDirectory $env:WINDIR -ErrorAction Stop | Out-Null
-        Start-Sleep -Milliseconds 1200
-        try {
-            $shellApp = New-Object -ComObject Shell.Application
-            foreach ($window in @($shellApp.Windows())) {
-                if (-not $window) { continue }
-                try {
-                    $fullName = ""
-                    try { $fullName = [System.IO.Path]::GetFileName([string]$window.FullName) } catch { $fullName = "" }
-                    if ($fullName -ieq "explorer.exe") {
-                        $window.Quit()
-                    }
-                }
-                catch { }
-            }
-        }
-        catch { }
-        try { Write-QLog "Tweaks: Explorer manually restarted to apply shell changes." "INFO" } catch { }
-        return $true
-    }
-    catch {
-        try { Write-QLog ("Tweaks: failed to restart Explorer: {0}" -f $_.Exception.Message) "WARN" } catch { }
-        if ($explorerStopped) {
-            try { Start-Process -FilePath $explorerPath -WorkingDirectory $env:WINDIR -ErrorAction SilentlyContinue | Out-Null } catch { }
-        }
-        return $false
-    }
-}
-
-function Start-QOTTweaksExplorerRestartBatch {
-    $state = $script:QOTTweaksInstantToggleState
-
-    $nextId = 0
-    try { $nextId = [int]$state.NextExplorerRestartBatchId } catch { $nextId = 0 }
-    $nextId++
-
-    $state.NextExplorerRestartBatchId = $nextId
-    $state.ActiveExplorerRestartBatchId = $nextId
-    $state.ExplorerRestartBatches[$nextId] = [pscustomobject]@{
-        Active = $true
-        Running = 0
-        PendingRestart = $false
-        Actions = New-Object 'System.Collections.Generic.List[string]'
-    }
-
-    return $nextId
-}
-
-function Request-QOTTweaksDeferredExplorerRestart {
-    param(
-        [AllowNull()][string]$Reason
-    )
-
-    $state = $script:QOTTweaksInstantToggleState
-    $state.DeferredExplorerRestartPending = $true
-
-    $existingTimer = $null
-    try { $existingTimer = $state.DeferredExplorerRestartTimer } catch { $existingTimer = $null }
-    if ($existingTimer) { return }
-
-    if ([string]::Equals([string]$env:QOT_UI_TOGGLE_TEST_MODE, "1", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $restartCount = 0
-        try { $restartCount = [int]$env:QOT_UI_TOGGLE_TEST_EXPLORER_RESTARTS } catch { $restartCount = 0 }
-        $env:QOT_UI_TOGGLE_TEST_EXPLORER_RESTARTS = [string]($restartCount + 1)
-        $state.DeferredExplorerRestartPending = $false
-
-        try {
-            $timer = [System.Windows.Threading.DispatcherTimer]::new()
-            $timer.Interval = [TimeSpan]::FromMilliseconds(100)
-            $handler = [System.EventHandler]{
-                param($sender, $args)
-                try { $sender.Stop() } catch { }
-                try { $state.DeferredExplorerRestartTimer = $null } catch { }
-            }.GetNewClosure()
-            $timer.Add_Tick($handler)
-            $state.DeferredExplorerRestartTimer = $timer
-            $timer.Start()
-        }
-        catch {
-            $state.DeferredExplorerRestartTimer = $null
-        }
-        return
-    }
-
-    try {
-        $timer = [System.Windows.Threading.DispatcherTimer]::new()
-        $timer.Interval = [TimeSpan]::FromMilliseconds(350)
-
-        $handler = [System.EventHandler]{
-            param($sender, $args)
-
-            try { $sender.Stop() } catch { }
-            try { $state.DeferredExplorerRestartTimer = $null } catch { }
-
-            $shouldRestart = $false
-            try { $shouldRestart = [bool]$state.DeferredExplorerRestartPending } catch { $shouldRestart = $false }
-            $state.DeferredExplorerRestartPending = $false
-            if (-not $shouldRestart) { return }
-
-            try {
-                if (-not [string]::IsNullOrWhiteSpace($Reason)) {
-                    try { Write-QLog ("Tweaks: running deferred Explorer restart ({0})." -f $Reason) "DEBUG" } catch { }
-                }
-                Restart-QOTExplorerShell | Out-Null
-            }
-            catch {
-                try { Write-QLog ("Tweaks: deferred Explorer restart failed: {0}" -f $_.Exception.Message) "WARN" } catch { }
-            }
-        }.GetNewClosure()
-
-        $timer.Add_Tick($handler)
-        $state.DeferredExplorerRestartTimer = $timer
-        $timer.Start()
-    }
-    catch {
-        $state.DeferredExplorerRestartPending = $false
-        try { Restart-QOTExplorerShell | Out-Null } catch { }
-    }
-}
-
-function Invoke-QOTTweaksExplorerRestartBatchIfReady {
-    param(
-        [Parameter(Mandatory)][int]$BatchId
-    )
-
-    if ($BatchId -le 0) { return }
-
-    $state = $script:QOTTweaksInstantToggleState
-    $batch = $null
-    try { $batch = $state.ExplorerRestartBatches[$BatchId] } catch { $batch = $null }
-    if (-not $batch) { return }
-
-    if ([bool]$batch.Active) { return }
-    if ([int]$batch.Running -gt 0) { return }
-
-    $shouldRestart = $false
-    try { $shouldRestart = [bool]$batch.PendingRestart } catch { $shouldRestart = $false }
-
-    try { $state.ExplorerRestartBatches.Remove($BatchId) | Out-Null } catch { }
-
-    if (-not $shouldRestart) { return }
-
-    $actionCount = 0
-    try { $actionCount = [int]$batch.Actions.Count } catch { $actionCount = 0 }
-    try { Write-QLog ("Tweaks: queued one Explorer restart after section batch {0} ({1} shell-affecting action(s))." -f $BatchId, $actionCount) "DEBUG" } catch { }
-    Request-QOTTweaksDeferredExplorerRestart -Reason ("section batch {0}" -f $BatchId)
-}
-
-function Stop-QOTTweaksExplorerRestartBatch {
-    param(
-        [Parameter(Mandatory)][int]$BatchId
-    )
-
-    if ($BatchId -le 0) { return }
-
-    $state = $script:QOTTweaksInstantToggleState
-    $batch = $null
-    try { $batch = $state.ExplorerRestartBatches[$BatchId] } catch { $batch = $null }
-    if ($batch) {
-        try { $batch.Active = $false } catch { }
-    }
-
-    try {
-        if ([int]$state.ActiveExplorerRestartBatchId -eq $BatchId) {
-            $state.ActiveExplorerRestartBatchId = 0
-        }
-    } catch { }
-
-    Invoke-QOTTweaksExplorerRestartBatchIfReady -BatchId $BatchId
-}
-
-function Register-QOTTweaksExplorerRestartBatchOperation {
-    $state = $script:QOTTweaksInstantToggleState
-
-    $batchId = 0
-    try { $batchId = [int]$state.ActiveExplorerRestartBatchId } catch { $batchId = 0 }
-    if ($batchId -le 0) { return 0 }
-
-    $batch = $null
-    try { $batch = $state.ExplorerRestartBatches[$batchId] } catch { $batch = $null }
-    if (-not $batch) { return 0 }
-
-    try { $batch.Running = ([int]$batch.Running + 1) } catch { }
-    return $batchId
-}
-
-function Set-QOTTweaksExplorerRestartBatchPending {
-    param(
-        [Parameter(Mandatory)][int]$BatchId,
-        [Parameter(Mandatory)][string]$ActionId
-    )
-
-    if ($BatchId -le 0) { return $false }
-
-    $state = $script:QOTTweaksInstantToggleState
-    $batch = $null
-    try { $batch = $state.ExplorerRestartBatches[$BatchId] } catch { $batch = $null }
-    if (-not $batch) { return $false }
-
-    try { $batch.PendingRestart = $true } catch { }
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($ActionId)) {
-            $batch.Actions.Add($ActionId) | Out-Null
-        }
-    } catch { }
-
-    return $true
-}
-
-function Complete-QOTTweaksExplorerRestartBatchOperation {
-    param(
-        [Parameter(Mandatory)][int]$BatchId
-    )
-
-    if ($BatchId -le 0) { return }
-
-    $state = $script:QOTTweaksInstantToggleState
-    $batch = $null
-    try { $batch = $state.ExplorerRestartBatches[$BatchId] } catch { $batch = $null }
-    if (-not $batch) { return }
-
-    try {
-        $running = [int]$batch.Running
-        if ($running -gt 0) {
-            $batch.Running = ($running - 1)
-        }
-    } catch { }
-
-    Invoke-QOTTweaksExplorerRestartBatchIfReady -BatchId $BatchId
-}
-
-function Invoke-QOTTweaksSectionOneShotAction {
-    param(
-        [Parameter(Mandatory)][string]$ActionId,
-        [AllowNull()]$Window
-    )
-
-    if ([string]::IsNullOrWhiteSpace($ActionId)) { return $false }
-
-    if ([string]::Equals([string]$env:QOT_UI_TOGGLE_TEST_MODE, "1", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $current = [string]$env:QOT_UI_TEST_SECTION_ONESHOT_ACTIONS
-        if ([string]::IsNullOrWhiteSpace($current)) {
-            $env:QOT_UI_TEST_SECTION_ONESHOT_ACTIONS = $ActionId
-        }
-        else {
-            $env:QOT_UI_TEST_SECTION_ONESHOT_ACTIONS = ($current + ";" + $ActionId)
-        }
-        try { Write-QLog ("Tweaks section one-shot action skipped in test mode: {0}" -f $ActionId) "DEBUG" } catch { }
-        return $true
-    }
-
-    $definition = $null
-    try { $definition = Get-QOTActionDefinition -ActionId $ActionId } catch { $definition = $null }
-    if (-not $definition) {
-        try { Write-QLog ("Tweaks section one-shot action has no definition: {0}" -f $ActionId) "WARN" } catch { }
-        return $false
-    }
-
-    $scriptPath = [string]$definition.ScriptPath
-    if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath)) {
-        try { Write-QLog ("Tweaks section one-shot action script missing for {0}: {1}" -f $ActionId, $scriptPath) "ERROR" } catch { }
-        return $false
-    }
-
-    try {
-        try { Write-QLog ("Tweaks section one-shot action starting: {0}" -f $ActionId) "INFO" } catch { }
-        $result = & $scriptPath -Window $Window
-
-        $status = ""
-        $reason = ""
-        $errorText = ""
-        foreach ($entry in @($result)) {
-            if (-not $entry) { continue }
-            if ($entry.PSObject.Properties.Name -contains "Status") {
-                $status = [string]$entry.Status
-                if ($entry.PSObject.Properties.Name -contains "Reason") { $reason = [string]$entry.Reason }
-                if ($entry.PSObject.Properties.Name -contains "Error") { $errorText = [string]$entry.Error }
-                break
-            }
-        }
-
-        if ($status -eq "Failed") {
-            $message = if (-not [string]::IsNullOrWhiteSpace($errorText)) { $errorText } else { $reason }
-            try { Write-QLog ("Tweaks section one-shot action failed: {0}. {1}" -f $ActionId, $message) "ERROR" } catch { }
-            return $false
-        }
-        if ($status -eq "Skipped") {
-            try { Write-QLog ("Tweaks section one-shot action skipped: {0}. {1}" -f $ActionId, $reason) "WARN" } catch { }
-            return $true
-        }
-
-        try { Write-QLog ("Tweaks section one-shot action completed: {0}" -f $ActionId) "INFO" } catch { }
-        return $true
-    }
-    catch {
-        try { Write-QLog ("Tweaks section one-shot action errored: {0}. {1}" -f $ActionId, $_.Exception.Message) "ERROR" } catch { }
-        return $false
-    }
-}
-
 function Stop-QOTTweaksInstantToggleOperation {
     param(
         [Parameter(Mandatory)][string]$ControlName
@@ -841,7 +480,7 @@ function Invoke-QOTTweaksInstantToggle {
     $state.Busy[$controlName] = $true
     try {
         try { Write-QLog ("Tweaks starting instant toggle: {0} command={1}" -f $controlName, $commandName) "DEBUG" } catch { }
-        Start-QOTTweaksInstantToggleAsync -Control $Sender -ActionId ([string]$metadata.ActionId) -CommandName $commandName -TargetState $targetState -SetToggleStateCmd $metadata.SetToggleStateCmd -GetLiveStateCmd $metadata.GetLiveStateCmd -RestartExplorer ([bool]$metadata.RestartExplorer)
+        Start-QOTTweaksInstantToggleAsync -Control $Sender -ActionId ([string]$metadata.ActionId) -CommandName $commandName -TargetState $targetState -SetToggleStateCmd $metadata.SetToggleStateCmd -GetLiveStateCmd $metadata.GetLiveStateCmd
     }
     catch {
         try { Write-QLog ("Tweaks instant toggle failed: {0}. {1}" -f $metadata.ActionId, $_.Exception.Message) "ERROR" } catch { }
@@ -861,8 +500,7 @@ function Start-QOTTweaksInstantToggleAsync {
         [Parameter(Mandatory)][string]$CommandName,
         [Parameter(Mandatory)][bool]$TargetState,
         [AllowNull()]$SetToggleStateCmd,
-        [AllowNull()]$GetLiveStateCmd,
-        [bool]$RestartExplorer = $false
+        [AllowNull()]$GetLiveStateCmd
     )
 
     $controlName = [string]$Control.Name
@@ -883,19 +521,10 @@ function Start-QOTTweaksInstantToggleAsync {
     $Control.IsEnabled = $false
     try { $Control.ToolTip = if ($TargetState) { "Applying..." } else { "Reverting..." } } catch { }
 
-    $explorerRestartBatchId = 0
-
     if ([string]::Equals([string]$env:QOT_UI_TOGGLE_TEST_MODE, "1", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $explorerRestartBatchId = Register-QOTTweaksExplorerRestartBatchOperation
         if ($SetToggleStateCmd) {
             try { & $SetToggleStateCmd -ActionId $ActionId -IsEnabled $TargetState | Out-Null } catch { }
         }
-        if ($RestartExplorer) {
-            if (-not (Set-QOTTweaksExplorerRestartBatchPending -BatchId $explorerRestartBatchId -ActionId $ActionId)) {
-                Restart-QOTExplorerShell | Out-Null
-            }
-        }
-        Complete-QOTTweaksExplorerRestartBatchOperation -BatchId $explorerRestartBatchId
         try { $Control.ToolTip = $originalToolTip } catch { }
         $Control.IsEnabled = $true
         try { $state.Busy.Remove($controlName) | Out-Null } catch { }
@@ -947,14 +576,10 @@ function Start-QOTTweaksInstantToggleAsync {
     }).AddArgument($modulePath).AddArgument($CommandName)
 
     $asyncResult = $powerShell.BeginInvoke()
-    $explorerRestartBatchId = Register-QOTTweaksExplorerRestartBatchOperation
     $completionTimer = [System.Windows.Threading.DispatcherTimer]::new()
     $completionTimer.Interval = [TimeSpan]::FromMilliseconds(120)
     $timeoutStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $stopToggleOperationFn = ${function:Stop-QOTTweaksInstantToggleOperation}
-    $restartExplorerFn = ${function:Restart-QOTExplorerShell}
-    $setExplorerRestartBatchPendingFn = ${function:Set-QOTTweaksExplorerRestartBatchPending}
-    $completeExplorerRestartBatchOperationFn = ${function:Complete-QOTTweaksExplorerRestartBatchOperation}
 
     $state.Operations[$controlName] = @{
         Timer           = $completionTimer
@@ -963,7 +588,6 @@ function Start-QOTTweaksInstantToggleAsync {
         AsyncResult     = $asyncResult
         OriginalToolTip = $originalToolTip
         Stopwatch       = $timeoutStopwatch
-        ExplorerRestartBatchId = $explorerRestartBatchId
     }
 
     $completionHandler = [System.EventHandler]{
@@ -976,14 +600,10 @@ function Start-QOTTweaksInstantToggleAsync {
             return
         }
 
-        $operationExplorerRestartBatchId = 0
-        try { $operationExplorerRestartBatchId = [int]$operation.ExplorerRestartBatchId } catch { $operationExplorerRestartBatchId = 0 }
-
         $async = $operation.AsyncResult
         if (-not $async) {
             try { $completionTimer.Stop() } catch { }
             & $stopToggleOperationFn -ControlName $controlName
-            & $completeExplorerRestartBatchOperationFn -BatchId $operationExplorerRestartBatchId
             return
         }
 
@@ -1061,21 +681,6 @@ function Start-QOTTweaksInstantToggleAsync {
             }
         }
         else {
-            if ($RestartExplorer) {
-                if (-not (& $setExplorerRestartBatchPendingFn -BatchId $operationExplorerRestartBatchId -ActionId $ActionId)) {
-                    try {
-                        try { Write-QLog ("Tweaks: restarting Explorer for {0}" -f $ActionId) "DEBUG" } catch { }
-                        & $restartExplorerFn | Out-Null
-                    }
-                    catch {
-                        try { Write-QLog ("Tweaks: Explorer restart invocation failed for {0}: {1}" -f $ActionId, $_.Exception.Message) "WARN" } catch { }
-                    }
-                }
-                else {
-                    try { Write-QLog ("Tweaks: deferred Explorer restart for {0} until section batch completes." -f $ActionId) "DEBUG" } catch { }
-                }
-            }
-
             $resolvedState = $TargetState
             $liveStateAvailable = $false
             if ($GetLiveStateCmd) {
@@ -1109,7 +714,6 @@ function Start-QOTTweaksInstantToggleAsync {
         try { $Control.ToolTip = $originalToolTip } catch { }
         $Control.IsEnabled = $true
         try { $state.Busy.Remove($controlName) | Out-Null } catch { }
-        & $completeExplorerRestartBatchOperationFn -BatchId $operationExplorerRestartBatchId
     }.GetNewClosure()
 
     $completionTimer.Add_Tick($completionHandler)
@@ -1126,39 +730,10 @@ function Register-QOTTweaksInstantToggleHandlers {
     $setToggleStateCmd = Resolve-QOTTweaksToggleStateCommand -Name "Set-QOToggleActionState"
     $getLiveStateCmd = Get-Command Get-QOTTweaksLiveToggleState -ErrorAction SilentlyContinue | Select-Object -First 1
     $state = $script:QOTTweaksInstantToggleState
-    if (-not $script:QOTTweaksInstantToggleMouseHandler) {
-        $script:QOTTweaksInstantToggleMouseHandler = [System.Windows.Input.MouseButtonEventHandler]{
+    if (-not $script:QOTTweaksInstantToggleClickHandler) {
+        $script:QOTTweaksInstantToggleClickHandler = [System.Windows.RoutedEventHandler]{
             param($sender, $args)
-            try {
-                if ($sender -is [System.Windows.Controls.CheckBox]) {
-                    if (-not $sender.IsEnabled) { return }
-
-                    $state = $script:QOTTweaksInstantToggleState
-                    $controlName = [string]$sender.Name
-                    if ($state.Busy[$controlName]) {
-                        try { $args.Handled = $true } catch { }
-                        return
-                    }
-
-                    $previousRestoreFlag = [bool]$state.RestoreInProgress
-                    $state.RestoreInProgress = $true
-                    try {
-                        $sender.IsChecked = (-not [bool]$sender.IsChecked)
-                    }
-                    finally {
-                        $state.RestoreInProgress = $previousRestoreFlag
-                    }
-
-                    try { $sender.Focus() | Out-Null } catch { }
-                    try { $args.Handled = $true } catch { }
-                    try { $sender.UpdateLayout() } catch { }
-                    try { $sender.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render) | Out-Null } catch { }
-                    Invoke-QOTTweaksInstantToggle -Sender $sender
-                }
-            }
-            catch {
-                try { Write-QLog ("Tweaks mouse handler error: {0}" -f $_.Exception.ToString()) "ERROR" } catch { }
-            }
+            if ($sender.IsEnabled) { Invoke-QOTTweaksInstantToggle -Sender $sender }
         }
     }
 
@@ -1173,7 +748,7 @@ function Register-QOTTweaksInstantToggleHandlers {
 
         $existingHandlers = $state.Handlers[[string]$action.Name]
         if ($existingHandlers) {
-            try { $control.RemoveHandler([System.Windows.UIElement]::PreviewMouseLeftButtonUpEvent, $existingHandlers.MouseUp) } catch { }
+            try { $control.Remove_Click($existingHandlers.Click) } catch { }
         }
 
         $state.Metadata[[string]$action.Name] = @{
@@ -1182,7 +757,6 @@ function Register-QOTTweaksInstantToggleHandlers {
             Undo             = [string]$commandNames.Undo
             SetToggleStateCmd = $setToggleStateCmd
             GetLiveStateCmd  = $getLiveStateCmd
-            RestartExplorer  = (Test-QOTTweakRequiresExplorerRestart -ActionId ([string]$action.ActionId))
         }
 
         $resolvedState = $null
@@ -1222,14 +796,14 @@ function Register-QOTTweaksInstantToggleHandlers {
         }
 
         try {
-            $control.AddHandler([System.Windows.UIElement]::PreviewMouseLeftButtonUpEvent, $script:QOTTweaksInstantToggleMouseHandler, $true)
+            $control.Add_Click($script:QOTTweaksInstantToggleClickHandler)
         }
         catch {
-            try { Write-QLog ("Tweaks mouse handler attach failed for {0}: {1}" -f $action.ActionId, $_.Exception.ToString()) "ERROR" } catch { }
+            try { Write-QLog ("Tweaks click handler attach failed for {0}: {1}" -f $action.ActionId, $_.Exception.ToString()) "ERROR" } catch { }
         }
 
         $state.Handlers[[string]$action.Name] = @{
-            MouseUp = $script:QOTTweaksInstantToggleMouseHandler
+            Click = $script:QOTTweaksInstantToggleClickHandler
         }
     }
 }
@@ -1311,14 +885,12 @@ function Set-QOTTweaksSectionOptionsState {
         [Parameter(Mandatory)]
         [string[]]$OptionNames,
         [Parameter(Mandatory)]
-        [bool]$IsChecked,
-        [hashtable]$ActionMap = @{}
+        [bool]$IsChecked
     )
 
     $updated = 0
     $previousSync = [bool]$script:QOTTweaksSectionSelectorSyncInProgress
     $script:QOTTweaksSectionSelectorSyncInProgress = $true
-    $explorerRestartBatchId = Start-QOTTweaksExplorerRestartBatch
 
     try {
         foreach ($name in @($OptionNames)) {
@@ -1335,21 +907,10 @@ function Set-QOTTweaksSectionOptionsState {
             if ($metadata) {
                 Invoke-QOTTweaksInstantToggle -Sender $control
             }
-            elseif ($IsChecked) {
-                $actionId = $null
-                try { $actionId = [string]$ActionMap[[string]$control.Name] } catch { $actionId = $null }
-                if ([string]::IsNullOrWhiteSpace($actionId)) {
-                    try { $actionId = [string]$control.Tag } catch { $actionId = $null }
-                }
-                if (-not [string]::IsNullOrWhiteSpace($actionId)) {
-                    Invoke-QOTTweaksSectionOneShotAction -ActionId $actionId -Window $Window | Out-Null
-                }
-            }
             $updated++
         }
     }
     finally {
-        Stop-QOTTweaksExplorerRestartBatch -BatchId $explorerRestartBatchId
         $script:QOTTweaksSectionSelectorSyncInProgress = $previousSync
     }
 
@@ -1407,14 +968,12 @@ function Register-QOTTweaksSectionSelectors {
         [Parameter(Mandatory)]
         [System.Windows.Window]$Window,
         [Parameter(Mandatory)]
-        [hashtable[]]$Sections,
-        [hashtable]$ActionMap = @{}
+        [hashtable[]]$Sections
     )
 
     $sectionsSnapshot = @($Sections)
     $updateAllFn = ${function:Update-QOTTweaksSectionSelectorStates}
     $setSectionFn = ${function:Set-QOTTweaksSectionOptionsState}
-    $actionMap = if ($ActionMap) { $ActionMap } else { @{} }
 
     foreach ($section in $sectionsSnapshot) {
         if (-not $section -or [string]::IsNullOrWhiteSpace([string]$section.HeaderName)) { continue }
@@ -1425,8 +984,7 @@ function Register-QOTTweaksSectionSelectors {
 
         if ($script:QOTTweaksSectionSelectorHandlers.ContainsKey($headerName)) {
             $oldHandler = $script:QOTTweaksSectionSelectorHandlers[$headerName]
-            try { $header.Remove_Checked($oldHandler) } catch { }
-            try { $header.Remove_Unchecked($oldHandler) } catch { }
+            try { $header.Remove_Click($oldHandler) } catch { }
         }
 
         $sectionSnapshot = $section
@@ -1436,36 +994,14 @@ function Register-QOTTweaksSectionSelectors {
             if ($script:QOTTweaksSectionSelectorSyncInProgress) { return }
             $targetState = ($sender -is [System.Windows.Controls.CheckBox] -and $sender.IsChecked -eq $true)
 
-            $nowTicks = [Environment]::TickCount64
-            if (-not ($script:QOTTweaksSectionLastBulkActions -is [hashtable])) {
-                $script:QOTTweaksSectionLastBulkActions = @{}
-            }
-            $lastBulkAction = $null
-            try { $lastBulkAction = $script:QOTTweaksSectionLastBulkActions[$headerName] } catch { $lastBulkAction = $null }
-            if ($lastBulkAction) {
-                $lastTargetState = $null
-                $lastTicks = 0
-                try { $lastTargetState = [bool]$lastBulkAction.TargetState } catch { $lastTargetState = $null }
-                try { $lastTicks = [int64]$lastBulkAction.Ticks } catch { $lastTicks = 0 }
-                if ($null -ne $lastTargetState -and $lastTargetState -eq $targetState -and ($nowTicks - $lastTicks) -lt 2000) {
-                    try { Write-QLog ("Tweaks & Cleaning section {0} duplicate {1} event ignored." -f $sectionSnapshot.HeaderName, $targetState) "DEBUG" } catch { }
-                    return
-                }
-            }
-            $script:QOTTweaksSectionLastBulkActions[$headerName] = [pscustomobject]@{
-                TargetState = $targetState
-                Ticks = $nowTicks
-            }
-
-            $updated = & $setSectionFn -Window $Window -OptionNames ([string[]]$sectionSnapshot.OptionNames) -IsChecked $targetState -ActionMap $actionMap
+            $updated = & $setSectionFn -Window $Window -OptionNames ([string[]]$sectionSnapshot.OptionNames) -IsChecked $targetState
             & $updateAllFn -Window $Window -Sections $sectionsSnapshot
             $actionLabel = if ($targetState) { "checked" } else { "unchecked" }
             try { Write-QLog ("Tweaks & Cleaning section {0} {1} {2} boxes." -f $sectionSnapshot.HeaderName, $actionLabel, $updated) "DEBUG" } catch { }
         }.GetNewClosure()
 
         $script:QOTTweaksSectionSelectorHandlers[$headerName] = $handler
-        try { $header.Add_Checked($handler) } catch { }
-        try { $header.Add_Unchecked($handler) } catch { }
+        try { $header.Add_Click($handler) } catch { }
     }
 
     foreach ($section in $sectionsSnapshot) {
@@ -1509,7 +1045,7 @@ function Initialize-QOTTweaksAndCleaningUI {
             @{ Name = "CbCleanWuCache";         Label = "Clear Windows Update cache";             ActionId = "Invoke-QCleanWindowsUpdateCache" },
             @{ Name = "CbCleanThumbCache";      Label = "Clean thumbnail cache";                  ActionId = "Invoke-QCleanThumbnailCache" },
             @{ Name = "CbCleanErrorLogs";       Label = "Clean old error logs and crash dumps";   ActionId = "Invoke-QCleanErrorLogs" },
-            @{ Name = "CbCleanSetupLeftovers";  Label = "Remove safe setup / upgrade leftovers";  ActionId = "Invoke-QCleanSetupLeftovers" },
+            @{ Name = "CbCleanSetupLeftovers";  Label = "Clear archived Windows setup logs";  ActionId = "Invoke-QCleanSetupLeftovers" },
             @{ Name = "CbClearStoreCache";      Label = "Clear Microsoft Store cache";            ActionId = "Invoke-QCleanStoreCache" },
             @{ Name = "CbEdgeLightCleanup";     Label = "Light clean of Microsoft Edge cache";    ActionId = "Invoke-QCleanEdgeCache" },
             @{ Name = "CbChromeLightCleanup";   Label = "Light clean of Chrome / Chromium cache"; ActionId = "Invoke-QCleanChromeCache" },
@@ -1543,11 +1079,6 @@ function Initialize-QOTTweaksAndCleaningUI {
         )
         
         $actionsSnapshot = $actions
-        $sectionActionMap = @{}
-        foreach ($action in @($actionsSnapshot)) {
-            if (-not $action -or [string]::IsNullOrWhiteSpace([string]$action.Name)) { continue }
-            $sectionActionMap[[string]$action.Name] = [string]$action.ActionId
-        }
         $sectionSelectors = @(
             @{
                 HeaderName = "CbSectionStorageCleanup"
@@ -1690,11 +1221,14 @@ function Initialize-QOTTweaksAndCleaningUI {
             throw
         }
         
+        $queuedActions = @($actionsSnapshot | Where-Object {
+            -not (Get-QOTTweaksInstantToggleCommandNames -ActionId $_.ActionId)
+        })
         Register-QOTActionGroup -Name $actionGroupName -GetItems ({
             param($Window)
 
             $items = @()
-            foreach ($action in $actionsSnapshot) {
+            foreach ($action in $queuedActions) {
                 $actionName = $action.Name
                 $actionLabel = $action.Label
                 $actionId = $action.ActionId
@@ -1708,7 +1242,7 @@ function Initialize-QOTTweaksAndCleaningUI {
                         if ($window -is [System.Windows.FrameworkElement]) {
                             try { $control = $window.FindName($actionName) } catch { }
                         }
-                        return ($control -is [System.Windows.Controls.CheckBox] -and $control.IsChecked -eq $true)
+                        return ($control -is [System.Windows.Controls.CheckBox] -and $control.IsEnabled -and $control.IsChecked -eq $true)
                     }).GetNewClosure()
                 }
             }
@@ -1768,10 +1302,10 @@ function Initialize-QOTTweaksAndCleaningUI {
             $getNamedElementForCountFn = ${function:Get-QOTNamedElement}
             $updateSelectedCount = {
                 $selectedCount = 0
-                foreach ($mapped in $actionsSnapshot) {
+                foreach ($mapped in $queuedActions) {
                     if (-not $mapped -or [string]::IsNullOrWhiteSpace([string]$mapped.Name)) { continue }
                     $cb = & $getNamedElementForCountFn -Root $Window -Name ([string]$mapped.Name)
-                    if ($cb -is [System.Windows.Controls.CheckBox] -and $cb.IsChecked -eq $true) {
+                    if ($cb -is [System.Windows.Controls.CheckBox] -and $cb.IsEnabled -and $cb.IsChecked -eq $true) {
                         $selectedCount++
                     }
                 }
@@ -1784,7 +1318,7 @@ function Initialize-QOTTweaksAndCleaningUI {
                 catch { }
             }.GetNewClosure()
 
-            foreach ($mapped in $actionsSnapshot) {
+            foreach ($mapped in $queuedActions) {
                 if (-not $mapped -or [string]::IsNullOrWhiteSpace([string]$mapped.Name)) { continue }
                 $cb = Get-QOTNamedElement -Root $Window -Name ([string]$mapped.Name)
                 if ($cb -is [System.Windows.Controls.CheckBox]) {
@@ -1796,7 +1330,7 @@ function Initialize-QOTTweaksAndCleaningUI {
             & $updateSelectedCount
         }
 
-        Register-QOTTweaksSectionSelectors -Window $Window -Sections $sectionSelectors -ActionMap $sectionActionMap
+        Register-QOTTweaksSectionSelectors -Window $Window -Sections $sectionSelectors
 
         $btnSelectAllTabActions = Get-QOTNamedElement -Root $Window -Name "BtnSelectAllTabActions"
         if ($btnSelectAllTabActions) {

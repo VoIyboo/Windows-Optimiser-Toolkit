@@ -20,20 +20,19 @@ function Invoke-QResetWindowsFirewall {
         return New-QOTTaskResult -Name $taskName -Status "Skipped" -Reason "Admin required"
     }
 
-    $confirmed = $true
+    $confirmed = $false
     try {
-        Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
         $choice = [System.Windows.MessageBox]::Show(
             "Reset Windows Firewall to defaults? Custom inbound/outbound rules may be removed.",
             "Confirm Firewall Reset",
             [System.Windows.MessageBoxButton]::YesNo,
             [System.Windows.MessageBoxImage]::Warning
         )
-        if ($choice -ne [System.Windows.MessageBoxResult]::Yes) {
-            $confirmed = $false
-        }
+        $confirmed = ($choice -eq [System.Windows.MessageBoxResult]::Yes)
     }
     catch {
+        return New-QOTTaskResult -Name $taskName -Status "Skipped" -Reason "Confirmation unavailable" -Error $_.Exception.Message
     }
 
     if (-not $confirmed) {
@@ -47,17 +46,20 @@ function Invoke-QRestartWindowsExplorer {
     $taskName = "Restart Windows Explorer"
 
     try {
-        $explorerProcesses = @(Get-Process -Name "explorer" -ErrorAction SilentlyContinue)
+        $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+        $explorerProcesses = @(Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Where-Object SessionId -eq $sessionId)
         if ($explorerProcesses.Count -eq 0) {
             return New-QOTTaskResult -Name $taskName -Status "Skipped" -Reason "Explorer process not found"
         }
 
         foreach ($proc in $explorerProcesses) {
-            try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
+            Stop-Process -Id $proc.Id -Force -ErrorAction Stop
         }
 
         Start-Sleep -Milliseconds 700
-        Start-Process -FilePath "explorer.exe" -ErrorAction SilentlyContinue | Out-Null
+        if (-not (Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Where-Object SessionId -eq $sessionId)) {
+            Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ErrorAction Stop | Out-Null
+        }
         return New-QOTTaskResult -Name $taskName -Status "Success"
     }
     catch {
@@ -132,6 +134,8 @@ function Resolve-QOTNetshIpResetOutcome {
 }
 
 function Invoke-QNetworkReset {
+    param([ValidateRange(1,43200)][int]$TimeoutSeconds = 300)
+
     $taskName = "Network reset"
     if (-not (Test-QOTIsAdmin)) {
         return New-QOTTaskResult -Name $taskName -Status "Skipped" -Reason "Admin required"
@@ -142,6 +146,7 @@ function Invoke-QNetworkReset {
         return New-QOTTaskResult -Name $taskName -Status "Skipped" -Reason "Command unavailable: netsh.exe"
     }
 
+    $process = $null
     try {
         Write-QLog ("Network: running {0} int ip reset" -f $command.Source)
 
@@ -154,12 +159,23 @@ function Invoke-QNetworkReset {
         $startInfo.CreateNoWindow = $true
 
         $process = [System.Diagnostics.Process]::Start($startInfo)
-        $stdOut = $process.StandardOutput.ReadToEnd()
-        $stdErr = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
-
-        $exitCode = 0
-        try { $exitCode = [int]$process.ExitCode } catch { $exitCode = 0 }
+        $outputRead = $process.StandardOutput.ReadToEndAsync()
+        $errorRead = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $stopError = $null
+            try { $process.Kill() }
+            catch { if (!$process.HasExited) { $stopError = $_.Exception.Message } }
+            # Keep ownership until exit, including when Windows rejects termination.
+            if ($stopError) { Write-QLog ("Network: waiting for timed-out netsh to exit: {0}" -f $stopError) "WARN" }
+            $process.WaitForExit()
+            return New-QOTTaskResult -Name $taskName -Status "Failed" -Reason "Network reset timed out. Some settings may have changed." -Error $stopError
+        }
+        if (-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($outputRead,$errorRead), 5000)) {
+            return New-QOTTaskResult -Name $taskName -Status "Failed" -Reason "The network command exited but its output was incomplete."
+        }
+        $stdOut = $outputRead.GetAwaiter().GetResult()
+        $stdErr = $errorRead.GetAwaiter().GetResult()
+        $exitCode = $process.ExitCode
 
         if (-not [string]::IsNullOrWhiteSpace($stdOut)) {
             Write-QLog ("Network: netsh int ip reset stdout: {0}" -f (($stdOut -replace '\s+', ' ').Trim()))
@@ -173,6 +189,7 @@ function Invoke-QNetworkReset {
     catch {
         return New-QOTTaskResult -Name $taskName -Status "Failed" -Reason "Command failed" -Error $_.Exception.Message
     }
+    finally { if ($process) { $process.Dispose() } }
 }
 
 function Invoke-QRepairAdapter {

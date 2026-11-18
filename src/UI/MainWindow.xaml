@@ -904,6 +904,7 @@
             <Grid Grid.Row="1" Margin="10">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="56" />
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="10" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
@@ -914,7 +915,6 @@
                     BorderThickness="1"
                     CornerRadius="10"
                     Padding="4,6">
-                <Grid x:Name="RailShellGrid">
                     <ScrollViewer VerticalScrollBarVisibility="Disabled"
                                   HorizontalScrollBarVisibility="Disabled"
                                   Focusable="False">
@@ -1044,14 +1044,14 @@
                         </Border>
                         </StackPanel>
                     </ScrollViewer>
+            </Border>
 
-                    <Border x:Name="TicketsRailSubmenu"
+                    <Border Grid.Column="1"
+                            x:Name="TicketsRailSubmenu"
                             Visibility="Collapsed"
-                            Width="38"
-                            HorizontalAlignment="Center"
+                            Width="40"
                             VerticalAlignment="Top"
-                            Margin="0,0,0,0"
-                            Panel.ZIndex="30"
+                            Margin="4,6,0,0"
                             Background="#08111F"
                             BorderBrush="#20314B"
                             BorderThickness="1"
@@ -1093,10 +1093,8 @@
                             </Button>
                         </StackPanel>
                     </Border>
-                </Grid>
-            </Border>
 
-            <ContentControl Grid.Column="2" x:Name="MainContentHost">
+            <ContentControl Grid.Column="3" x:Name="MainContentHost">
             <TabControl x:Name="MainTabControl"
                         Background="#0F172A"
                         BorderBrush="#111827"
@@ -1656,7 +1654,7 @@
                                 <Trigger Property="Tag" Value="Invoke-QCleanWindowsUpdateCache"><Setter Property="ToolTip" Value="Caution: Windows Update may re-download required files." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanThumbnailCache"><Setter Property="ToolTip" Value="Safe: refresh Explorer thumbnail and preview cache." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanErrorLogs"><Setter Property="ToolTip" Value="Safe: remove old error logs and crash dump files." /></Trigger>
-                                <Trigger Property="Tag" Value="Invoke-QCleanSetupLeftovers"><Setter Property="ToolTip" Value="Safe: remove setup leftovers from past upgrades." /></Trigger>
+                                <Trigger Property="Tag" Value="Invoke-QCleanSetupLeftovers"><Setter Property="ToolTip" Value="Removes archived setup logs in the Windows Panther folder." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanStoreCache"><Setter Property="ToolTip" Value="Safe: reset local Microsoft Store cache files." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanEdgeCache"><Setter Property="ToolTip" Value="Light cleanup of Microsoft Edge cache files." /></Trigger>
                                 <Trigger Property="Tag" Value="Invoke-QCleanChromeCache"><Setter Property="ToolTip" Value="Light cleanup of Chrome and Chromium cache files." /></Trigger>
@@ -1745,7 +1743,7 @@
                                                       Content="Windows housekeeping"
                                                       ToolTip="Check every option in Windows housekeeping" />
                                             <CheckBox x:Name="CbCleanErrorLogs" Tag="Invoke-QCleanErrorLogs" Content="Clean old error logs and crash dumps" />
-                                            <CheckBox x:Name="CbCleanSetupLeftovers" Tag="Invoke-QCleanSetupLeftovers" Content="Remove safe setup / upgrade leftovers" />
+                                            <CheckBox x:Name="CbCleanSetupLeftovers" Tag="Invoke-QCleanSetupLeftovers" Content="Clear archived Windows setup logs" />
                                             <CheckBox x:Name="CbClearStoreCache" Tag="Invoke-QCleanStoreCache" Content="Clear Microsoft Store cache" />
                                             <CheckBox x:Name="CbClearEventLogs" Tag="Invoke-QClearWindowsEventLogs" Content="Clear Windows Event Logs" />
                                             <CheckBox x:Name="CbClearTeamsCache" Tag="Invoke-QCleanTeamsCache" Content="Clear Microsoft Teams cache" />
@@ -1786,6 +1784,9 @@
                                         </GroupBox.Header>
                                         <StackPanel Margin="4">
 
+                                            <TextBlock Text="Some Start menu, taskbar and right-click menu changes take effect at your next sign-in."
+                                                       Foreground="{StaticResource TextSubtle}"
+                                                       TextWrapping="Wrap" Margin="4,0,4,6" />
                                             <CheckBox x:Name="CbSectionStartMenuRecommendations"
                                                       Tag="SectionSelector"
                                                       Style="{StaticResource SectionHeaderCheckBoxStyle}"
@@ -1914,7 +1915,7 @@
                                     <StackPanel Grid.Column="1"
                                                  Margin="2,0,0,0"
                                                  VerticalAlignment="Center">
-                                        <TextBlock Text="{Binding Name}"
+                                        <TextBlock Text="{Binding DisplayName}" ToolTip="{Binding RegistryKeyPath}"
                                                    Foreground="White"
                                                    FontSize="13"
                                                    TextWrapping="NoWrap"
@@ -2619,7 +2620,7 @@
                                 <Trigger Property="Name" Value="CbAdvDeepCacheCleanup"><Setter Property="ToolTip" Value="High-risk: deep cache and component store cleanup actions." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvCleanComponentStore"><Setter Property="ToolTip" Value="Caution: removes superseded Windows component files using DISM cleanup." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvAggressiveComponentStoreCleanup"><Setter Property="ToolTip" Value="High-risk: deeper DISM cleanup that may remove update rollback capability." /></Trigger>
-                                <Trigger Property="Name" Value="CbAdvScanUnusedDeviceDrivers"><Setter Property="ToolTip" Value="Scan/report mode for orphaned or unused driver packages. No driver packages are removed by this action." /></Trigger>
+                                <Trigger Property="Name" Value="CbAdvScanUnusedDeviceDrivers"><Setter Property="ToolTip" Value="Counts third-party driver packages reported by PnPUtil." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvDisableTelemetryScheduledTasks"><Setter Property="ToolTip" Value="Safe: disables selected telemetry and CEIP scheduled tasks." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvDisableIPv6"><Setter Property="ToolTip" Value="Disable IPv6 stack usage on network adapters." /></Trigger>
                                 <Trigger Property="Name" Value="CbAdvDisableTeredo"><Setter Property="ToolTip" Value="Disable Teredo tunneling components and related services." /></Trigger>
@@ -2698,7 +2699,7 @@
                                             <CheckBox x:Name="CbAdvRemoveOldProfiles" Content="Remove old profiles" />
                                             <CheckBox x:Name="CbAdvCleanComponentStore" Content="Clean Windows Component Store" />
                                             <CheckBox x:Name="CbAdvDisableTelemetryScheduledTasks" Content="Disable telemetry scheduled tasks" />
-                                            <CheckBox x:Name="CbAdvScanUnusedDeviceDrivers" Content="Scan unused device drivers (report only)" />
+                                            <CheckBox x:Name="CbAdvScanUnusedDeviceDrivers" Content="Count third-party driver packages (report only)" />
                                             <CheckBox x:Name="CbAdvAggressiveRestoreCleanup" Content="Aggressive restore/log cleanup" />
                                             <CheckBox x:Name="CbAdvDeepCacheCleanup" Content="Deep cache/component store cleanup" />
                                             <CheckBox x:Name="CbAdvAggressiveComponentStoreCleanup" Content="Aggressive component store cleanup" />
@@ -3104,6 +3105,28 @@
                         </DataGridTemplateColumn>
                     </DataGrid.Columns>
                 </DataGrid>
+
+                <TextBlock x:Name="TicketsEmptyText"
+                           Grid.Row="0" Margin="24" Text="Loading tickets..."
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextAlignment="Center" TextWrapping="Wrap"
+                           Foreground="{StaticResource TextSubtle}" IsHitTestVisible="False">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Visibility" Value="Collapsed" />
+                            <Style.Triggers>
+                                <MultiDataTrigger>
+                                    <MultiDataTrigger.Conditions>
+                                        <Condition Binding="{Binding ElementName=TicketsGrid, Path=HasItems}" Value="False" />
+                                        <Condition Binding="{Binding ElementName=TicketsGrid, Path=Visibility}" Value="Visible" />
+                                        <Condition Binding="{Binding ElementName=TicketsStartupErrorPanel, Path=Visibility}" Value="Collapsed" />
+                                    </MultiDataTrigger.Conditions>
+                                    <Setter Property="Visibility" Value="Visible" />
+                                </MultiDataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
 
                 <Border x:Name="TicketsStartupErrorPanel"
                         Grid.Row="0"

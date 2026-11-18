@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory=$true)][string]$ToolkitRoot,
     [string]$ReplyCommand = "Send-QOTicketReply",
     [Parameter(Mandatory=$true)][string]$PayloadPath,
-    [string]$ResultPath
+    [string]$ResultPath,
+    [switch]$TransportOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,6 +54,7 @@ function Write-QOTReplyRunnerResult {
     $json
 }
 
+$dispatchStarted = $false
 try {
     Write-QOTReplyRunnerLog ("Reply runner starting. ToolkitRoot='{0}' PayloadPath='{1}' ResultPath='{2}' ReplyCommand='{3}'" -f $ToolkitRoot, $PayloadPath, $ResultPath, $ReplyCommand)
     if ([string]::IsNullOrWhiteSpace($ToolkitRoot)) {
@@ -78,12 +80,13 @@ try {
         throw "Ticket storage command unavailable."
     }
 
-    $payloadRaw = [string](Get-Content -LiteralPath $PayloadPath -Raw -ErrorAction Stop)
+    $payloadRaw = [IO.File]::ReadAllText($PayloadPath)
     if ([string]::IsNullOrWhiteSpace($payloadRaw)) {
         throw "Reply payload was empty."
     }
 
     $payload = $payloadRaw | ConvertFrom-Json -ErrorAction Stop
+    if ($payload.PSObject.Properties['StorePath']) { Assert-QOTicketWorkerStore -StorePath $payload.StorePath }
     $ticketId = ""
     $subject = ""
     $body = ""
@@ -119,29 +122,25 @@ try {
         exit 0
     }
 
-    $rawResult = & $ReplyCommand -Ticket $ticket -Subject $subject -Body $body -PendingReplyDraftId $pendingReplyDraftId
-    if (-not $rawResult) {
-        $rawResult = New-QOTReplyRunnerResult -Success:$false -Note "Reply command returned no result."
+    $replyParams = @{ Ticket = $ticket; Subject = $subject; Body = $body; PendingReplyDraftId = $pendingReplyDraftId }
+    if ($TransportOnly) { $replyParams.TransportOnly = $true }
+    $dispatchStarted = $true
+    $rawResult = & $replyCmd @replyParams
+    if ($null -eq $rawResult -or $rawResult.Success -isnot [bool]) {
+        throw "Reply transport did not return an explicit submission result."
     }
 
-    $success = $false
-    $note = ""
-    try { if ($rawResult.PSObject.Properties.Name -contains "Success") { $success = [bool]$rawResult.Success } } catch { $success = $false }
-    try { if ($rawResult.PSObject.Properties.Name -contains "Note") { $note = [string]$rawResult.Note } } catch { $note = "" }
-
-    if ($rawResult.PSObject.Properties.Name -notcontains "Success") {
-        if ($note -notmatch '(?i)\b(failed|unavailable|not found|required|missing|error)\b') {
-            $success = $true
-        }
-    }
-
-    Write-QOTReplyRunnerLog ("Reply runner completed. Success={0} Note='{1}' TicketId='{2}'" -f $success, $note, $ticketId)
-    Write-QOTReplyRunnerResult -Result (New-QOTReplyRunnerResult -Success:$success -Note $note)
+    Write-QOTReplyRunnerLog ("Reply runner completed. Success={0} Note='{1}' TicketId='{2}'" -f $rawResult.Success, $rawResult.Note, $ticketId)
+    Write-QOTReplyRunnerResult -Result $rawResult
     exit 0
 }
 catch {
     $failure = New-QOTReplyRunnerResult -Success:$false -Note ("Reply runner failed: " + $_.Exception.Message)
     Write-QOTReplyRunnerLog ("Reply runner failed. " + $_.Exception.Message) "ERROR"
+    if ($dispatchStarted) {
+        $failure.Note = "Outlook did not confirm submission. Check Outbox and Sent Items before resending."
+        $failure | Add-Member -NotePropertyName SubmissionUnconfirmed -NotePropertyValue $true
+    }
     Write-QOTReplyRunnerResult -Result $failure
     exit 1
 }

@@ -169,6 +169,18 @@ src\
 irm 'https://raw.githubusercontent.com/VoIyboo/Windows-Optimiser-Toolkit/main/bootstrap.ps1' | iex
 ```
 
+For a downloaded ZIP, extract it and double-click `Open-Quinn.vbs` to open the app without a command window. You can also run `.\run-local.ps1` from an existing PowerShell session.
+
+## Running the tests
+
+From the extracted project folder, run the regression suites in Windows PowerShell 5.1.
+
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\Run-All.ps1
+```
+
+The suites use disposable ticket stores, simulated mail and package commands, and WPF controls. They exercise cleanup against fixture files.
+
 ---
 
 # 🛠️ Development Philosophy

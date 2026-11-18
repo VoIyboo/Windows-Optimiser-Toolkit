@@ -199,6 +199,8 @@ function Get-QOTWin32InstalledApps {
             $results.Add([pscustomobject]@{
                 IsSelected      = $false
                 Name            = $name
+                Publisher       = $publisher
+                Version         = [string]$item.DisplayVersion
                 InstallDate     = $installDate
                 Source          = "Win32"
                 PackageName     = $null
@@ -270,6 +272,8 @@ function Get-QOTStoreInstalledApps {
         $results.Add([pscustomobject]@{
             IsSelected      = $false
             Name            = $name
+            Publisher       = $publisher
+            Version         = [string]$appx.Version
             InstallDate     = $null
             Source          = "Store"
             PackageName     = $name
@@ -310,8 +314,27 @@ function Get-QOTInstalledApps {
         $scanErrors.Add($_.Exception.Message) | Out-Null
         try { Write-QLog ("Store app scan failed: {0}" -f $_.Exception.Message) "ERROR" } catch { }
     }
+    if ($scanErrors.Count -and !$win32Apps.Count -and !$storeApps.Count) {
+        throw ("Installed app inventory is unavailable. " + ($scanErrors -join ' / '))
+    }
 
-    $results = @($win32Apps + $storeApps | Sort-Object Name, Source -Unique | Sort-Object Name)
+    $results = @($win32Apps + $storeApps | Sort-Object Name, Source, RegistryKeyPath -Unique)
+    foreach ($group in @($results | Group-Object Name | Where-Object Count -gt 1)) {
+        foreach ($app in $group.Group) {
+            $registration = [string]$app.RegistryKeyPath
+            $scope = switch -Regex ($registration) {
+                'HKCU:|HKEY_CURRENT_USER' { 'Current user'; break }
+                'HKLM:|HKEY_LOCAL_MACHINE' { 'All users'; break }
+                default { [string]$app.Source }
+            }
+            $details = @($scope, $app.Publisher, $app.Version | Where-Object { $_ })
+            $app | Add-Member NoteProperty DisplayName ("{0} ({1})" -f $app.Name, ($details -join ', ')) -Force
+        }
+        # Two registrations can have the same publisher, version and scope.
+        foreach ($ambiguous in @($group.Group | Group-Object DisplayName | Where-Object Count -gt 1)) {
+            foreach ($app in $ambiguous.Group) { $app.DisplayName = "{0} ({1})" -f $app.Name,$app.RegistryKeyPath }
+        }
+    }
 
     try { Write-QLog ("Win32 found: {0}, Store found: {1}" -f $win32Apps.Count, $storeApps.Count) "INFO" } catch { }
 
@@ -329,12 +352,14 @@ function Get-QOTInstalledAppsCached {
         [switch]$IncludeAllUsersStore
     )
 
-    if (-not $ForceRefresh -and $Global:QOT_InstalledAppsCache -and $Global:QOT_InstalledAppsCache.Count -gt 0) {
+    if (-not $ForceRefresh -and $null -ne $Global:QOT_InstalledAppsCache -and $Global:QOT_InstalledAppsCacheTimestamp -and
+        [bool]$Global:QOT_InstalledAppsCacheIncludesAllUsers -eq $IncludeAllUsersStore.IsPresent) {
         return @($Global:QOT_InstalledAppsCache)
     }
 
     $results = @(Get-QOTInstalledApps -IncludeAllUsersStore:$IncludeAllUsersStore)
     $Global:QOT_InstalledAppsCache = $results
+    $Global:QOT_InstalledAppsCacheIncludesAllUsers = $IncludeAllUsersStore.IsPresent
     $Global:QOT_InstalledAppsCacheTimestamp = Get-Date
     return $results
 }
