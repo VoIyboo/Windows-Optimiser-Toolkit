@@ -504,6 +504,14 @@ function Get-QOTInstalledToolkitRoot {
         return $Layout.CurrentRoot
     }
 
+    # A missing or damaged install record can leave a complete release on disk.
+    foreach ($release in (Get-ChildItem -LiteralPath $Layout.ReleasesRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^(?:[0-9a-f]{40}(?:-[0-9a-f]{32})?|[0-9a-f]{32})$' } |
+            Sort-Object CreationTimeUtc -Descending)) {
+        if (Test-Path -LiteralPath (Join-Path $release.FullName 'src\Intro\Intro.ps1') -PathType Leaf) {
+            return $release.FullName
+        }
+    }
     return ""
 }
 
@@ -603,7 +611,7 @@ function Find-QOTToolkitRoot {
     $candidateRoots = New-Object System.Collections.Generic.List[string]
     $candidateRoots.Add($SearchRoot) | Out-Null
 
-    foreach ($directory in (Get-ChildItem -Path $SearchRoot -Directory -Recurse -ErrorAction SilentlyContinue)) {
+    foreach ($directory in (Get-ChildItem -LiteralPath $SearchRoot -Directory -Recurse -ErrorAction SilentlyContinue)) {
         $candidateRoots.Add($directory.FullName) | Out-Null
     }
 
@@ -846,7 +854,9 @@ try {
     $shouldInstallOrUpdate = $ForceRefresh.IsPresent -or (-not $hasInstalledCopy)
     if (-not $shouldInstallOrUpdate -and $remoteInfo) {
         $installedSha = ""
-        try { $installedSha = ([string]($state.CommitSha + "")).Trim() } catch { $installedSha = "" }
+        if ($state -and $installedToolkitRoot -eq $state.InstallRoot) {
+            $installedSha = ([string]$state.CommitSha).Trim()
+        }
         if ([string]::IsNullOrWhiteSpace($installedSha)) {
             $shouldInstallOrUpdate = $true
         }

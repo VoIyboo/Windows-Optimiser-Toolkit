@@ -23,6 +23,11 @@ function global:Start-QuinnFixtureTicketAction($Action, $PayloadPath, $ResultPat
     $payload = [IO.File]::ReadAllText($PayloadPath) | ConvertFrom-Json
     $global:QuinnTicketActions.Add([pscustomobject]@{ Action=$Action; Payload=$payload })
     $result = @{ Success=$true; TicketId=$payload.TicketId; DraftId=$payload.DraftId; NoteId=$payload.NoteId }
+    if ($global:QuinnFailNextTicketAction) {
+        $result.Success = $false
+        $result.Note = 'Fixture failed to save'
+        $global:QuinnFailNextTicketAction = $false
+    }
     [IO.File]::WriteAllText($ResultPath, (ConvertTo-Json $result))
     [pscustomobject]@{ HasExited=$true; ExitCode=0 }
 }
@@ -35,6 +40,16 @@ function global:Get-QuinnTestControls($root, [type]$type) {
 }
 function global:Invoke-QuinnTestClick($control) {
     $control.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+}
+
+function Open-QuinnTestTicket($grid, $id) {
+    $grid.SelectedItem = $grid.Items | Where-Object Id -eq $id
+    $source = [Windows.PresentationSource]::FromVisual($grid)
+    $enter = [Windows.Input.KeyEventArgs]::new([Windows.Input.Keyboard]::PrimaryDevice,$source,0,[Windows.Input.Key]::Enter)
+    $enter.RoutedEvent = [Windows.UIElement]::PreviewKeyDownEvent
+    $grid.RaiseEvent($enter)
+    $grid.UpdateLayout()
+    return $enter.Handled
 }
 
 function Invoke-QuinnTestTicketScenario($window, $FixtureSource) {
@@ -151,13 +166,7 @@ function Invoke-QuinnTestTicketScenario($window, $FixtureSource) {
     $queue = & $core { Get-QOTPendingReplyQueueSnapshot }
     Assert ($queue.ActiveCount -eq 1 -and $queue.Entries[0].TicketId -eq $second.Id -and @($first.PendingReplies).Count -eq 0 -and $draft.To -ceq "o'brien@example.invalid" -and $draft.SenderMailbox -eq 'help@example.invalid' -and $draft.Body -eq 'A fixture message') 'The initial email queues once against its own ticket, exact recipient and sender mailbox'
 
-    $grid.SelectedItem = $grid.Items | Where-Object Id -eq $second.Id
-    $source = [Windows.PresentationSource]::FromVisual($grid)
-    $enter = [Windows.Input.KeyEventArgs]::new([Windows.Input.Keyboard]::PrimaryDevice,$source,0,[Windows.Input.Key]::Enter)
-    $enter.RoutedEvent = [Windows.UIElement]::PreviewKeyDownEvent
-    $grid.RaiseEvent($enter)
-    $window.UpdateLayout()
-    Assert ($enter.Handled -and $window.FindName('TicketDetailsPanel').IsVisible) 'Enter opens the selected customer ticket'
+    Assert ((Open-QuinnTestTicket $grid $second.Id) -and $window.FindName('TicketDetailsPanel').IsVisible) 'Enter opens the selected customer ticket'
     $send = $window.FindName('BtnSendTicketReply')
     $body = $window.FindName('TicketReplyText')
     Invoke-QuinnTestClick ($window.FindName('BtnComposeReplyCustomer'))
@@ -184,6 +193,55 @@ function Invoke-QuinnTestTicketScenario($window, $FixtureSource) {
         & $ticketUi { $script:TicketsBackgroundActionTimers | Select-Object @{Name='TimerRunning';Expression={$_.Timer.IsEnabled}},ResultPath | Out-Host }
     }
     Assert (($global:QuinnTicketDiagnostics -contains $replySuccess) -and [bool]($global:QuinnTicketDiagnostics -like $noteSuccess)) 'The UI reads both result files and confirms the reply and note on the selected ticket'
+
+    $noteButton = $window.FindName('BtnComposeInternalNote')
+    $replyButton = $window.FindName('BtnComposeReplyCustomer')
+    $backButton = $window.FindName('BtnRailTicketBack')
+    $body.Text = 'Sensitive internal draft'
+    Invoke-QuinnTestClick $replyButton
+    $replyWasEmpty = !$body.Text
+    $body.Text = 'Public draft'
+    & $ticketUi { $null = Invoke-QOTicketsFilterSafely -Grid $script:TicketsGrid -ForceRefresh }
+    $validAfterRefresh = $send.IsEnabled -and $body.Text -eq 'Public draft'
+    Invoke-QuinnTestClick $noteButton
+    $noteRestored = $body.Text -eq 'Sensitive internal draft'
+    Invoke-QuinnTestClick $backButton
+    $null = Open-QuinnTestTicket $grid $first.Id
+    $otherWasEmpty = !$body.Text
+    $body.Text = 'First customer only'
+    Invoke-QuinnTestClick $backButton
+    $null = Open-QuinnTestTicket $grid $second.Id
+    $restoredAfterNavigation = $send.Content -eq 'Save internal note' -and $body.Text -eq 'Sensitive internal draft'
+    Invoke-QuinnTestClick $replyButton
+    $publicRestored = $body.Text -eq 'Public draft'
+    Assert $replyWasEmpty 'Choosing customer reply cannot expose an unsent internal note'
+    Assert $validAfterRefresh 'Refreshing a manual ticket preserves its valid reply and send button'
+    Assert $noteRestored 'Switching between reply and internal note retains the separate drafts'
+    Assert ($otherWasEmpty -and $restoredAfterNavigation -and $publicRestored) 'Opening another customer keeps both drafts with their original ticket'
+
+    $current = & $core { param($id) (Get-QOTickets -Quiet).Tickets | Where-Object Id -eq $id } $second.Id
+    $current.EmailTo = 'changed@example.invalid'
+    $null = & $core { param($item) Update-QOTicket $item } $current
+    & $ticketUi { $null = Invoke-QOTicketsFilterSafely -Grid $script:TicketsGrid -ForceRefresh }
+    Assert ($grid.SelectedItem.EmailTo -eq 'changed@example.invalid') 'The queue reflects a contact correction made during composition'
+    $beforeRouteCheck = $global:QuinnTicketActions.Count
+    Invoke-QuinnTestClick $send
+    Assert ($global:QuinnTicketActions.Count -eq $beforeRouteCheck -and $body.Text -eq 'Public draft') 'A contact change holds the original draft before any reply is queued'
+    $body.Clear()
+    $body.Text = 'Reviewed reply for the corrected address'
+    Invoke-QuinnTestClick $send
+    $latest = $global:QuinnTicketActions | Select-Object -Last 1
+    Assert ($global:QuinnTicketActions.Count -eq $beforeRouteCheck+1 -and $latest.Payload.ExpectedRoute.To -ceq 'changed@example.invalid' -and $latest.Payload.Body -ceq 'Reviewed reply for the corrected address') 'A freshly composed reply uses the reviewed customer address'
+    Invoke-QuinnTestClick $noteButton
+    $body.Text = 'Private note awaiting storage'
+    $global:QuinnFailNextTicketAction = $true
+    Invoke-QuinnTestClick $send
+    Invoke-QuinnTestClick $replyButton
+    $body.Text = 'An unrelated customer reply'
+    Wait-For { $global:QuinnTicketDiagnostics -like '*Background internal note save failed*Fixture failed to save*' }
+    Assert ($body.Text -eq 'An unrelated customer reply') 'A delayed note failure cannot overwrite a customer reply'
+    Invoke-QuinnTestClick $noteButton
+    Assert ($body.Text -eq 'Private note awaiting storage') 'A failed note is restored to its private draft after switching modes'
 }
 
 Add-Type -AssemblyName PresentationFramework

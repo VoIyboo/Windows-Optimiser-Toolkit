@@ -53,7 +53,7 @@ class FakePackageManager {
     }
 }
 "@
-    Add-Type -TypeDefinition $source -OutputAssembly $exe -OutputType ConsoleApplication
+    & (Join-Path $PSScriptRoot 'New-TestExecutable.ps1') -Path $exe -Source $source
     $actions = Import-Module (Join-Path $src 'Apps/Apps.Actions.psm1') -PassThru -DisableNameChecking
     $helpers = Import-Module (Join-Path $src 'Apps/Apps.Helpers.psm1') -PassThru -DisableNameChecking
     Import-Module (Join-Path $src 'Apps/InstallCommonApps.psm1') -DisableNameChecking
@@ -194,6 +194,80 @@ class FakePackageManager {
         $null -ne $Global:QOT_ScannedWingetIds -and $Global:QOT_ScannedWingetIds.Contains('Notepad++.Notepad++')
     }
     Check 'empty selection returns skipped' { (& $entry -Window $window).Status -eq 'Skipped' }
+
+    $scanner = Import-Module (Join-Path $root 'src/Apps/InstalledApps.psm1') -PassThru -DisableNameChecking
+    Check 'an unavailable rescan retains the last installed-app inventory' {
+        & $scanner {
+            $offline = $false
+            function Get-QOTWin32InstalledApps {
+                if ($offline) { throw 'Registry unavailable' }
+                [pscustomobject]@{ Name='Cached fixture'; Source='Win32'; RegistryKeyPath='HKCU:fixture' }
+            }
+            function Get-QOTStoreInstalledApps { if ($offline) { throw 'Store unavailable' } }
+            $previous = @(Get-QOTInstalledAppsCached -ForceRefresh)
+            $offline = $true
+            try {
+                $null = Get-QOTInstalledAppsCached -ForceRefresh
+            } catch {
+                return ($previous.Count -eq 1 -and $Global:QOT_InstalledAppsCache[0].Name -eq 'Cached fixture')
+            }
+            return $false
+        }
+    }
+    Check 'the all-users inventory has its own cache scope' {
+        & $scanner {
+            function Get-QOTWin32InstalledApps { }
+            function Get-QOTStoreInstalledApps([switch]$IncludeAllUsers) {
+                [pscustomobject]@{ Name=if ($IncludeAllUsers) { 'All users fixture' } else { 'Current user fixture' }; Source='Store'; RegistryKeyPath='APPX:fixture' }
+            }
+            $current = @(Get-QOTInstalledAppsCached -ForceRefresh)
+            $all = @(Get-QOTInstalledAppsCached -IncludeAllUsersStore)
+            $back = @(Get-QOTInstalledAppsCached)
+            $current[0].Name -eq 'Current user fixture' -and $all[0].Name -eq 'All users fixture' -and $back[0].Name -eq 'Current user fixture'
+        }
+    }
+    $twins = @(& $scanner {
+        param($fixtureExe)
+        function Get-ItemProperty($Path) {
+            if ($Path -like '*WOW6432Node*') { return }
+            $scope = if ($Path -like 'HKCU:*') { 'user' } else { 'machine' }
+            [pscustomobject]@{
+                DisplayName='Twin editor'; DisplayVersion='2.1'; Publisher='Fixture'
+                PSPath=($Path.TrimEnd('*') + 'TwinEditor')
+                UninstallString=('"{0}" record twin-{1}' -f $fixtureExe,$scope)
+            }
+        }
+        function Get-AppxPackage { }
+        Get-QOTInstalledApps
+    } $exe)
+    Check 'same-name personal and machine installations remain separately identifiable' {
+        $twins.Count -eq 2 -and @($twins.DisplayName | Select-Object -Unique).Count -eq 2 -and
+            @($twins.RegistryKeyPath | Select-Object -Unique).Count -eq 2
+    }
+    Check 'two registrations for the same uninstall command run it once per batch' {
+        $grid.ItemsSource = @(foreach ($key in 'HKCU:fixture','HKLM:fixture') {
+            [pscustomobject]@{Name='Shared uninstall'; RegistryKeyPath=$key; UninstallString=('"{0}" fail shared' -f $exe); IsSelected=$true; Source='Win32'}
+        })
+        $result = & $entry -Window $window
+        $calls = @(Get-Content $env:QOT_TEST_APP_LOG | Where-Object { $_ -ceq 'fail|shared' })
+        $result.Status -eq 'Failed' -and $calls.Count -eq 1 -and @($grid.ItemsSource | Where-Object IsSelected).Count -eq 2
+    }
+    Check 'Play uses only the selected registration for identically named apps' {
+        $grid.ItemsSource = $twins
+        $chosen = $twins | Where-Object RegistryKeyPath -like 'HKCU:*'
+        $chosen.IsSelected = $true
+        $beforePlay = $Global:QOT_InstalledAppsCacheTimestamp
+        $result = & $entry -Window $window
+        $frame = [Windows.Threading.DispatcherFrame]::new()
+        $timer = [Windows.Threading.DispatcherTimer]::new()
+        $timer.Interval = [timespan]::FromMilliseconds(50)
+        $limit = [datetime]::UtcNow.AddSeconds(8)
+        $timer.Add_Tick({ if ($Global:QOT_InstalledAppsCacheTimestamp -gt $beforePlay -or [datetime]::UtcNow -gt $limit) { $frame.Continue = $false } }.GetNewClosure())
+        $timer.Start()
+        try { [Windows.Threading.Dispatcher]::PushFrame($frame) } finally { $timer.Stop() }
+        $calls = @(Get-Content $env:QOT_TEST_APP_LOG | Where-Object { $_ -like 'record|twin-*' })
+        $twins.Count -eq 2 -and $result.Status -eq 'Success' -and $calls.Count -eq 1 -and $calls[0] -ceq 'record|twin-user'
+    }
 } finally {
     foreach ($name in $oldEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $oldEnvironment[$name], 'Process') }
     $target = (Resolve-Path -LiteralPath $fixture).Path

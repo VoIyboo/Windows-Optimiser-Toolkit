@@ -44,6 +44,12 @@ $app | Add-Member ScriptMethod CreateItem { $this.Draft }
     function script:Write-QOTOutlookSyncLog { }
 } $mapi $app
 
+$stored = [pscustomobject]@{ Id='stored'; Source='Outlook'; SourceMessageId='entry'; EmailBody='original body'; UpdatedAt='2026-09-21 09:00:00' }
+$incoming = [pscustomobject]@{ SourceMessageId='entry'; SenderEmail='customer@example.invalid'; UpdatedAt='2026-08-20 10:00:00'; EmailBody='original body' }
+$changed = & $module { param($row,$mail) Update-QOTExistingTicketFromMailItem $row $mail } $stored $incoming
+$unchanged = & $module { param($row,$mail) Update-QOTExistingTicketFromMailItem $row $mail } $stored $incoming
+Assert ($changed -and !$unchanged -and $stored.SenderEmail -eq $incoming.SenderEmail -and $stored.UpdatedAt -eq '2026-09-21 09:00:00') 'A sender-only update schedules a save once and keeps newer local edits dated correctly'
+
 $normalized = & $module { param($value) Normalize-QOTEmailAddress $value } $address
 Assert ($normalized -ceq $address) 'Mailbox lookup preserves apostrophes in the complete address'
 $result = Send-QOTicketOutlookEmail -To "Customer <$address>" -Subject 'Fixture' -Body 'Fixture'
@@ -109,6 +115,7 @@ $items | Add-Member ScriptMethod Sort { if (!$this.CanSort) { throw 'Sort unavai
     $script:Items = $items
     $script:ScanState = @{ Watermark = 0; SuccessTime = 0; Saved = @() }
     function script:Get-QOTickets { [pscustomobject]@{ Tickets = @() } }
+    function script:Get-QOTicketsStorePath { 'fixture.json' }
     function script:Save-QOTickets($Database) { $script:ScanState.Saved = @($Database.Tickets) }
     function script:Get-QOTMonitoredMailboxAddresses { 'fixture@example.invalid' }
     function script:Get-QOTEffectiveMonitoredMailboxAddresses { 'fixture@example.invalid' }
@@ -116,10 +123,13 @@ $items | Add-Member ScriptMethod Sort { if (!$this.CanSort) { throw 'Sort unavai
         $script:ScanState.LastMailbox = $MailboxAddress
         [pscustomobject]@{ Items = $script:Items }
     }
-    function script:Get-QOTLastEmailSyncUtc { [datetime]::UtcNow.AddDays(-2) }
+    function script:Get-QOTEmailSyncScope { [pscustomobject]@{ LastSyncUtc=[datetime]::UtcNow.AddDays(-2); MonitoredAddresses=@('fixture@example.invalid') } }
     function script:Get-QOTEffectiveEmailCutoffUtc { [datetime]::UtcNow.AddDays(-1) }
-    function script:Set-QOTLastEmailSyncUtc { $script:ScanState.Watermark++ }
-    function script:Set-QOTLastSuccessfulEmailSyncUtc { $script:ScanState.SuccessTime++ }
+    function script:Set-QOEmailSyncCheckpoint($Revision,$CompletedUtc,$WatermarkUtc) {
+        if ($WatermarkUtc) { $script:ScanState.Watermark++ }
+        $script:ScanState.SuccessTime++
+        return $true
+    }
     function script:Convert-QOTMailItemToTicket($MailboxAddress,$MailItem) { [pscustomobject]@{ Id = $MailItem.EntryID } }
     function script:Get-QOTTicketIdentityKeys($Ticket) { $Ticket.Id }
 } $items
@@ -133,3 +143,15 @@ $scan = Sync-QOTicketsFromOutlook
 Assert ($scan.Success -and $scan.Added -eq 1 -and $state.Saved[0].Id -eq 'recent' -and $state.Watermark -eq 1) 'An unsorted Inbox still imports newer messages after an old message'
 $found = & $module { param($map) Find-QOTOutlookMessageByInternetId $map 'fixture@example.invalid' -MailboxAddress 'second@example.invalid' } $mapi
 Assert ($found -eq $newMail -and $state.LastMailbox -eq 'second@example.invalid') 'Reply lookup uses the original mailbox and the same normalized Internet Message-ID as import'
+
+$newMail | Add-Member NoteProperty Categories 'Customer'
+$newMail | Add-Member NoteProperty UnRead $true
+$newMail | Add-Member NoteProperty Saves 0
+$newMail | Add-Member ScriptMethod Save { $this.Saves++ }
+& $module { function script:Save-QOTickets { throw 'Fixture store is full' } }
+$failed = $false
+try { $null = Sync-QOTicketsFromOutlook -MarkAsRead } catch { $failed = $_.Exception.Message -match 'Fixture store is full' }
+Assert ($failed -and $newMail.UnRead -and $newMail.Categories -eq 'Customer' -and $newMail.Saves -eq 0) 'A failed ticket save leaves the Outlook message unread and its categories intact'
+& $module { function script:Save-QOTickets($Database) { $script:ScanState.Saved = @($Database.Tickets) } }
+$null = Sync-QOTicketsFromOutlook -MarkAsRead
+Assert (!$newMail.UnRead -and $newMail.Categories -match 'QOT Imported' -and $newMail.Saves -eq 1) 'A successful ticket save applies the Outlook category and read flag'

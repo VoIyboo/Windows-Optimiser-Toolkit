@@ -113,8 +113,8 @@ function Invoke-QDisableTelemetryScheduledTasks {
         }
     }
 
-    if ($failed -gt 0 -and $disabled -eq 0) {
-        return New-QOTTaskResult -Name $taskName -Status "Failed" -Reason "Task disable operations failed"
+    if ($failed -gt 0) {
+        return New-QOTTaskResult -Name $taskName -Status "Failed" -Reason ("Disabled {0} task(s), failed {1}, skipped {2}." -f $disabled, $failed, $skipped)
     }
 
     if ($disabled -gt 0) {
@@ -164,8 +164,8 @@ function Invoke-QEnableTelemetryScheduledTasks {
         }
     }
 
-    if ($failed -gt 0 -and $enabled -eq 0) {
-        return New-QOTTaskResult -Name $taskName -Status "Failed" -Reason "Task enable operations failed"
+    if ($failed -gt 0) {
+        return New-QOTTaskResult -Name $taskName -Status "Failed" -Reason ("Enabled {0} task(s), failed {1}, skipped {2}." -f $enabled, $failed, $skipped)
     }
 
     if ($enabled -gt 0) {

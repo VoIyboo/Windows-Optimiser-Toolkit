@@ -644,15 +644,22 @@ function Normalize-QOTicketDatabase {
             $ticket.InternalNotes = @()
         } catch { }
 
+        $pendingIndex = 0
         foreach ($pendingReply in @($ticket.PendingReplies)) {
             if (-not $pendingReply) { continue }
 
             $draftId = ""
             try { if ($pendingReply.PSObject.Properties.Name -contains "DraftId") { $draftId = ([string]($pendingReply.DraftId + "")).Trim() } } catch { $draftId = "" }
             if ([string]::IsNullOrWhiteSpace($draftId)) {
-                try { $draftId = [guid]::NewGuid().ToString("N") } catch { $draftId = ([string](Get-Date -Format "yyyyMMddHHmmssfff")) }
+                $draftId = ([string]$pendingReply.ReplyId).Trim()
+                if (!$draftId) {
+                    # Older queue files have no draft ID. Selecting and claiming
+                    # a reply each reload the file before the first save.
+                    $draftId = Get-QOTicketStableEntryKey -TicketId $ticket.Id -Kind 'legacy-draft' -Index $pendingIndex -Entry $pendingReply
+                }
                 try { $pendingReply | Add-Member -NotePropertyName DraftId -NotePropertyValue $draftId -Force } catch { }
             }
+            $pendingIndex++
             try {
                 if (-not ($pendingReply.PSObject.Properties.Name -contains "ReplyId") -or [string]::IsNullOrWhiteSpace([string]$pendingReply.ReplyId)) {
                     $pendingReply | Add-Member -NotePropertyName ReplyId -NotePropertyValue $draftId -Force
@@ -661,7 +668,13 @@ function Normalize-QOTicketDatabase {
             try {
                 $pendingState = "Queued"
                 if ($pendingReply.PSObject.Properties.Name -contains "SendState") {
-                    $pendingState = Normalize-QOTTicketPendingReplyState -SendState ([string]$pendingReply.SendState)
+                    $rawState = ([string]$pendingReply.SendState).Trim()
+                    $pendingState = Normalize-QOTTicketPendingReplyState -SendState $rawState
+                    if ($pendingState -eq 'Failed' -and $rawState -ne 'Failed') {
+                        $reason = "Unrecognized delivery state '$rawState'. Review Outbox and Sent Items before resending."
+                        $pendingReply | Add-Member -NotePropertyName FailureNote -NotePropertyValue $reason -Force
+                        $pendingReply | Add-Member -NotePropertyName LastError -NotePropertyValue $reason -Force
+                    }
                 }
                 $pendingReply.SendState = $pendingState
             } catch { }
@@ -957,7 +970,7 @@ function Read-QOTicketStoreJsonText {
     return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
 }
 
-function Get-QOTicketStableBodySuffix {
+function Get-QOTicketStableEntryKey {
     param(
         [AllowNull()][string]$TicketId,
         [Parameter(Mandatory)][string]$Kind,
@@ -1130,7 +1143,7 @@ function Optimize-QOTicketBodyStorage {
             if ($ticket.PSObject.Properties.Name -contains "IncomingMessages") {
                 foreach ($incoming in @($ticket.IncomingMessages)) {
                     if ($null -eq $incoming) { continue }
-                    $suffix = Get-QOTicketStableBodySuffix -TicketId $ticketId -Kind "incoming" -Index $incomingIndex -Entry $incoming
+                    $suffix = Get-QOTicketStableEntryKey -TicketId $ticketId -Kind "incoming" -Index $incomingIndex -Entry $incoming
                     Optimize-QOTicketInlineTextBodyStorage -Owner $incoming -TicketId $ticketId -BodyProperty "Body" -PathProperty "BodyPath" -PreviewProperty "BodyPreview" -PathSuffix $suffix
                     $incomingIndex++
                 }
@@ -1142,7 +1155,7 @@ function Optimize-QOTicketBodyStorage {
             if ($ticket.PSObject.Properties.Name -contains "Replies") {
                 foreach ($reply in @($ticket.Replies)) {
                     if ($null -eq $reply) { continue }
-                    $suffix = Get-QOTicketStableBodySuffix -TicketId $ticketId -Kind "reply" -Index $replyIndex -Entry $reply
+                    $suffix = Get-QOTicketStableEntryKey -TicketId $ticketId -Kind "reply" -Index $replyIndex -Entry $reply
                     Optimize-QOTicketInlineTextBodyStorage -Owner $reply -TicketId $ticketId -BodyProperty "Body" -PathProperty "BodyPath" -PreviewProperty "BodyPreview" -PathSuffix $suffix
                     $replyIndex++
                 }
@@ -1154,7 +1167,7 @@ function Optimize-QOTicketBodyStorage {
             if ($ticket.PSObject.Properties.Name -contains "Notes") {
                 foreach ($note in @($ticket.Notes)) {
                     if ($null -eq $note) { continue }
-                    $suffix = Get-QOTicketStableBodySuffix -TicketId $ticketId -Kind "note" -Index $noteIndex -Entry $note
+                    $suffix = Get-QOTicketStableEntryKey -TicketId $ticketId -Kind "note" -Index $noteIndex -Entry $note
                     Optimize-QOTicketInlineTextBodyStorage -Owner $note -TicketId $ticketId -BodyProperty "Body" -PathProperty "BodyPath" -PreviewProperty "BodyPreview" -PathSuffix $suffix
                     $noteIndex++
                 }
@@ -1388,8 +1401,22 @@ function Test-QOIsBadTicketPath {
 }
 
 function Get-QOTicketsStorePath {
+    param([AllowNull()]$Ticket)
+    if ($null -ne $Ticket) {
+        $version = $null
+        if ($script:TicketRowVersions.TryGetValue($Ticket, [ref]$version)) { return $version.Path }
+    }
     Initialize-QOTicketStorage
     return $script:TicketStorePath
+}
+
+function Assert-QOTicketWorkerStore {
+    param([Parameter(Mandatory)][string]$StorePath)
+
+    $current = [IO.Path]::GetFullPath((Get-QOTicketsStorePath))
+    if (![string]::Equals([IO.Path]::GetFullPath($StorePath), $current, 'OrdinalIgnoreCase')) {
+        throw 'The ticket store changed. Reopen the ticket in its original store and retry.'
+    }
 }
 
 function Ensure-QOTicketsStoreDirectory {
@@ -3145,7 +3172,7 @@ function Normalize-QOTTicketPendingReplyState {
         "sending" { return "Sending" }
         "sent"    { return "Sent" }
         "failed"  { return "Failed" }
-        default   { return "Queued" }
+        default   { return "Failed" }
     }
 }
 
@@ -3248,6 +3275,10 @@ function Test-QOTTicketReplyRoute {
     foreach ($field in 'To','SenderMailbox','SourceMessageId','MessageId','ConversationId','SourceStoreId','EmailEntryId') {
         # Drafts saved by older versions did not carry these two identifiers.
         if ($field -in 'SourceStoreId','EmailEntryId' -and $expectedRoute.PSObject.Properties.Name -notcontains $field) { continue }
+        # Recording a first fresh outbound message fills in its conversation ID.
+        # Other drafts without an original message still use the verified To address.
+        if ($field -eq 'ConversationId' -and !$expectedRoute.ConversationId -and
+            !$Current.SourceMessageId -and !$Current.MessageId -and !$Current.EmailEntryId) { continue }
         if ([string]$expectedRoute.$field -cne [string]$Current.$field) { return $false }
     }
     return $true
@@ -3278,6 +3309,7 @@ function New-QOTTicketReplyWorkerPayload {
     return [pscustomobject]@{
         TicketId            = $ticketId
         PendingReplyDraftId = ([string]($PendingReplyDraftId + "")).Trim()
+        StorePath           = Get-QOTicketsStorePath -Ticket $Ticket
         Subject             = $subjectValue
         Body                = $bodyValue
         To                  = [string](Get-QOTicketPrimaryEmailAddress -Ticket $Ticket)
@@ -3786,6 +3818,10 @@ function Remove-QOTTicketPendingReply {
             $pendingDraftId = ""
             try { if ($pending.PSObject.Properties.Name -contains "DraftId") { $pendingDraftId = ([string]($pending.DraftId + "")).Trim() } } catch { $pendingDraftId = "" }
             if ([string]::Equals($pendingDraftId, $draftKey, [System.StringComparison]::OrdinalIgnoreCase)) {
+                # Act on the state of this same database snapshot. The worker
+                # can claim or deliver a draft after the UI requested cancellation.
+                $state = Normalize-QOTTicketPendingReplyState $pending.SendState
+                if ($state -eq 'Sent' -or ($state -eq 'Sending' -and (Test-QOTicketsReplyQueueWorkerRunning))) { return $false }
                 $removed = $true
                 continue
             }
@@ -4519,7 +4555,8 @@ function Start-QOTicketsReplyQueueWorker {
         "-WindowStyle", "Hidden",
         "-STA",
         "-File", $runnerPath,
-        "-ToolkitRoot", $toolkitRoot
+        "-ToolkitRoot", $toolkitRoot,
+        "-StorePath", (Get-QOTicketsStorePath)
     )
 
     $workingDirectory = $toolkitRoot
@@ -5023,6 +5060,9 @@ function Send-QOTicketReply {
         if (-not $draft -or $draft.SendState -ne "Sending") {
             return [pscustomobject]@{ Success = $false; Note = "This draft is no longer awaiting delivery." }
         }
+        if ($subjectValue -cne ([string]$draft.Subject).Trim() -or $bodyValue -cne ([string]$draft.Body).Trim()) {
+            return [pscustomobject]@{ Success = $false; Note = "The saved draft content changed. Review the reply before resending." }
+        }
         if (!$id) { $route = Get-QOTTicketPendingReplyMetadataFromTicket -Ticket $ticketToUpdate }
         if (-not $draft.To -and -not $draft.SourceMessageId -and -not $draft.MessageId) {
             return [pscustomobject]@{ Success = $false; Note = "The saved reply has no recipient or Outlook reference. Review the ticket before resending." }
@@ -5102,8 +5142,10 @@ $exports = @(
     "Initialize-QOTicketStorage",
     "Reset-QOTicketStorageCache",
     "Get-QOTicketsStorePath",
+    "Assert-QOTicketWorkerStore",
     "Get-QOTicketPrimaryEmailAddress",
     "Get-QOTTicketPendingReplyMetadataFromTicket",
+    "Test-QOTTicketReplyRoute",
     "Resolve-QOTicketEmailAddress",
     "Ensure-QOTicketsStoreDirectory",
     "Get-QOTickets",

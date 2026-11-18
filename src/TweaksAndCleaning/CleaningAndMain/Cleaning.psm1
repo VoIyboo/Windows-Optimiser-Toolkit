@@ -607,16 +607,19 @@ function Invoke-QCleanTeamsCache {
     if (Get-Process -Name 'Teams','ms-teams' -ErrorAction SilentlyContinue) {
         return New-QOTTaskResult -Name $taskName -Status "Skipped" -Reason "Quit Teams before clearing its cache"
     }
-    $cachePaths = @(
+    $newTeams = Join-Path $env:LOCALAPPDATA 'Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams'
+    $profiles = @(
         (Join-Path $env:APPDATA 'Microsoft\Teams')
-        (Join-Path $env:LOCALAPPDATA 'Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams')
+        $newTeams
+        (Join-Path $newTeams 'EBWebView\WV2Profile_tfw')
     )
-
-    $ops = @()
-    foreach ($cachePath in $cachePaths) {
-        if ([string]::IsNullOrWhiteSpace($cachePath)) { continue }
-        $ops += Invoke-QCleanPath -Path $cachePath -Label ("Teams cache ({0})" -f $cachePath)
-    }
+    # Teams keeps user uploads and settings alongside its browser caches.
+    $ops = @(foreach ($profile in $profiles) {
+        foreach ($cache in 'Cache','Code Cache','GPUCache','DawnCache','Service Worker\CacheStorage') {
+            $path = Join-Path $profile $cache
+            Invoke-QCleanPath -Path $path -Label ("Teams cache ({0})" -f $path)
+        }
+    })
 
     $result = Resolve-QOTTaskResult -Name $taskName -Operations $ops
     Write-QOTTaskOutcome -TaskName $taskName -Result $result

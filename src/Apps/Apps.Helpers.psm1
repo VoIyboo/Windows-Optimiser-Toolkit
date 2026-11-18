@@ -302,6 +302,9 @@ function Ensure-QOTInstalledAppForGrid {
     if ($null -eq $App.PSObject.Properties["IsSelected"]) {
         $App | Add-Member -NotePropertyName IsSelected -NotePropertyValue $false -Force
     }
+    if ($null -eq $App.PSObject.Properties["DisplayName"]) {
+        $App | Add-Member -NotePropertyName DisplayName -NotePropertyValue $App.Name
+    }
     if ($null -eq $App.PSObject.Properties["Publisher"]) {
         $App | Add-Member -NotePropertyName Publisher -NotePropertyValue "" -Force
     }

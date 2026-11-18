@@ -33,6 +33,52 @@ try {
         finally { $holder.Dispose(); [GC]::Collect(); [GC]::WaitForPendingFinalizers() }
         if (!$problem -or [IO.File]::ReadAllText($path) -cne $original) { throw 'A transient read error triggered default settings' }
     }
+    Check 'a stale sync save preserves another process changing nested mailbox settings' {
+        $sync = Get-QOSettings
+        $worker = Join-Path $fixture 'set-mailboxes.ps1'
+        @'
+param($ModulePath)
+$ErrorActionPreference = 'Stop'
+Import-Module $ModulePath
+$null = Set-QOMonitoredMailboxAddresses -Addresses @('first@example.invalid','next@example.invalid')
+'@ | Set-Content -LiteralPath $worker -Encoding UTF8
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $worker (Join-Path $repo 'src/Core/Settings.psm1')
+        if ($LASTEXITCODE) { throw 'The separate settings writer failed' }
+        $sync.Tickets.EmailIntegration.LastSyncUtc = '2026-01-01T05:04:03Z'
+        Save-QOSettings $sync
+        $result = Get-QOSettings
+        if ($result.Tickets.EmailIntegration.MonitoredAddresses.Count -ne 2 -or !$result.Tickets.EmailIntegration.LastSyncUtc) { throw 'A worker reverted the mailbox configuration' }
+        $sync.UiState.LastSelectedTab = 'TabTickets'
+        Save-QOSettings $sync
+        if ((Get-QOSettings).Tickets.EmailIntegration.MonitoredAddresses.Count -ne 2) { throw 'Reusing the saved object restored an old list' }
+    }
+    Check 'divergent writes to one settings value report conflict before replacing the file' {
+        $null = Set-QOSetting -Name PreferredStartTab -Value 'Cleaning'
+        $one = Get-QOSettings
+        $two = Get-QOSettings
+        $one.PreferredStartTab = 'Apps'
+        $two.PreferredStartTab = 'Tickets'
+        Save-QOSettings $one
+        $before = [IO.File]::ReadAllText($path)
+        $failed = $false
+        try { Save-QOSettings $two } catch { $failed = $true }
+        if (!$failed -or [IO.File]::ReadAllText($path) -cne $before) { throw 'A conflicting write replaced the previously committed value' }
+    }
+    Check 'a stale settings save cannot reset a damaged or switched settings file' {
+        $old = Get-QOSettings
+        $old.Site = 'edited after read'
+        [IO.File]::WriteAllText($path, '{corrupt')
+        $failed = $false
+        try { Save-QOSettings $old } catch { $failed = $true }
+        if (!$failed -or [IO.File]::ReadAllText($path) -cne '{corrupt') { throw 'A stale save replaced a damaged file' }
+        $old = Get-QOSettings
+        $other = Join-Path $fixture 'other.json'
+        [IO.File]::WriteAllText($other, '{"Site":"second"}')
+        $env:QOT_SETTINGS_PATH = $other
+        $failed = $false
+        try { try { Save-QOSettings $old } catch { $failed = $true } } finally { $env:QOT_SETTINGS_PATH = $path }
+        if (!$failed -or [IO.File]::ReadAllText($other) -cne '{"Site":"second"}') { throw 'Settings leaked across profiles' }
+    }
     Check 'a failed replacement retains the previous bytes and removes temporary files' {
         $original = '{"Site":"retain"}'
         [IO.File]::WriteAllText($path,$original)

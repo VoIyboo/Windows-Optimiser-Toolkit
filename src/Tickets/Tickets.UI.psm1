@@ -194,7 +194,8 @@ $script:ShowClosed = $true
 $script:ShowDeleted = $false
 $script:TicketsSortMode = "Priority"
 $script:TicketsAssigneeFilter = "All"
-$script:TicketsComposeState = @{ Mode = "Reply"; ByTicketId = @{} }
+$script:TicketsComposeState = @{ Mode = "Reply"; Key = ""; Route = $null; ByTicket = @{} }
+$script:TicketsComposeTextChangedHandler = $null
 
 function Write-QOTicketsUILog {
     param(
@@ -4807,6 +4808,52 @@ function Set-QOTicketDetailsBodyContent {
     } catch { }
 }
 
+function Get-QOTicketComposerRoute {
+    param([AllowNull()]$Ticket)
+    if (!$Ticket) { return }
+    try {
+        $route = Get-QOTTicketPendingReplyMetadataFromTicket -Ticket $Ticket
+        if ($route.To -and ($route.SenderMailbox -or $route.SourceMessageId -or $route.MessageId -or $route.EmailEntryId)) { return $route }
+    } catch { }
+}
+
+function Set-QOTicketComposerDraft {
+    param([AllowNull()]$Ticket, [AllowNull()]$TextBox, [string]$Mode, [AllowNull()]$Route)
+
+    $state = $script:TicketsComposeState
+    $key = if ($Ticket.Id) { [string](Get-QOTicketsStorePath -Ticket $Ticket) + '|' + [string]$Ticket.Id } else { '' }
+    if ($key -and !$state.ByTicket.ContainsKey($key)) {
+        $state.ByTicket[$key] = @{ Mode = 'Reply'; Reply = ''; Note = ''; ReplyRoute = $null }
+    }
+    if (!$Mode) { $Mode = if ($key) { $state.ByTicket[$key].Mode } else { 'Reply' } }
+    if ($key -and !$Route) { $Mode = 'Note' }
+    $state.Route = $Route
+    if ($state.Key -ne $key -or $state.Mode -ne $Mode) {
+        if ($state.Key -and $TextBox) { $state.ByTicket[$state.Key][$state.Mode] = $TextBox.Text }
+        $state.Key = $key
+        $state.Mode = $Mode
+        if ($TextBox) { $TextBox.Text = if ($key) { $state.ByTicket[$key][$Mode] } else { '' } }
+    }
+    if ($key) { $state.ByTicket[$key].Mode = $Mode }
+    return $Mode
+}
+
+function Restore-QOTicketComposerDraft {
+    param($Key, $Mode, $Text, $Route, $TextBox)
+
+    $state = $script:TicketsComposeState
+    if (!$Key -or !$state.ByTicket.ContainsKey($Key)) { return }
+    $draft = $state.ByTicket[$Key]
+    if ($state.Key -eq $Key -and $state.Mode -eq $Mode) {
+        if ($TextBox.Text) { return }
+        if ($Mode -eq 'Reply') { $draft.ReplyRoute = $Route }
+        $TextBox.Text = $Text
+    } elseif (!$draft[$Mode]) {
+        $draft[$Mode] = $Text
+        if ($Mode -eq 'Reply') { $draft.ReplyRoute = $Route }
+    }
+}
+
 function Update-QOTicketDetailsView {
     param(
         [AllowNull()]$Ticket,
@@ -4828,7 +4875,7 @@ function Update-QOTicketDetailsView {
         try { Set-QOTicketSummaryHeader -SummaryControl $script:TicketsSummaryHeaderText -SummaryLines @() } catch { }
         try { Set-QOTicketContactHeader -Ticket $null } catch { }
         if ($ReplySubject) { $ReplySubject.Text = "" }
-        if ($ReplyText) { $ReplyText.Text = "" }
+        $null = Set-QOTicketComposerDraft -Ticket $null -TextBox $ReplyText
         if ($ReplyButton) { $ReplyButton.IsEnabled = $false }
         try { if ($script:TicketsHeaderTitleText) { $script:TicketsHeaderTitleText.Text = "Tickets" } } catch { }
         Set-QOTicketDetailsVisibility -DetailsPanel $DetailsPanel -Chevron $Chevron -IsOpen:$false
@@ -4841,20 +4888,7 @@ function Update-QOTicketDetailsView {
         try { Write-QOTicketsUILog ("Tickets: Timeline refresh ignored because ticket/view is no longer active. TicketId='{0}' ActiveTicketId='{1}'." -f $refreshTicketId, ([string]($script:TicketsActiveTicketId + "")).Trim()) } catch { }
         return
     }
-    $composeModeBeforeRefresh = ""
-    try { $composeModeBeforeRefresh = ([string]($script:TicketsComposeState.Mode + "")).Trim() } catch { $composeModeBeforeRefresh = "" }
-    try {
-        if (($script:TicketsComposeState.ByTicketId -is [hashtable]) -and
-            (-not [string]::IsNullOrWhiteSpace($refreshTicketId)) -and
-            $script:TicketsComposeState.ByTicketId.ContainsKey($refreshTicketId)) {
-            $rememberedComposeMode = ([string]($script:TicketsComposeState.ByTicketId[$refreshTicketId] + "")).Trim()
-            if ($rememberedComposeMode -match '^(?i)(Reply|Note)$') {
-                $script:TicketsComposeState.Mode = $rememberedComposeMode
-            }
-        }
-    } catch { }
-    try { Write-QOTicketsUILog ("Tickets: Timeline refresh start. TicketId='{0}' RenderPath='DetailRefresh' ComposeModeBefore='{1}'." -f $refreshTicketId, $composeModeBeforeRefresh) } catch { }
-
+    Write-QOTicketsUILog ("Tickets: Timeline refresh start. TicketId='{0}'." -f $refreshTicketId)
     $detailsRenderModel = $null
     $resolvedTicket = $Ticket
     try {
@@ -4987,25 +5021,11 @@ function Update-QOTicketDetailsView {
         } catch { }
     }
     if ($ReplyButton) {
-        $canReply = $false
-        try {
-            if ($resolvedTicket.PSObject.Properties.Name -contains "SourceMessageId") {
-                if (-not [string]::IsNullOrWhiteSpace([string]$resolvedTicket.SourceMessageId)) { $canReply = $true }
-            }
-            if (-not $canReply -and ($resolvedTicket.PSObject.Properties.Name -contains "EmailMessageId")) {
-                if (-not [string]::IsNullOrWhiteSpace([string]$resolvedTicket.EmailMessageId)) { $canReply = $true }
-            }
-        } catch { $canReply = $false }
-
-        $currentComposeMode = ""
-        try { $currentComposeMode = ([string]($script:TicketsComposeState.Mode + "")).Trim() } catch { $currentComposeMode = "" }
-        if ([string]::Equals($currentComposeMode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) {
-            $ReplyButton.IsEnabled = $true
-            try { $ReplyButton.Content = "Save internal note" } catch { }
-        } else {
-            $ReplyButton.IsEnabled = $canReply
-            try { $ReplyButton.Content = "Send reply" } catch { }
-        }
+        $route = Get-QOTicketComposerRoute $resolvedTicket
+        $mode = Set-QOTicketComposerDraft -Ticket $resolvedTicket -TextBox $ReplyText -Route $route
+        $ReplyButton.IsEnabled = ($mode -eq "Note" -or $null -ne $route)
+        $ReplyButton.Content = if ($mode -eq "Note") { "Save internal note" } else { "Send reply" }
+        if ($ReplyButton.Tag -and $ReplyButton.Tag.PSObject.Properties['ComposeAction']) { $ReplyButton.Tag.ComposeAction = $mode }
     }
     Set-QOTicketDetailsVisibility -DetailsPanel $DetailsPanel -Chevron $Chevron -IsOpen:$true
     try { Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='{1}'." -f $refreshTicketId, ([string]($script:TicketsComposeState.Mode + "")).Trim()) } catch { }
@@ -7771,8 +7791,7 @@ function Initialize-QOTicketsUI {
         }
     }.GetNewClosure()
 
-    $getPrimaryTicketEmailAddress = Get-Command Get-QOTicketPrimaryEmailAddress -ErrorAction SilentlyContinue
-    $getTicketReplyRoute = Get-Command Get-QOTTicketPendingReplyMetadataFromTicket -ErrorAction SilentlyContinue
+    $testReplyRoute = Get-Command Test-QOTTicketReplyRoute -ErrorAction SilentlyContinue
 
     $ticketHasReplyReference = {
         param([AllowNull()]$Ticket)
@@ -7792,42 +7811,8 @@ function Initialize-QOTicketsUI {
         return $false
     }.GetNewClosure()
 
-    $getPreferredSenderMailbox = {
-        param([AllowNull()]$Ticket)
-
-        $sourceMailbox = ""
-        try {
-            if ($Ticket -and ($Ticket.PSObject.Properties.Name -contains "SourceMailbox")) {
-                $sourceMailbox = ([string]($Ticket.SourceMailbox + "")).Trim()
-            }
-        } catch { $sourceMailbox = "" }
-        if (-not [string]::IsNullOrWhiteSpace($sourceMailbox)) {
-            return $sourceMailbox
-        }
-
-        $configuredMailboxes = @(& $getConfiguredSenderMailboxes)
-        if ($configuredMailboxes.Count -eq 1) {
-            return ([string]$configuredMailboxes[0]).Trim()
-        }
-
-        return ""
-    }.GetNewClosure()
-
-    $canTicketReply = {
-        param([AllowNull()]$Ticket)
-        if (-not $Ticket) { return $false }
-        try {
-            if (& $ticketHasReplyReference $Ticket) { return $true }
-
-            $recipientEmail = [string](& $getPrimaryTicketEmailAddress $Ticket)
-            $senderMailbox = [string](& $getPreferredSenderMailbox $Ticket)
-            if ((-not [string]::IsNullOrWhiteSpace($recipientEmail)) -and (-not [string]::IsNullOrWhiteSpace($senderMailbox))) {
-                return $true
-            }
-        } catch { }
-        return $false
-    }.GetNewClosure()
-
+    $getComposerRoute = Get-Command Get-QOTicketComposerRoute
+    $selectComposerDraft = Get-Command Set-QOTicketComposerDraft
     $isDetailsViewActive = Get-Command Test-QOTicketDetailsViewActive
     $isTicketVisibleInDetails = {
         param([AllowNull()][string]$TicketIdValue)
@@ -7892,6 +7877,15 @@ function Initialize-QOTicketsUI {
     }.GetNewClosure()
 
     $composeState = $script:TicketsComposeState
+    if ($script:TicketsComposeTextChangedHandler) { $ticketReplyText.Remove_TextChanged($script:TicketsComposeTextChangedHandler) }
+    $script:TicketsComposeTextChangedHandler = [System.Windows.Controls.TextChangedEventHandler]{
+        param($box, $eventArgs)
+        if (!$composeState.Key -or $composeState.Mode -ne 'Reply') { return }
+        $draft = $composeState.ByTicket[$composeState.Key]
+        if ([string]::IsNullOrWhiteSpace($box.Text)) { $draft.ReplyRoute = $null }
+        elseif (!$draft.ReplyRoute) { $draft.ReplyRoute = $composeState.Route }
+    }.GetNewClosure()
+    $ticketReplyText.Add_TextChanged($script:TicketsComposeTextChangedHandler)
     $updateReplyComposeFeedback = {
         param([AllowNull()]$Ticket)
 
@@ -8043,13 +8037,13 @@ function Initialize-QOTicketsUI {
     $setComposeMode = {
         param(
             [AllowNull()][string]$Mode,
-            [switch]$PreserveText,
+            [AllowNull()]$Ticket,
             [switch]$SkipFocus
         )
 
         try {
-            $normalizedMode = if ([string]::Equals([string]$Mode, "Note", [System.StringComparison]::OrdinalIgnoreCase)) { "Note" } else { "Reply" }
-            $composeState.Mode = $normalizedMode
+            $route = & $getComposerRoute $Ticket
+            $normalizedMode = & $selectComposerDraft -Ticket $Ticket -TextBox $ticketReplyText -Mode $Mode -Route $route
             $isNoteMode = ($normalizedMode -eq "Note")
 
             if ($btnComposeInternalNote) {
@@ -8084,9 +8078,7 @@ function Initialize-QOTicketsUI {
                     $btnSendReply.Tag = $existingTag
                 } catch { }
             }
-            if (-not $PreserveText) {
-                try { if ($ticketReplyText) { $ticketReplyText.Text = "" } } catch { }
-            }
+            if ($btnSendReply) { $btnSendReply.IsEnabled = [bool]($Ticket -and ($isNoteMode -or $route)) }
             if (-not $SkipFocus) {
                 try { if ($ticketReplyText) { $null = $ticketReplyText.Focus() } } catch { }
             }
@@ -8113,14 +8105,13 @@ function Initialize-QOTicketsUI {
                 try { Set-QOTicketSummaryHeader -SummaryControl $ticketSummaryHeaderText -SummaryLines @() } catch { }
                 try { Set-QOTicketContactHeader -Ticket $null } catch { }
                 try { if ($ticketReplySubject) { $ticketReplySubject.Text = "" } } catch { }
-                try { if ($ticketReplyText) { $ticketReplyText.Text = "" } } catch { }
                 try { if ($btnSendReply) { $btnSendReply.IsEnabled = $false } } catch { }
                 try { if ($ticketReplyStatusText) { $ticketReplyStatusText.Visibility = "Collapsed"; $ticketReplyStatusText.Text = "" } } catch { }
                 try { if ($btnRetryFailedReply) { $btnRetryFailedReply.Visibility = "Collapsed"; $btnRetryFailedReply.IsEnabled = $false } } catch { }
                 try { if ($btnComposeInternalNote) { $btnComposeInternalNote.IsEnabled = $false } } catch { }
                 try { if ($btnComposeReplyCustomer) { $btnComposeReplyCustomer.IsEnabled = $false } } catch { }
                 try { if ($ticketsHeaderTitleText) { $ticketsHeaderTitleText.Text = "Tickets" } } catch { }
-                try { & $setComposeMode -Mode "Reply" -PreserveText:$false -SkipFocus } catch { }
+                try { & $setComposeMode -Ticket $null -SkipFocus } catch { }
                 try {
                     if ($setTicketDetailsVisibilityCmd) {
                         & $setTicketDetailsVisibilityCmd -DetailsPanel $detailsPanel -Chevron $detailsChevron -TicketsGrid $grid -IsOpen:$false
@@ -8376,37 +8367,7 @@ function Initialize-QOTicketsUI {
             try { if ($btnComposeInternalNote) { $btnComposeInternalNote.IsEnabled = $true } } catch { }
             try { if ($btnComposeReplyCustomer) { $btnComposeReplyCustomer.IsEnabled = $true } } catch { }
 
-            $canReply = $false
-            try { $canReply = [bool](& $canTicketReply $detailsTicket) } catch { $canReply = $false }
-
-            $targetMode = ""
-            $composeModeBeforeOpenRefresh = ""
-            try { $composeModeBeforeOpenRefresh = ([string]($composeState.Mode + "")).Trim() } catch { $composeModeBeforeOpenRefresh = "" }
-            try {
-                $modeTicketId = & $getTicketIdValueCmd -Ticket $detailsTicket
-                if (($composeState.ByTicketId -is [hashtable]) -and
-                    (-not [string]::IsNullOrWhiteSpace($modeTicketId)) -and
-                    $composeState.ByTicketId.ContainsKey($modeTicketId)) {
-                    $targetMode = ([string]($composeState.ByTicketId[$modeTicketId] + "")).Trim()
-                }
-            } catch { $targetMode = "" }
-            if ([string]::IsNullOrWhiteSpace($targetMode)) { $targetMode = "Reply" }
-            if (([string]::Equals($targetMode, "Reply", [System.StringComparison]::OrdinalIgnoreCase)) -and (-not $canReply)) {
-                $targetMode = "Note"
-            }
-            try { Write-QOTicketsUILog ("Tickets: Compose mode before refresh. TicketId='{0}' Mode='{1}' Target='{2}'." -f (Get-QOTicketIdValue -Ticket $detailsTicket), $composeModeBeforeOpenRefresh, $targetMode) } catch { }
-            try { & $setComposeMode -Mode $targetMode -PreserveText -SkipFocus } catch { }
-            try { Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='{1}'." -f (Get-QOTicketIdValue -Ticket $detailsTicket), ([string]($composeState.Mode + "")).Trim()) } catch { }
-
-            try {
-                if ($btnSendReply) {
-                    if ([string]::Equals([string]$composeState.Mode, "Reply", [System.StringComparison]::OrdinalIgnoreCase)) {
-                        $btnSendReply.IsEnabled = $canReply
-                    } else {
-                        $btnSendReply.IsEnabled = $true
-                    }
-                }
-            } catch { }
+            & $setComposeMode -Ticket $detailsTicket -SkipFocus
             try { & $updateReplyComposeFeedback $detailsTicket } catch { }
 
             try {
@@ -10975,15 +10936,7 @@ function Initialize-QOTicketsUI {
                 try { Show-QOTicketsOpenPulse -StatusText $syncStatusText -Message "Open a ticket first." -DurationMilliseconds 1800 } catch { }
                 return
             }
-            & $setComposeMode -Mode "Note" -PreserveText -SkipFocus
-            try {
-                $composeTicketId = & $getTicketIdValueCmd -Ticket $ticket
-                if (-not [string]::IsNullOrWhiteSpace($composeTicketId)) {
-                    $composeState.ByTicketId[$composeTicketId] = "Note"
-                }
-                Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='Note'." -f $composeTicketId)
-            } catch { }
-            try { if ($btnSendReply) { $btnSendReply.IsEnabled = $true } } catch { }
+            & $setComposeMode -Mode "Note" -Ticket $ticket -SkipFocus
             try { & $updateReplyComposeFeedback $ticket } catch { }
         } catch {
             Write-QOTicketsUILog ("Tickets: Internal note compose mode failed: " + $_.Exception.Message) "WARN"
@@ -10998,7 +10951,7 @@ function Initialize-QOTicketsUI {
             if (-not $ticket) { return }
 
             $canReply = $false
-            try { $canReply = [bool](& $canTicketReply $ticket) } catch { $canReply = $false }
+            try { $canReply = [bool](& $getComposerRoute $ticket) } catch { $canReply = $false }
             if (-not $canReply) {
                 [System.Windows.MessageBox]::Show(
                     "This ticket needs either an Outlook source message or both a customer email address and sender mailbox before it can send email.",
@@ -11006,20 +10959,12 @@ function Initialize-QOTicketsUI {
                     [System.Windows.MessageBoxButton]::OK,
                     [System.Windows.MessageBoxImage]::Information
                 ) | Out-Null
-                & $setComposeMode -Mode "Note" -PreserveText -SkipFocus
+                & $setComposeMode -Mode "Note" -Ticket $ticket -SkipFocus
                 try { if ($btnSendReply) { $btnSendReply.IsEnabled = $true } } catch { }
                 return
             }
 
-            & $setComposeMode -Mode "Reply" -PreserveText -SkipFocus
-            try {
-                $composeTicketId = & $getTicketIdValueCmd -Ticket $ticket
-                if (-not [string]::IsNullOrWhiteSpace($composeTicketId)) {
-                    $composeState.ByTicketId[$composeTicketId] = "Reply"
-                }
-                Write-QOTicketsUILog ("Tickets: Compose mode after refresh. TicketId='{0}' Mode='Reply'." -f $composeTicketId)
-            } catch { }
-            try { if ($btnSendReply) { $btnSendReply.IsEnabled = $true } } catch { }
+            & $setComposeMode -Mode "Reply" -Ticket $ticket -SkipFocus
             try { & $updateReplyComposeFeedback $ticket } catch { }
         } catch {
             Write-QOTicketsUILog ("Tickets: Reply compose mode failed: " + $_.Exception.Message) "WARN"
@@ -11095,6 +11040,7 @@ function Initialize-QOTicketsUI {
     $startBackgroundTicketAction = {
         param(
             [Parameter(Mandatory)][string]$ActionName,
+            [AllowNull()]$Ticket,
             [Parameter(Mandatory)][hashtable]$Payload,
             [AllowNull()][scriptblock]$OnSuccess,
             [AllowNull()][scriptblock]$OnFailure,
@@ -11132,6 +11078,9 @@ function Initialize-QOTicketsUI {
         }
 
         try {
+            if (!$Ticket -or $Ticket.Id -ne $Payload.TicketId) { throw 'The original ticket is no longer selected.' }
+            $Payload.StorePath = & $getStorePathCmd -Ticket $Ticket
+            if (!$Payload.StorePath) { throw 'The original ticket store is unavailable.' }
             ($Payload | ConvertTo-Json -Depth 12 -Compress) | Set-Content -LiteralPath $payloadPath -Encoding UTF8 -Force -ErrorAction Stop
         } catch {
             $failureResult = [pscustomobject]@{
@@ -11384,16 +11333,18 @@ function Initialize-QOTicketsUI {
         Log = $replySendWriteLogCmd; ReadTickets = $getTicketsCmd
         CopyTicket = Get-Command Update-QOTicketObjectFromSource
         RemoveLocalNote = Get-Command Remove-QOTicketsLocalInternalNote
+        RestoreDraft = Get-Command Restore-QOTicketComposerDraft
         IsVisible = $isTicketVisibleInDetails; RefreshDetails = $queueLightweightDetailsRefresh
         RefreshQueue = $refreshPendingReplyUi; RefreshCompose = $updateReplyComposeFeedback
         SetPending = $setOptimisticReplyStateCmd; RemovePending = $removeOptimisticReplyCmd
         Pulse = $replySendOpenPulseCmd; Status = $syncStatusText
-        Body = $ticketReplyText; Subject = $ticketReplySubject; SendButton = $btnSendReply
+        Body = $ticketReplyText
     }
     $script:TicketsSendReplyHandler = [System.Windows.RoutedEventHandler]{
         param($sender, $args)
         try {
             $feedback = $replyFeedback
+            $composeKey = $composeState.Key
             $queuedSendOperation = $null
             try {
                 $sendTag = $null
@@ -11468,6 +11419,10 @@ function Initialize-QOTicketsUI {
                 }
             }
             if (-not $ticket) { return }
+            if (!$queuedSendOperation -and $composeKey -ne ([string](& $getStorePathCmd -Ticket $ticket) + '|' + [string]$ticket.Id)) {
+                & $replySendOpenPulseCmd -StatusText $syncStatusText -Message "Reopen the ticket to submit this draft." -DurationMilliseconds 3500
+                return
+            }
 
             $composeMode = ""
             try {
@@ -11575,13 +11530,13 @@ function Initialize-QOTicketsUI {
                     if (!$reason) { $reason = "The internal note could not be saved." }
                     & $feedback.Log ("Tickets: Background internal note save failed. TicketId='{0}' Note='{1}'." -f $ticketId, $reason) "WARN"
                     $null = & $feedback.RemoveLocalNote -TicketId $ticketId -ClientNoteId $localNoteClientId
+                    & $feedback.RestoreDraft $composeKey 'Note' $messageText $null $feedback.Body
                     if (& $feedback.IsVisible -TicketIdValue $ticketId) {
-                        if (!$feedback.Body.Text -and $feedback.SendButton.Tag.ComposeAction -eq 'Note') { $feedback.Body.Text = $messageText }
                         & $feedback.RefreshDetails $ticket
                         & $feedback.Pulse -StatusText $feedback.Status -Message $reason -DurationMilliseconds 4000
                     }
                 }.GetNewClosure()
-                $null = & $startBackgroundTicketAction -ActionName "save-note" -Payload @{
+                $null = & $startBackgroundTicketAction -ActionName "save-note" -Ticket $ticket -Payload @{
                     TicketId = $ticketId
                     Note     = $messageText
                     Author   = $author
@@ -11600,9 +11555,8 @@ function Initialize-QOTicketsUI {
                 return
             }
 
-            $canReply = $false
-            try { $canReply = [bool](& $canTicketReply $ticket) } catch { $canReply = $false }
-            if (-not $canReply) {
+            $currentRoute = & $getComposerRoute $ticket
+            if (!$currentRoute) {
                 [System.Windows.MessageBox]::Show(
                     "This ticket needs either an Outlook source message or both a customer email address and sender mailbox before it can send email.",
                     "Reply unavailable",
@@ -11628,9 +11582,9 @@ function Initialize-QOTicketsUI {
                 return
             }
 
-            $expectedRoute = & $getTicketReplyRoute -Ticket $ticket
-            if (!$expectedRoute.To) {
-                [System.Windows.MessageBox]::Show("Enter a valid customer address on this ticket before sending.", "Reply unavailable") | Out-Null
+            $expectedRoute = if ($queuedSendOperation) { $queuedSendOperation.ExpectedRoute } else { $composeState.ByTicket[$composeState.Key].ReplyRoute }
+            if (!$expectedRoute -or !$testReplyRoute -or !(& $testReplyRoute $expectedRoute $currentRoute)) {
+                [System.Windows.MessageBox]::Show("The reply destination could not be confirmed. Your draft is still here. Review the ticket contact, then clear the draft and compose the reply for that address.", "Review reply destination") | Out-Null
                 return
             }
             $replyAlreadyInProgress = $false
@@ -11761,14 +11715,11 @@ function Initialize-QOTicketsUI {
                 } catch { }
                 try { & $feedback.Log ("Tickets: Background reply queue persistence failed. TicketId='{0}' DraftId='{1}' Note='{2}'." -f $ticketId, $optimisticDraftId, $failureText) "WARN" } catch { }
                 try { & $feedback.RefreshQueue -TicketIdValue $ticketId -Reason "queue-persist-failed" } catch { }
-                if (!$queuedSendOperation -and $feedback.Body -and !$feedback.Body.Text -and
-                    $feedback.Subject.Text -eq $replySubject -and (& $feedback.IsVisible -TicketIdValue $ticketId)) {
-                    $feedback.Body.Text = $messageText
-                }
+                if (!$queuedSendOperation) { & $feedback.RestoreDraft $composeKey 'Reply' $messageText $expectedRoute $feedback.Body }
                 try { & $feedback.Pulse -StatusText $feedback.Status -Message $failureText -DurationMilliseconds 4000 } catch { }
             }.GetNewClosure()
 
-            $queuePersistAction = & $startBackgroundTicketAction -ActionName "queue-reply" -Payload @{
+            $queuePersistAction = & $startBackgroundTicketAction -ActionName "queue-reply" -Ticket $ticket -Payload @{
                 TicketId = $ticketId
                 ExpectedRoute = $expectedRoute
                 Subject  = $replySubject
@@ -12699,7 +12650,7 @@ function Initialize-QOTicketsUI {
                 try { & $replySendOpenPulseCmd -StatusText $syncStatusText -Message $failureText -DurationMilliseconds 2200 } catch { }
             }.GetNewClosure()
 
-            $retryAction = & $startBackgroundTicketAction -ActionName "retry-reply" -Payload @{
+            $retryAction = & $startBackgroundTicketAction -ActionName "retry-reply" -Ticket $ticket -Payload @{
                 TicketId = $ticketId
                 DraftId  = $requestedRetryDraftId
             } -OnSuccess $retrySuccessHandler -OnFailure $retryFailureHandler -TimeoutSeconds 90 -LogLabel "reply retry"
@@ -12774,7 +12725,7 @@ function Initialize-QOTicketsUI {
                 try { & $replySendOpenPulseCmd -StatusText $syncStatusText -Message $failureText -DurationMilliseconds 2200 } catch { }
             }.GetNewClosure()
 
-            $cancelAction = & $startBackgroundTicketAction -ActionName "cancel-reply" -Payload @{
+            $cancelAction = & $startBackgroundTicketAction -ActionName "cancel-reply" -Ticket $ticket -Payload @{
                 TicketId = $requestedTicketId
                 DraftId  = $requestedDraftId
             } -OnSuccess $cancelSuccessHandler -OnFailure $cancelFailureHandler -TimeoutSeconds 90 -LogLabel "reply delete"
@@ -12869,7 +12820,7 @@ function Initialize-QOTicketsUI {
                 try { & $replySendOpenPulseCmd -StatusText $syncStatusText -Message $failureText -DurationMilliseconds 2200 } catch { }
             }.GetNewClosure()
 
-            $deleteNoteAction = & $startBackgroundTicketAction -ActionName "delete-note" -Payload @{
+            $deleteNoteAction = & $startBackgroundTicketAction -ActionName "delete-note" -Ticket $ticket -Payload @{
                 TicketId = $requestedTicketId
                 NoteId   = $requestedNoteId
             } -OnSuccess $deleteNoteSuccessHandler -OnFailure $deleteNoteFailureHandler -TimeoutSeconds 60 -LogLabel "note delete"

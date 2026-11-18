@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 # Always save to THIS path (resolved lazily)
 $script:SettingsPath = $null
 $script:QOAppDataRoot = $null
+$script:SettingsReadVersions = [Runtime.CompilerServices.ConditionalWeakTable[psobject,hashtable]]::new()
 
 function Test-QOPathWritable {
     param(
@@ -91,17 +92,9 @@ function Read-QOSettingsText {
     } finally { $stream.Dispose() }
 }
 
-function Write-QOSettingsFile {
-    param(
-        [string]$Path,
-        [string]$Json,
-        [switch]$IfMissing,
-        [AllowEmptyString()][string]$DamagedText
-    )
+function Invoke-QOSettingsLocked {
+    param([string]$Path, [scriptblock]$Action)
 
-    $dir = Split-Path -Parent $Path
-    $null = [IO.Directory]::CreateDirectory($dir)
-    $temp = Join-Path $dir ('.settings-' + [guid]::NewGuid().ToString('N') + '.tmp')
     $hash = [Security.Cryptography.SHA256]::Create()
     try {
         $bytes = [Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($Path).ToUpperInvariant())
@@ -113,24 +106,83 @@ function Write-QOSettingsFile {
         try { $locked = $mutex.WaitOne([TimeSpan]::FromSeconds(10)) }
         catch [Threading.AbandonedMutexException] { $locked = $true }
         if (!$locked) { throw 'Timed out waiting to save toolkit settings.' }
+        & $Action
+    } finally {
+        if ($locked) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function ConvertFrom-QOSettingsJson {
+    param([string]$Json)
+    # Keep UTC sync markers as strings when reading in PowerShell 7.5+.
+    $options = @{}
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { $options.DateKind = 'String' }
+    ConvertFrom-Json -InputObject $Json @options -ErrorAction Stop
+}
+
+function Merge-QOSettingsEdits {
+    param($Original, $Edited, $Current, [string]$Prefix)
+
+    $names = @($Original.PSObject.Properties.Name) + @($Edited.PSObject.Properties.Name)
+    foreach ($name in @($names | Where-Object { $_ } | Select-Object -Unique)) {
+        $originalProperty = $Original.PSObject.Properties[$name]
+        $editedProperty = $Edited.PSObject.Properties[$name]
+        $currentProperty = $Current.PSObject.Properties[$name]
+        # An absent property produces no string; a present null produces the JSON literal null.
+        $before = if ($originalProperty) { ConvertTo-Json -InputObject $originalProperty.Value -Depth 20 -Compress }
+        $after = if ($editedProperty) { ConvertTo-Json -InputObject $editedProperty.Value -Depth 20 -Compress }
+        if ($before -ceq $after) { continue }
+        $latest = if ($currentProperty) { ConvertTo-Json -InputObject $currentProperty.Value -Depth 20 -Compress }
+        if ($latest -ceq $after) { continue }
+        if ($latest -cne $before) {
+            if ((Test-QOSettingsIsObject $originalProperty.Value) -and (Test-QOSettingsIsObject $editedProperty.Value) -and (Test-QOSettingsIsObject $currentProperty.Value)) {
+                Merge-QOSettingsEdits $originalProperty.Value $editedProperty.Value $currentProperty.Value "$Prefix$name."
+                continue
+            }
+            throw "Another writer changed '$Prefix$name'. Reload settings before saving."
+        }
+        if ($editedProperty) { $Current | Add-Member -NotePropertyName $name -NotePropertyValue $editedProperty.Value -Force }
+        else { $Current.PSObject.Properties.Remove($name) }
+    }
+}
+
+function Write-QOSettingsFile {
+    param(
+        [string]$Path,
+        [string]$Json,
+        [switch]$IfMissing,
+        [AllowEmptyString()][string]$DamagedText,
+        [hashtable]$ReadVersion
+    )
+
+    $recover = $PSBoundParameters.ContainsKey('DamagedText')
+    Invoke-QOSettingsLocked -Path $Path -Action {
+        $dir = Split-Path -Parent $Path
+        $null = [IO.Directory]::CreateDirectory($dir)
         $exists = [IO.File]::Exists($Path)
         if ($IfMissing -and $exists) { return $false }
         $backup = [System.Management.Automation.Language.NullString]::Value
-        if ($PSBoundParameters.ContainsKey('DamagedText')) {
+        if ($recover) {
             # A writer may have replaced the settings since the original read.
             if (!$exists -or (Read-QOSettingsText $Path) -cne $DamagedText) { return $false }
             $backup = "$Path.bak_$([guid]::NewGuid().ToString('N'))"
         }
-        [IO.File]::WriteAllText($temp, $Json, [Text.UTF8Encoding]::new($true))
-        if ($exists) { [IO.File]::Replace($temp, $Path, $backup) }
-        else { [IO.File]::Move($temp, $Path) }
-        return $true
-    } finally {
-        try { [IO.File]::Delete($temp) }
-        finally {
-            if ($locked) { $mutex.ReleaseMutex() }
-            $mutex.Dispose()
+        if ($ReadVersion) {
+            if (!$exists) { throw 'The settings file was removed. Reload settings before saving.' }
+            $currentJson = Read-QOSettingsText $Path
+            if (!$currentJson.TrimStart().StartsWith('{')) { throw 'The settings file is invalid. Reload settings before saving.' }
+            $current = Complete-QOSettingsDefaults (ConvertFrom-QOSettingsJson $currentJson)
+            Merge-QOSettingsEdits (ConvertFrom-QOSettingsJson $ReadVersion.Json) (ConvertFrom-QOSettingsJson $Json) $current
+            $Json = ConvertTo-Json -InputObject $current -Depth 20
         }
+        $temp = Join-Path $dir ('.settings-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            [IO.File]::WriteAllText($temp, $Json, [Text.UTF8Encoding]::new($true))
+            if ($exists) { [IO.File]::Replace($temp, $Path, $backup) }
+            else { [IO.File]::Move($temp, $Path) }
+        } finally { [IO.File]::Delete($temp) }
+        return $true
     }
 }
 
@@ -138,7 +190,13 @@ function Save-QOSettings {
     param([Parameter(Mandatory)]$Settings)
 
     $json = ConvertTo-Json -InputObject $Settings -Depth 20
-    $null = Write-QOSettingsFile -Path (Get-QOSettingsPath) -Json $json
+    $path = Get-QOSettingsPath
+    $version = $null
+    if ($script:SettingsReadVersions.TryGetValue($Settings, [ref]$version) -and $version.Path -ne $path) {
+        throw 'The settings location changed. Reload settings before saving.'
+    }
+    $null = Write-QOSettingsFile -Path $path -Json $json -ReadVersion $version
+    if ($version) { $version.Json = $json }
 }
 
 function New-QODefaultSettings {
@@ -278,132 +336,146 @@ function Get-QOSettings {
         try { $json = Read-QOSettingsText $path }
         catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {
             $defaults = New-QODefaultSettings -NoSave
-            if (Write-QOSettingsFile -Path $path -Json (ConvertTo-Json $defaults -Depth 20) -IfMissing) { return $defaults }
+            $null = Write-QOSettingsFile -Path $path -Json (ConvertTo-Json $defaults -Depth 20) -IfMissing
             continue
         }
         # Windows PowerShell unwraps a single-element JSON array. Check the root as well.
         $settings = $null
         if ($json.TrimStart().StartsWith('{')) {
-            try { $settings = ConvertFrom-Json -InputObject $json -ErrorAction Stop }
+            try { $settings = ConvertFrom-QOSettingsJson $json }
             catch [ArgumentException], [InvalidOperationException] { $settings = $null }
         }
         if (-not (Test-QOSettingsIsObject $settings)) {
             $defaults = New-QODefaultSettings -NoSave
-            if (Write-QOSettingsFile -Path $path -Json (ConvertTo-Json $defaults -Depth 20) -DamagedText $json) { return $defaults }
+            $null = Write-QOSettingsFile -Path $path -Json (ConvertTo-Json $defaults -Depth 20) -DamagedText $json
             continue
         }
-
-        # Merge defaults so missing keys get added
-        $defaults = New-QODefaultSettings -NoSave
-
-        foreach ($prop in $defaults.PSObject.Properties.Name) {
-            if (-not (Test-QOSettingsHasProperty -Target $settings -Name $prop)) {
-                $settings | Add-Member -NotePropertyName $prop -NotePropertyValue $defaults.$prop -Force
-            }
-        }
-
-        # UiState branch - guard every drill before we touch it.
-        $null = Confirm-QOSettingsNestedObject -Parent $settings -Name 'UiState' -Default $defaults.UiState
-        if (-not (Test-QOSettingsHasProperty -Target $settings.UiState -Name 'LastSelectedTab')) {
-            $settings.UiState | Add-Member -NotePropertyName LastSelectedTab -NotePropertyValue $defaults.UiState.LastSelectedTab -Force
-        }
-        if ([string]::IsNullOrWhiteSpace([string]$settings.UiState.LastSelectedTab)) {
-            $settings.UiState.LastSelectedTab = $defaults.UiState.LastSelectedTab
-        }
-        $null = Confirm-QOSettingsNestedObject -Parent $settings.UiState -Name 'TabVisibility' -Default $defaults.UiState.TabVisibility
-        $null = Confirm-QOSettingsNestedObject -Parent $settings.UiState -Name 'ToggleActions' -Default ([pscustomobject]@{})
-
-        if (Test-QOSettingsIsObject -Value $defaults.UiState.TabVisibility) {
-            foreach ($prop in $defaults.UiState.TabVisibility.PSObject.Properties.Name) {
-                if (-not (Test-QOSettingsHasProperty -Target $settings.UiState.TabVisibility -Name $prop)) {
-                    $settings.UiState.TabVisibility | Add-Member -NotePropertyName $prop -NotePropertyValue $defaults.UiState.TabVisibility.$prop -Force
-                }
-                if ($null -eq $settings.UiState.TabVisibility.$prop) {
-                    $settings.UiState.TabVisibility.$prop = $defaults.UiState.TabVisibility.$prop
-                }
-                $settings.UiState.TabVisibility.$prop = [bool]$settings.UiState.TabVisibility.$prop
-            }
-        }
-
-        # Ensure nested Tickets structure exists
-        $null = Confirm-QOSettingsNestedObject -Parent $settings -Name 'Tickets' -Default $defaults.Tickets
-        $null = Confirm-QOSettingsNestedObject -Parent $settings.Tickets -Name 'EmailIntegration' -Default $defaults.Tickets.EmailIntegration
-        $null = Confirm-QOSettingsNestedObject -Parent $settings.Tickets -Name 'StatusFilters' -Default $defaults.Tickets.StatusFilters
-        $null = Confirm-QOSettingsNestedObject -Parent $settings.Tickets -Name 'ListView' -Default $defaults.Tickets.ListView
-
-
-        if ($null -eq $settings.Tickets.EmailIntegration.MonitoredAddresses) {
-            $settings.Tickets.EmailIntegration | Add-Member -NotePropertyName MonitoredAddresses -NotePropertyValue @() -Force
-        }
-
-        if ($null -eq $settings.Tickets.EmailIntegration.EmailSyncStartDatePinned) {
-            $settings.Tickets.EmailIntegration | Add-Member -NotePropertyName EmailSyncStartDatePinned -NotePropertyValue $null -Force
-        }
-
-        if (-not (Test-QOSettingsHasProperty -Target $settings.Tickets.EmailIntegration -Name 'LastSyncUtc')) {
-            $settings.Tickets.EmailIntegration | Add-Member -NotePropertyName LastSyncUtc -NotePropertyValue $null -Force
-        }
-        if (-not (Test-QOSettingsHasProperty -Target $settings.Tickets.EmailIntegration -Name 'LastSuccessfulSyncUtc')) {
-            $settings.Tickets.EmailIntegration | Add-Member -NotePropertyName LastSuccessfulSyncUtc -NotePropertyValue $null -Force
-        }
-
-        if (Test-QOSettingsIsObject -Value $defaults.Tickets.StatusFilters) {
-            foreach ($prop in $defaults.Tickets.StatusFilters.PSObject.Properties.Name) {
-                if (-not (Test-QOSettingsHasProperty -Target $settings.Tickets.StatusFilters -Name $prop)) {
-                    $settings.Tickets.StatusFilters | Add-Member -NotePropertyName $prop -NotePropertyValue $defaults.Tickets.StatusFilters.$prop -Force
-                }
-            }
-        }
-
-        if (Test-QOSettingsIsObject -Value $defaults.Tickets.ListView) {
-            foreach ($prop in $defaults.Tickets.ListView.PSObject.Properties.Name) {
-                if (-not (Test-QOSettingsHasProperty -Target $settings.Tickets.ListView -Name $prop)) {
-                    $settings.Tickets.ListView | Add-Member -NotePropertyName $prop -NotePropertyValue $defaults.Tickets.ListView.$prop -Force
-                }
-            }
-        }
-        $settings.Tickets.ListView.ShowOpen = [bool]$settings.Tickets.ListView.ShowOpen
-        $settings.Tickets.ListView.ShowClosed = [bool]$settings.Tickets.ListView.ShowClosed
-        $settings.Tickets.ListView.ShowDeleted = [bool]$settings.Tickets.ListView.ShowDeleted
-        $sortModeRaw = ""
-        try { $sortModeRaw = ([string]($settings.Tickets.ListView.SortMode + "")).Trim() } catch { $sortModeRaw = "" }
-        switch ($sortModeRaw.ToLowerInvariant()) {
-            "newest" { $settings.Tickets.ListView.SortMode = "Newest" }
-            "oldest" { $settings.Tickets.ListView.SortMode = "Oldest" }
-            default { $settings.Tickets.ListView.SortMode = "Priority" }
-        }
-        $assigneeFilterRaw = ""
-        try { $assigneeFilterRaw = ([string]($settings.Tickets.ListView.AssigneeFilter + "")).Trim() } catch { $assigneeFilterRaw = "" }
-        if ([string]::IsNullOrWhiteSpace($assigneeFilterRaw)) { $assigneeFilterRaw = "All" }
-        if ($assigneeFilterRaw.StartsWith("@")) { $assigneeFilterRaw = $assigneeFilterRaw.TrimStart("@") }
-        switch ($assigneeFilterRaw.ToLowerInvariant()) {
-            "all" { $assigneeFilterRaw = "All" }
-            "unassigned" { $assigneeFilterRaw = "Unassigned" }
-            "none" { $assigneeFilterRaw = "Unassigned" }
-            "n/a" { $assigneeFilterRaw = "Unassigned" }
-            "na" { $assigneeFilterRaw = "Unassigned" }
-            "null" { $assigneeFilterRaw = "Unassigned" }
-            default { }
-        }
-        $settings.Tickets.ListView.AssigneeFilter = $assigneeFilterRaw
-
-        $taskTimeoutSeconds = 1800
-        try {
-            if ($settings.PSObject.Properties.Name -contains "TaskTimeoutSeconds") {
-                $taskTimeoutSeconds = [int]$settings.TaskTimeoutSeconds
-            }
-        } catch { $taskTimeoutSeconds = 1800 }
-        if ($taskTimeoutSeconds -lt 300) { $taskTimeoutSeconds = 300 }
-        if ($taskTimeoutSeconds -gt 43200) { $taskTimeoutSeconds = 43200 }
-        if ($settings.PSObject.Properties.Name -notcontains "TaskTimeoutSeconds") {
-            $settings | Add-Member -NotePropertyName TaskTimeoutSeconds -NotePropertyValue $taskTimeoutSeconds -Force
-        } else {
-            $settings.TaskTimeoutSeconds = $taskTimeoutSeconds
-        }
-
-
+        $settings = Complete-QOSettingsDefaults $settings
+        $script:SettingsReadVersions.Add($settings, @{Path=$path; Json=(ConvertTo-Json -InputObject $settings -Depth 20 -Compress)})
         return $settings
     }
+}
+
+function Complete-QOSettingsDefaults {
+    param($settings)
+    # Merge defaults so missing keys get added
+    $defaults = New-QODefaultSettings -NoSave
+
+    foreach ($prop in $defaults.PSObject.Properties.Name) {
+        if (-not (Test-QOSettingsHasProperty -Target $settings -Name $prop)) {
+            $settings | Add-Member -NotePropertyName $prop -NotePropertyValue $defaults.$prop -Force
+        }
+    }
+
+    # UiState branch - guard every drill before we touch it.
+    $null = Confirm-QOSettingsNestedObject -Parent $settings -Name 'UiState' -Default $defaults.UiState
+    if (-not (Test-QOSettingsHasProperty -Target $settings.UiState -Name 'LastSelectedTab')) {
+        $settings.UiState | Add-Member -NotePropertyName LastSelectedTab -NotePropertyValue $defaults.UiState.LastSelectedTab -Force
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$settings.UiState.LastSelectedTab)) {
+        $settings.UiState.LastSelectedTab = $defaults.UiState.LastSelectedTab
+    }
+    $null = Confirm-QOSettingsNestedObject -Parent $settings.UiState -Name 'TabVisibility' -Default $defaults.UiState.TabVisibility
+    $null = Confirm-QOSettingsNestedObject -Parent $settings.UiState -Name 'ToggleActions' -Default ([pscustomobject]@{})
+
+    if (Test-QOSettingsIsObject -Value $defaults.UiState.TabVisibility) {
+        foreach ($prop in $defaults.UiState.TabVisibility.PSObject.Properties.Name) {
+            if (-not (Test-QOSettingsHasProperty -Target $settings.UiState.TabVisibility -Name $prop)) {
+                $settings.UiState.TabVisibility | Add-Member -NotePropertyName $prop -NotePropertyValue $defaults.UiState.TabVisibility.$prop -Force
+            }
+            if ($null -eq $settings.UiState.TabVisibility.$prop) {
+                $settings.UiState.TabVisibility.$prop = $defaults.UiState.TabVisibility.$prop
+            }
+            $settings.UiState.TabVisibility.$prop = [bool]$settings.UiState.TabVisibility.$prop
+        }
+    }
+
+    # Ensure nested Tickets structure exists
+    $null = Confirm-QOSettingsNestedObject -Parent $settings -Name 'Tickets' -Default $defaults.Tickets
+    $null = Confirm-QOSettingsNestedObject -Parent $settings.Tickets -Name 'EmailIntegration' -Default $defaults.Tickets.EmailIntegration
+    $null = Confirm-QOSettingsNestedObject -Parent $settings.Tickets -Name 'StatusFilters' -Default $defaults.Tickets.StatusFilters
+    $null = Confirm-QOSettingsNestedObject -Parent $settings.Tickets -Name 'ListView' -Default $defaults.Tickets.ListView
+
+
+    if ($null -eq $settings.Tickets.EmailIntegration.MonitoredAddresses) {
+        $settings.Tickets.EmailIntegration | Add-Member -NotePropertyName MonitoredAddresses -NotePropertyValue @() -Force
+    }
+
+    if ($null -eq $settings.Tickets.EmailIntegration.EmailSyncStartDatePinned) {
+        $settings.Tickets.EmailIntegration | Add-Member -NotePropertyName EmailSyncStartDatePinned -NotePropertyValue $null -Force
+    }
+
+    if (-not (Test-QOSettingsHasProperty -Target $settings.Tickets.EmailIntegration -Name 'LastSyncUtc')) {
+        $settings.Tickets.EmailIntegration | Add-Member -NotePropertyName LastSyncUtc -NotePropertyValue $null -Force
+    }
+    if (-not (Test-QOSettingsHasProperty -Target $settings.Tickets.EmailIntegration -Name 'LastSuccessfulSyncUtc')) {
+        $settings.Tickets.EmailIntegration | Add-Member -NotePropertyName LastSuccessfulSyncUtc -NotePropertyValue $null -Force
+    }
+    $sync = $settings.Tickets.EmailIntegration
+    $parsed = [datetime]::MinValue
+    if ($sync.EmailSyncStartDatePinned -and ![datetime]::TryParseExact([string]$sync.EmailSyncStartDatePinned, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$parsed)) {
+        $sync.EmailSyncStartDatePinned = $null
+    }
+    foreach ($name in 'LastSyncUtc','LastSuccessfulSyncUtc') {
+        if ($sync.$name -and ![datetime]::TryParse([string]$sync.$name, [Globalization.CultureInfo]::InvariantCulture, 'RoundtripKind', [ref]$parsed)) { $sync.$name = $null }
+    }
+
+    if (Test-QOSettingsIsObject -Value $defaults.Tickets.StatusFilters) {
+        foreach ($prop in $defaults.Tickets.StatusFilters.PSObject.Properties.Name) {
+            if (-not (Test-QOSettingsHasProperty -Target $settings.Tickets.StatusFilters -Name $prop)) {
+                $settings.Tickets.StatusFilters | Add-Member -NotePropertyName $prop -NotePropertyValue $defaults.Tickets.StatusFilters.$prop -Force
+            }
+        }
+    }
+
+    if (Test-QOSettingsIsObject -Value $defaults.Tickets.ListView) {
+        foreach ($prop in $defaults.Tickets.ListView.PSObject.Properties.Name) {
+            if (-not (Test-QOSettingsHasProperty -Target $settings.Tickets.ListView -Name $prop)) {
+                $settings.Tickets.ListView | Add-Member -NotePropertyName $prop -NotePropertyValue $defaults.Tickets.ListView.$prop -Force
+            }
+        }
+    }
+    $settings.Tickets.ListView.ShowOpen = [bool]$settings.Tickets.ListView.ShowOpen
+    $settings.Tickets.ListView.ShowClosed = [bool]$settings.Tickets.ListView.ShowClosed
+    $settings.Tickets.ListView.ShowDeleted = [bool]$settings.Tickets.ListView.ShowDeleted
+    $sortModeRaw = ""
+    try { $sortModeRaw = ([string]($settings.Tickets.ListView.SortMode + "")).Trim() } catch { $sortModeRaw = "" }
+    switch ($sortModeRaw.ToLowerInvariant()) {
+        "newest" { $settings.Tickets.ListView.SortMode = "Newest" }
+        "oldest" { $settings.Tickets.ListView.SortMode = "Oldest" }
+        default { $settings.Tickets.ListView.SortMode = "Priority" }
+    }
+    $assigneeFilterRaw = ""
+    try { $assigneeFilterRaw = ([string]($settings.Tickets.ListView.AssigneeFilter + "")).Trim() } catch { $assigneeFilterRaw = "" }
+    if ([string]::IsNullOrWhiteSpace($assigneeFilterRaw)) { $assigneeFilterRaw = "All" }
+    if ($assigneeFilterRaw.StartsWith("@")) { $assigneeFilterRaw = $assigneeFilterRaw.TrimStart("@") }
+    switch ($assigneeFilterRaw.ToLowerInvariant()) {
+        "all" { $assigneeFilterRaw = "All" }
+        "unassigned" { $assigneeFilterRaw = "Unassigned" }
+        "none" { $assigneeFilterRaw = "Unassigned" }
+        "n/a" { $assigneeFilterRaw = "Unassigned" }
+        "na" { $assigneeFilterRaw = "Unassigned" }
+        "null" { $assigneeFilterRaw = "Unassigned" }
+        default { }
+    }
+    $settings.Tickets.ListView.AssigneeFilter = $assigneeFilterRaw
+
+    $taskTimeoutSeconds = 1800
+    try {
+        if ($settings.PSObject.Properties.Name -contains "TaskTimeoutSeconds") {
+            $taskTimeoutSeconds = [int]$settings.TaskTimeoutSeconds
+        }
+    } catch { $taskTimeoutSeconds = 1800 }
+    if ($taskTimeoutSeconds -lt 300) { $taskTimeoutSeconds = 300 }
+    if ($taskTimeoutSeconds -gt 43200) { $taskTimeoutSeconds = 43200 }
+    if ($settings.PSObject.Properties.Name -notcontains "TaskTimeoutSeconds") {
+        $settings | Add-Member -NotePropertyName TaskTimeoutSeconds -NotePropertyValue $taskTimeoutSeconds -Force
+    } else {
+        $settings.TaskTimeoutSeconds = $taskTimeoutSeconds
+    }
+
+
+    return $settings
 }
 
 function Set-QOSetting {
@@ -519,25 +591,18 @@ function Set-QOTicketStorageSettings {
         [AllowNull()][string]$BackupPath
     )
 
-    $s = Get-QOSettings
-    if (-not $s) { $s = New-QODefaultSettings -NoSave }
-
     $resolvedStorePath = Resolve-QOTicketStorePath -Path $StorePath
     $resolvedBackupPath = Resolve-QOTicketBackupPath -Path $BackupPath -StorePath $resolvedStorePath
-
-    if ($s.PSObject.Properties.Name -notcontains "TicketStorePath") {
-        $s | Add-Member -NotePropertyName TicketStorePath -NotePropertyValue $resolvedStorePath -Force
-    } else {
-        $s.TicketStorePath = $resolvedStorePath
+    Invoke-QOSettingsLocked -Path (Get-QOSettingsPath) -Action {
+        $settings = Get-QOSettings
+        $oldStore = Resolve-QOTicketStorePath -Path $settings.TicketStorePath
+        if ($oldStore -ne $resolvedStorePath) {
+            Update-QOEmailSyncRevision $settings.Tickets.EmailIntegration $true
+        }
+        $settings | Add-Member NoteProperty TicketStorePath $resolvedStorePath -Force
+        $settings | Add-Member NoteProperty LocalTicketBackupPath $resolvedBackupPath -Force
+        Save-QOSettings -Settings $settings
     }
-
-    if ($s.PSObject.Properties.Name -notcontains "LocalTicketBackupPath") {
-        $s | Add-Member -NotePropertyName LocalTicketBackupPath -NotePropertyValue $resolvedBackupPath -Force
-    } else {
-        $s.LocalTicketBackupPath = $resolvedBackupPath
-    }
-
-    Save-QOSettings -Settings $s
     return (Get-QOTicketStorageSettings)
 }
 
@@ -560,42 +625,36 @@ function Get-QOMonitoredMailboxAddresses {
     )
 }
 
-function Set-QOMonitoredMailboxAddresses {
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()][string[]]$Addresses
-    )
-
-    $s = Get-QOSettings
-    if (-not $s) { $s = New-QODefaultSettings -NoSave }
-
-    if (-not $s.Tickets) {
-        $s | Add-Member -NotePropertyName Tickets -NotePropertyValue ([pscustomobject]@{}) -Force
+function Update-QOEmailSyncRevision {
+    param($Integration, [bool]$ResetCheckpoint)
+    $Integration | Add-Member -NotePropertyName SyncRevision -NotePropertyValue ([guid]::NewGuid().ToString('N')) -Force
+    if ($ResetCheckpoint) {
+        $Integration.LastSyncUtc = $null
+        $Integration.LastSuccessfulSyncUtc = $null
     }
-    if (-not $s.Tickets.EmailIntegration) {
-        $s.Tickets | Add-Member -NotePropertyName EmailIntegration -NotePropertyValue ([pscustomobject]@{}) -Force
-    }
-    if ($null -eq $s.Tickets.EmailIntegration.MonitoredAddresses) {
-        $s.Tickets.EmailIntegration | Add-Member -NotePropertyName MonitoredAddresses -NotePropertyValue @() -Force
-    }
-
-    $clean = @(
-        $Addresses |
-        ForEach-Object { ([string]$_).Trim() } |
-        Where-Object { $_ } |
-        Sort-Object -Unique
-    )
-
-    $s.Tickets.EmailIntegration.MonitoredAddresses = $clean
-    Save-QOSettings -Settings $s
-
-    return $clean
 }
 
-# --------------------------------------------------------------------
-# Email sync start date pinning
-# Storage: Tickets.EmailIntegration.EmailSyncStartDatePinned (yyyy-MM-dd or null)
-# --------------------------------------------------------------------
+function Set-QOMonitoredMailboxAddresses {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Addresses,
+        [switch]$IfUnconfigured
+    )
+    $clean = @($Addresses | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+    Invoke-QOSettingsLocked -Path (Get-QOSettingsPath) -Action {
+        $settings = Get-QOSettings
+        $integration = $settings.Tickets.EmailIntegration
+        $old = @($integration.MonitoredAddresses | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+        if ($IfUnconfigured -and $old.Count) { return $old }
+        $added = @($clean | Where-Object { $old -notcontains $_ }).Count -gt 0
+        if ($added -or $clean.Count -ne $old.Count) {
+            $integration.MonitoredAddresses = $clean
+            Update-QOEmailSyncRevision $integration $added
+            Save-QOSettings -Settings $settings
+        }
+        return $clean
+    }
+}
+
 function Get-QOEmailSyncStartDatePinned {
     $s = Get-QOSettings
     if (-not $s) { return $null }
@@ -612,47 +671,56 @@ function Get-QOEmailSyncStartDatePinned {
 }
 
 function Set-QOEmailSyncStartDatePinned {
-    param(
-        [Parameter(Mandatory)]
-        [datetime]$Date
-    )
-
-    $s = Get-QOSettings
-    if (-not $s) { $s = New-QODefaultSettings -NoSave }
-
-    if (-not $s.Tickets) {
-        $s | Add-Member -NotePropertyName Tickets -NotePropertyValue ([pscustomobject]@{}) -Force
+    param([Parameter(Mandatory)][datetime]$Date)
+    $pin = $Date.Date.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    Invoke-QOSettingsLocked -Path (Get-QOSettingsPath) -Action {
+        $settings = Get-QOSettings
+        $integration = $settings.Tickets.EmailIntegration
+        $oldPin = [string]$integration.EmailSyncStartDatePinned
+        if ($oldPin -ne $pin) {
+            $oldDate = if ($oldPin) { [datetime]$oldPin } else { (Get-Date).Date }
+            $integration.EmailSyncStartDatePinned = $pin
+            Update-QOEmailSyncRevision $integration ($Date.Date -lt $oldDate)
+            Save-QOSettings -Settings $settings
+        }
     }
-    if (-not $s.Tickets.EmailIntegration) {
-        $s.Tickets | Add-Member -NotePropertyName EmailIntegration -NotePropertyValue ([pscustomobject]@{}) -Force
-    }
-    if ($null -eq $s.Tickets.EmailIntegration.EmailSyncStartDatePinned) {
-        $s.Tickets.EmailIntegration | Add-Member -NotePropertyName EmailSyncStartDatePinned -NotePropertyValue $null -Force
-    }
-
-    $s.Tickets.EmailIntegration.EmailSyncStartDatePinned = $Date.Date.ToString("yyyy-MM-dd")
-    Save-QOSettings -Settings $s
-
-    return (Get-QOEmailSyncStartDatePinned)
+    return $Date.Date
 }
 
 function Clear-QOEmailSyncStartDatePinned {
-    $s = Get-QOSettings
-    if (-not $s) { $s = New-QODefaultSettings -NoSave }
+    Invoke-QOSettingsLocked -Path (Get-QOSettingsPath) -Action {
+        $settings = Get-QOSettings
+        $integration = $settings.Tickets.EmailIntegration
+        if ($integration.EmailSyncStartDatePinned) {
+            $oldDate = [datetime]$integration.EmailSyncStartDatePinned
+            $integration.EmailSyncStartDatePinned = $null
+            Update-QOEmailSyncRevision $integration ((Get-Date).Date -lt $oldDate)
+            Save-QOSettings -Settings $settings
+        }
+    }
+}
 
-    if (-not $s.Tickets) {
-        $s | Add-Member -NotePropertyName Tickets -NotePropertyValue ([pscustomobject]@{}) -Force
+function Set-QOEmailSyncCheckpoint {
+    param(
+        [AllowEmptyString()][string]$Revision,
+        [Parameter(Mandatory)][datetime]$CompletedUtc,
+        [Nullable[datetime]]$WatermarkUtc,
+        [string]$StorePath
+    )
+    Invoke-QOSettingsLocked -Path (Get-QOSettingsPath) -Action {
+        $settings = Get-QOSettings
+        $integration = $settings.Tickets.EmailIntegration
+        if ([string]$integration.SyncRevision -ne $Revision) { return $false }
+        if ($StorePath -and (Resolve-QOTicketStorePath -Path $settings.TicketStorePath) -ne $StorePath) { return $false }
+        if (!$integration.LastSuccessfulSyncUtc -or $CompletedUtc -gt ([datetime]$integration.LastSuccessfulSyncUtc).ToUniversalTime()) {
+            $integration.LastSuccessfulSyncUtc = $CompletedUtc.ToUniversalTime().ToString('o')
+        }
+        if ($null -ne $WatermarkUtc -and (!$integration.LastSyncUtc -or $WatermarkUtc -gt ([datetime]$integration.LastSyncUtc).ToUniversalTime())) {
+            $integration.LastSyncUtc = $WatermarkUtc.ToUniversalTime().ToString('o')
+        }
+        Save-QOSettings -Settings $settings
+        return $true
     }
-    if (-not $s.Tickets.EmailIntegration) {
-        $s.Tickets | Add-Member -NotePropertyName EmailIntegration -NotePropertyValue ([pscustomobject]@{}) -Force
-    }
-    if ($null -eq $s.Tickets.EmailIntegration.EmailSyncStartDatePinned) {
-        $s.Tickets.EmailIntegration | Add-Member -NotePropertyName EmailSyncStartDatePinned -NotePropertyValue $null -Force
-    }
-
-    $s.Tickets.EmailIntegration.EmailSyncStartDatePinned = $null
-    Save-QOSettings -Settings $s
-    return $null
 }
 
 function Get-QOEffectiveEmailSyncStartDate {
@@ -919,9 +987,10 @@ function Set-QOTabVisibilitySettings {
 function Set-QOMonitoredAddresses {
     param(
         [Parameter(Mandatory)]
-        [AllowEmptyCollection()][string[]]$Addresses
+        [AllowEmptyCollection()][string[]]$Addresses,
+        [switch]$IfUnconfigured
     )
-    return (Set-QOMonitoredMailboxAddresses -Addresses $Addresses)
+    return (Set-QOMonitoredMailboxAddresses -Addresses $Addresses -IfUnconfigured:$IfUnconfigured)
 }
 
 function Get-QOMonitoredAddresses {
@@ -937,6 +1006,7 @@ Export-ModuleMember -Function `
     New-QODefaultSettings, `
     Get-QOMonitoredMailboxAddresses, `
     Set-QOMonitoredMailboxAddresses, `
+    Set-QOEmailSyncCheckpoint, `
     Get-QOMonitoredAddresses, `
     Set-QOMonitoredAddresses, `
     Get-QOEmailSyncStartDatePinned, `

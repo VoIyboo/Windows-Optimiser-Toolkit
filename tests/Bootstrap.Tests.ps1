@@ -160,6 +160,13 @@ Add-Type -Name Window -Namespace QuinnTest -MemberDefinition @"
             }
         }
     }
+    Test-Case 'Archive discovery supports literal square brackets in a profile path' {
+        $unpacked = Join-Path $fixture 'staff[1]'
+        $content = Join-Path $unpacked 'repository-main'
+        $folder = [IO.Directory]::CreateDirectory((Join-Path $content 'src\Intro'))
+        [IO.File]::WriteAllText((Join-Path $folder.FullName 'Intro.ps1'), '# fixture')
+        if ((Find-QOTToolkitRoot $unpacked) -ne $content) { throw 'Could not locate the unpacked release' }
+    }
     Test-Case 'A failed update launches the last working installation' {
         # Exercise the normal remote control flow with a previously installed release.
         # Strip only declarations, retaining the bootstrap entry point and its error handling.
@@ -180,6 +187,23 @@ Add-Type -Name Window -Namespace QuinnTest -MemberDefinition @"
         function Add-Type { throw 'UI disabled in fixture' }
         & ([scriptblock]::Create($main))
         if ($observed.Root -ne $oldState.InstallRoot) { throw 'Usable installation was not launched' }
+    }
+    Test-Case 'A damaged install record can still open a downloaded release offline' {
+        $main = $source.Substring($source.IndexOf('$logDir = Get-QOTBootstrapLogDir'))
+        $ForceRemote = $true
+        $ForceRefresh = [switch]$false
+        $Branch = 'main'
+        $observed = @{}
+        $originalLocation = Get-Location
+        [IO.File]::WriteAllText($layout.StatePath, '{truncated')
+        function Get-QOTInstallLayout { $layout }
+        function Get-QOTBootstrapLogDir { $fixture }
+        function Get-QOTLatestRemoteInfo { throw 'Offline' }
+        function Install-QOTFromGitHub { throw 'Offline download attempted' }
+        function Start-QOTInstalledCopy($ToolkitRoot) { $observed.Root = $ToolkitRoot }
+        function Add-Type { throw 'UI disabled in fixture' }
+        & ([scriptblock]::Create($main))
+        if (!$observed.Root -or !(Test-Path -LiteralPath (Join-Path $observed.Root 'src\Intro\Intro.ps1'))) { throw 'Cached release was not launched' }
     }
 } finally {
     Set-Location $oldLocation

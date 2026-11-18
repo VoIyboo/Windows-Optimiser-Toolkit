@@ -269,7 +269,7 @@ function Save-QOTConfiguredMailboxAddresses {
     if (-not $setCmd) { return $clean }
 
     try {
-        $saved = @(& $setCmd -Addresses $clean)
+        $saved = @(& $setCmd -Addresses $clean -IfUnconfigured)
         if ($saved.Count -gt 0) {
             return @(
                 @($saved) |
@@ -845,98 +845,8 @@ function Get-QOTTicketIdentityKeys {
 # Watermark: only sync emails newer than last successful sync
 # Stored in Settings: Tickets.EmailIntegration.LastSyncUtc
 # ---------------------------------------------------------------------
-function Get-QOTLastEmailSyncUtc {
-    try {
-        $s = Get-QOSettings
-        if ($s -and $s.PSObject.Properties.Name -contains "Tickets") {
-            $t = $s.Tickets
-            if ($t -and $t.PSObject.Properties.Name -contains "EmailIntegration") {
-                $ei = $t.EmailIntegration
-                if ($ei -and $ei.PSObject.Properties.Name -contains "LastSyncUtc") {
-                    $v = [string]$ei.LastSyncUtc
-                    if (-not [string]::IsNullOrWhiteSpace($v)) {
-                        return ([datetime]::Parse($v)).ToUniversalTime()
-                    }
-                }
-            }
-        }
-    } catch { }
-
-    return [datetime]"1970-01-01T00:00:00Z"
-}
-
-function Set-QOTLastEmailSyncUtc {
-    param(
-        [Parameter(Mandatory)]
-        [datetime]$UtcTime
-    )
-
-    try {
-        $s = Get-QOSettings
-        if (-not $s) { return }
-
-        if ($s.PSObject.Properties.Name -notcontains "Tickets") {
-            $s | Add-Member -NotePropertyName Tickets -NotePropertyValue ([pscustomobject]@{}) -Force
-        }
-
-        if ($s.Tickets.PSObject.Properties.Name -notcontains "EmailIntegration") {
-            $s.Tickets | Add-Member -NotePropertyName EmailIntegration -NotePropertyValue ([pscustomobject]@{}) -Force
-        }
-
-        if ($s.Tickets.EmailIntegration.PSObject.Properties.Name -notcontains "LastSyncUtc") {
-            $s.Tickets.EmailIntegration | Add-Member -NotePropertyName LastSyncUtc -NotePropertyValue $null -Force
-        }
-
-        $s.Tickets.EmailIntegration.LastSyncUtc = $UtcTime.ToUniversalTime().ToString("o")
-        Save-QOSettings -Settings $s
-    } catch { }
-}
-
-function Get-QOTLastSuccessfulEmailSyncUtc {
-    try {
-        $s = Get-QOSettings
-        if ($s -and $s.PSObject.Properties.Name -contains "Tickets") {
-            $t = $s.Tickets
-            if ($t -and $t.PSObject.Properties.Name -contains "EmailIntegration") {
-                $ei = $t.EmailIntegration
-                if ($ei -and $ei.PSObject.Properties.Name -contains "LastSuccessfulSyncUtc") {
-                    $v = [string]$ei.LastSuccessfulSyncUtc
-                    if (-not [string]::IsNullOrWhiteSpace($v)) {
-                        return ([datetime]::Parse($v)).ToUniversalTime()
-                    }
-                }
-            }
-        }
-    } catch { }
-
-    return $null
-}
-
-function Set-QOTLastSuccessfulEmailSyncUtc {
-    param(
-        [Parameter(Mandatory)]
-        [datetime]$UtcTime
-    )
-
-    try {
-        $s = Get-QOSettings
-        if (-not $s) { return }
-
-        if ($s.PSObject.Properties.Name -notcontains "Tickets") {
-            $s | Add-Member -NotePropertyName Tickets -NotePropertyValue ([pscustomobject]@{}) -Force
-        }
-
-        if ($s.Tickets.PSObject.Properties.Name -notcontains "EmailIntegration") {
-            $s.Tickets | Add-Member -NotePropertyName EmailIntegration -NotePropertyValue ([pscustomobject]@{}) -Force
-        }
-
-        if ($s.Tickets.EmailIntegration.PSObject.Properties.Name -notcontains "LastSuccessfulSyncUtc") {
-            $s.Tickets.EmailIntegration | Add-Member -NotePropertyName LastSuccessfulSyncUtc -NotePropertyValue $null -Force
-        }
-
-        $s.Tickets.EmailIntegration.LastSuccessfulSyncUtc = $UtcTime.ToUniversalTime().ToString("o")
-        Save-QOSettings -Settings $s
-    } catch { }
+function Get-QOTEmailSyncScope {
+    return (Get-QOSettings).Tickets.EmailIntegration
 }
 
 # ---------------------------------------------------------------------
@@ -948,14 +858,9 @@ function Set-QOTLastSuccessfulEmailSyncUtc {
 function Get-QOTEffectiveEmailCutoffUtc {
     param(
         [Parameter(Mandatory)]
-        [datetime]$LastSyncUtc
+        [datetime]$LastSyncUtc,
+        [AllowNull()]$Pinned
     )
-
-    $pinned = $null
-    try {
-        # If user pinned a start date, always sync from that day -> now.
-        $pinned = Get-QOEmailSyncStartDatePinned
-    } catch { }
 
     $neverSynced = ($LastSyncUtc -le [datetime]"1970-01-02T00:00:00Z")
     if ($neverSynced) {
@@ -1112,7 +1017,6 @@ function Update-QOTExistingTicketFromMailItem {
 
     if (-not $ExistingTicket -or -not $IncomingTicket) { return $false }
 
-    $changed = $false
     $incomingUpdatedAt = ""
     try { $incomingUpdatedAt = ([string]($IncomingTicket.UpdatedAt + "")).Trim() } catch { $incomingUpdatedAt = "" }
 
@@ -1148,25 +1052,25 @@ function Update-QOTExistingTicketFromMailItem {
         } else {
             try { $ExistingTicket | Add-Member -NotePropertyName $PropertyName -NotePropertyValue $NewValue -Force } catch { return }
         }
-        $script:__qotExistingTicketUpdated = $true
-    }.GetNewClosure()
+        return $true
+    }
 
-    $script:__qotExistingTicketUpdated = $false
-
-    & $setValue -PropertyName "Source" -NewValue "Outlook" -ReplaceIfBlank
-    & $setValue -PropertyName "SourceMailbox" -NewValue $IncomingTicket.SourceMailbox -ReplaceIfBlank
-    & $setValue -PropertyName "SourceMessageId" -NewValue $IncomingTicket.SourceMessageId -ReplaceIfBlank
-    & $setValue -PropertyName "SourceStoreId" -NewValue $IncomingTicket.SourceStoreId -ReplaceIfBlank
-    & $setValue -PropertyName "EmailMessageId" -NewValue $IncomingTicket.EmailMessageId -ReplaceIfBlank
-    & $setValue -PropertyName "EmailConversationId" -NewValue $IncomingTicket.EmailConversationId -ReplaceIfBlank
-    & $setValue -PropertyName "SenderName" -NewValue $IncomingTicket.SenderName -AlwaysReplace
-    & $setValue -PropertyName "SenderEmail" -NewValue $IncomingTicket.SenderEmail -AlwaysReplace
-    & $setValue -PropertyName "EmailFrom" -NewValue $IncomingTicket.EmailFrom -AlwaysReplace
-    & $setValue -PropertyName "EmailReceived" -NewValue $IncomingTicket.EmailReceived -ReplaceIfBlank
-    & $setValue -PropertyName "Subject" -NewValue $IncomingTicket.Subject -ReplaceIfBlank
-    & $setValue -PropertyName "Created" -NewValue $IncomingTicket.Created -ReplaceIfBlank
-    & $setValue -PropertyName "CreatedAt" -NewValue $IncomingTicket.CreatedAt -ReplaceIfBlank
-    & $setValue -PropertyName "EmailBodyPreview" -NewValue $IncomingTicket.EmailBodyPreview -ReplaceIfBlank
+    $changed = @(
+        & $setValue -PropertyName "Source" -NewValue "Outlook" -ReplaceIfBlank
+        & $setValue -PropertyName "SourceMailbox" -NewValue $IncomingTicket.SourceMailbox -ReplaceIfBlank
+        & $setValue -PropertyName "SourceMessageId" -NewValue $IncomingTicket.SourceMessageId -ReplaceIfBlank
+        & $setValue -PropertyName "SourceStoreId" -NewValue $IncomingTicket.SourceStoreId -ReplaceIfBlank
+        & $setValue -PropertyName "EmailMessageId" -NewValue $IncomingTicket.EmailMessageId -ReplaceIfBlank
+        & $setValue -PropertyName "EmailConversationId" -NewValue $IncomingTicket.EmailConversationId -ReplaceIfBlank
+        & $setValue -PropertyName "SenderName" -NewValue $IncomingTicket.SenderName -AlwaysReplace
+        & $setValue -PropertyName "SenderEmail" -NewValue $IncomingTicket.SenderEmail -AlwaysReplace
+        & $setValue -PropertyName "EmailFrom" -NewValue $IncomingTicket.EmailFrom -AlwaysReplace
+        & $setValue -PropertyName "EmailReceived" -NewValue $IncomingTicket.EmailReceived -ReplaceIfBlank
+        & $setValue -PropertyName "Subject" -NewValue $IncomingTicket.Subject -ReplaceIfBlank
+        & $setValue -PropertyName "Created" -NewValue $IncomingTicket.Created -ReplaceIfBlank
+        & $setValue -PropertyName "CreatedAt" -NewValue $IncomingTicket.CreatedAt -ReplaceIfBlank
+        & $setValue -PropertyName "EmailBodyPreview" -NewValue $IncomingTicket.EmailBodyPreview -ReplaceIfBlank
+    ).Count -gt 0
 
     $existingBodyPath = ""
     try {
@@ -1200,9 +1104,9 @@ function Update-QOTExistingTicketFromMailItem {
         [string]::IsNullOrWhiteSpace($existingBody) -and
         [string]::IsNullOrWhiteSpace($existingBodyPath)) {
         if ($ExistingTicket.PSObject.Properties.Name -contains "EmailBody") {
-            try { $ExistingTicket.EmailBody = $incomingBody; $script:__qotExistingTicketUpdated = $true } catch { }
+            try { $ExistingTicket.EmailBody = $incomingBody; $changed = $true } catch { }
         } else {
-            try { $ExistingTicket | Add-Member -NotePropertyName EmailBody -NotePropertyValue $incomingBody -Force; $script:__qotExistingTicketUpdated = $true } catch { }
+            try { $ExistingTicket | Add-Member -NotePropertyName EmailBody -NotePropertyValue $incomingBody -Force; $changed = $true } catch { }
         }
     }
 
@@ -1261,17 +1165,17 @@ function Update-QOTExistingTicketFromMailItem {
             })
 
             if ($ExistingTicket.PSObject.Properties.Name -contains "IncomingMessages") {
-                try { $ExistingTicket.IncomingMessages = @($incomingMessages); $script:__qotExistingTicketUpdated = $true } catch { }
+                try { $ExistingTicket.IncomingMessages = @($incomingMessages); $changed = $true } catch { }
             } else {
-                try { $ExistingTicket | Add-Member -NotePropertyName IncomingMessages -NotePropertyValue @($incomingMessages) -Force; $script:__qotExistingTicketUpdated = $true } catch { }
+                try { $ExistingTicket | Add-Member -NotePropertyName IncomingMessages -NotePropertyValue @($incomingMessages) -Force; $changed = $true } catch { }
             }
         }
     }
 
-    $changed = [bool]$script:__qotExistingTicketUpdated
-    Remove-Variable -Scope Script -Name __qotExistingTicketUpdated -ErrorAction SilentlyContinue
-
-    if ($changed -and -not [string]::IsNullOrWhiteSpace($incomingUpdatedAt)) {
+    $incomingTime = [datetime]::MinValue
+    $lastEdit = [datetime]::MinValue
+    $null = [datetime]::TryParse([string]$ExistingTicket.UpdatedAt, [ref]$lastEdit)
+    if ($changed -and [datetime]::TryParse($incomingUpdatedAt, [ref]$incomingTime) -and $incomingTime -gt $lastEdit) {
         if ($ExistingTicket.PSObject.Properties.Name -contains "UpdatedAt") {
             try { $ExistingTicket.UpdatedAt = $incomingUpdatedAt } catch { }
         } else {
@@ -1358,6 +1262,11 @@ function Sync-QOTicketsFromOutlook {
 
     Initialize-QOTicketsCoreApi
     $mailboxes = @(Get-QOTEffectiveMonitoredMailboxAddresses -AllowStartOutlook:$AllowStartOutlook -PersistWhenSingle)
+    # Auto-detection can save a mailbox. Read the configured addresses, date
+    # and revision together so the worker advances only the scope it scanned.
+    $scope = Get-QOTEmailSyncScope
+    $configured = @($scope.MonitoredAddresses | Where-Object { $_ })
+    if ($configured.Count) { $mailboxes = $configured }
     if (-not $mailboxes -or $mailboxes.Count -eq 0) {
         $note = "No monitored mailbox addresses are configured. Open Outlook and sign in, then add a mailbox in Settings or let QOT auto-detect a single mailbox."
         Write-QOTOutlookSyncLog $note "WARN"
@@ -1366,7 +1275,8 @@ function Sync-QOTicketsFromOutlook {
 
     Write-QOTOutlookSyncLog ("Starting sync. Mailboxes={0}; MaxPerMailbox={1}; AllowStartOutlook={2}" -f @($mailboxes).Count, $MaxPerMailbox, [bool]$AllowStartOutlook)
 
-    $existingDb  = Get-QOTickets
+    $existingDb = Get-QOTickets
+    $storePath = Get-QOTicketsStorePath
     $existingIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $existingTicketByIdentity = @{}
 
@@ -1383,8 +1293,8 @@ function Sync-QOTicketsFromOutlook {
         } catch { }
     }
 
-    $lastSyncUtc  = Get-QOTLastEmailSyncUtc
-    $cutoffUtc    = Get-QOTEffectiveEmailCutoffUtc -LastSyncUtc $lastSyncUtc
+    $lastSyncUtc = if ($scope.LastSyncUtc) { ([datetime]$scope.LastSyncUtc).ToUniversalTime() } else { [datetime]'1970-01-01T00:00:00Z' }
+    $cutoffUtc = Get-QOTEffectiveEmailCutoffUtc -LastSyncUtc $lastSyncUtc -Pinned $scope.EmailSyncStartDatePinned
     $syncStartedAtUtc = (Get-Date).ToUniversalTime()
 
     # Background and startup sync both keep Outlook launch disabled so polls fail fast
@@ -1393,6 +1303,7 @@ function Sync-QOTicketsFromOutlook {
     Write-QOTOutlookSyncLog "Outlook namespace resolved."
     $added = 0
     $addedTickets = @()
+    $messagesToMark = [Collections.Generic.List[object]]::new()
     $mailboxNotes = @()
     $canAdvanceWatermark = $true
     $mailboxSuccessCount = 0
@@ -1459,9 +1370,6 @@ function Sync-QOTicketsFromOutlook {
                 break
             }
 
-            $categories = ""
-            try { $categories = [string]$item.Categories } catch { }
-
             $ticket = Convert-QOTMailItemToTicket -MailboxAddress $mbValue -MailItem $item
             $ticketIdentityKeys = @(Get-QOTTicketIdentityKeys -Ticket $ticket)
             if ($ticketIdentityKeys.Count -eq 0) { continue }
@@ -1510,14 +1418,7 @@ function Sync-QOTicketsFromOutlook {
                 }
             }
 
-            try {
-                if ($ProcessedCategory) {
-                    if ($categories) { $item.Categories = ($categories + "; " + $ProcessedCategory) } else { $item.Categories = $ProcessedCategory }
-                }
-                if ($MarkAsRead) { $item.UnRead = $false }
-                $item.Save() | Out-Null
-            } catch { }
-
+            if ($ProcessedCategory -or $MarkAsRead) { $messagesToMark.Add($item) }
             $added++
             $count++
         }
@@ -1544,6 +1445,23 @@ function Sync-QOTicketsFromOutlook {
         $existingDb.Tickets = @($existingDb.Tickets) + @($addedTickets)
         Save-QOTickets -Database $existingDb
     }
+
+    foreach ($message in $messagesToMark) {
+        try {
+            $modified = $false
+            if ($ProcessedCategory) {
+                $categories = [string]$message.Categories
+                if (($categories -split '\s*[;,]\s*') -notcontains $ProcessedCategory) {
+                    $message.Categories = if ($categories) { "$categories; $ProcessedCategory" } else { $ProcessedCategory }
+                    $modified = $true
+                }
+            }
+            if ($MarkAsRead -and $message.UnRead) { $message.UnRead = $false; $modified = $true }
+            if ($modified) { $null = $message.Save() }
+        } catch {
+            Write-QOTOutlookSyncLog ("Ticket saved, but Outlook could not update the source message. " + $_.Exception.Message) "WARN"
+        }
+    }
     
     $overallSuccess = $mailboxFailureCount -eq 0
 
@@ -1553,14 +1471,17 @@ function Sync-QOTicketsFromOutlook {
         $nextWatermarkUtc = $cutoffUtc
     }
 
-    # Persist a real "last successful run" timestamp even when the watermark is intentionally held.
     if ($overallSuccess) {
-        Set-QOTLastSuccessfulEmailSyncUtc -UtcTime $completedAtUtc
-    }
-
-    # Only update watermark when all mailboxes fully progressed past cutoff in this pass.
-    if ($canAdvanceWatermark) {
-        Set-QOTLastEmailSyncUtc -UtcTime $nextWatermarkUtc
+        $watermark = if ($canAdvanceWatermark) { $nextWatermarkUtc } else { $null }
+        try {
+            if (!(Set-QOEmailSyncCheckpoint -Revision ([string]$scope.SyncRevision) -CompletedUtc $completedAtUtc -WatermarkUtc $watermark -StorePath $storePath)) {
+                throw 'The ticket store, mailboxes or start date changed. The next sync will use the new settings.'
+            }
+        } catch {
+            $overallSuccess = $false
+            $canAdvanceWatermark = $false
+            $mailboxNotes += $_.Exception.Message
+        }
     }
 
     $summaryNote = ("Sync complete. Success=" + [string][bool]$overallSuccess + " WatermarkAdvanced=" + [string][bool]$canAdvanceWatermark + " CutoffUtc=" + $cutoffUtc.ToString("o") + " LastSyncUtcWas=" + $lastSyncUtc.ToString("o") + " NextWatermarkUtc=" + $nextWatermarkUtc.ToString("o") + " MailboxesOk=" + $mailboxSuccessCount + " MailboxesFailed=" + $mailboxFailureCount + " | " + ($mailboxNotes -join " ; "))

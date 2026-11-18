@@ -113,6 +113,33 @@ function Send-QOTicketOutlookEmail {
             }
         }
     }
+    Check 'workers hold queued actions when settings switch to a copy of the ticket store' {
+        $secondStore = Join-Path $root 'other-team.json'
+        Copy-Item -LiteralPath $store -Destination $secondStore
+        $payload = Join-Path $root 'switch-payload.json'
+        $resultPath = Join-Path $root 'switch-result.json'
+        $replyPayload = New-QOTTicketReplyWorkerPayload -Ticket $ticket -Subject 'Original team' -Body 'Private reply'
+        try {
+            $null = Set-QOTicketStorageSettings -StorePath $secondStore -BackupPath $backup
+            $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $noteJson = @{StorePath=$store; TicketId=$ticket.Id; NoteId='other-team-note'; Note='Original team only'} | ConvertTo-Json
+            [IO.File]::WriteAllText($payload, $noteJson)
+            $null = & $engine -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File (Join-Path $tickets 'Tickets.BackgroundActionRunner.ps1') -ToolkitRoot $root -Action save-note -PayloadPath $payload -ResultPath $resultPath
+            $noteResult = [IO.File]::ReadAllText($resultPath) | ConvertFrom-Json
+            [IO.File]::WriteAllText($payload, ($replyPayload | ConvertTo-Json))
+            $null = & $engine -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File (Join-Path $tickets 'Tickets.Email.ReplyRunner.ps1') -ToolkitRoot $root -PayloadPath $payload -ResultPath $resultPath -TransportOnly
+            $mailResult = [IO.File]::ReadAllText($resultPath) | ConvertFrom-Json
+            $null = & $engine -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File (Join-Path $tickets 'Tickets.Email.ReplyQueueRunner.ps1') -ToolkitRoot $root -StorePath $store
+            Assert ($LASTEXITCODE -eq 1) 'The queue worker accepted a different store at startup'
+            $copy = [IO.File]::ReadAllText($secondStore) | ConvertFrom-Json
+            Assert (!$noteResult.Success -and $noteResult.Note -match 'store' -and !($copy.Tickets.Notes.NoteId -contains 'other-team-note')) 'A private note reached a different store'
+            Assert ($replyPayload.StorePath -eq $store -and !$mailResult.Success -and $mailResult.Note -match 'store' -and !(Test-Path $env:QOT_TEST_MAIL)) 'The transport followed the changed store'
+        } finally {
+            $null = Set-QOTicketStorageSettings -StorePath $store -BackupPath $backup
+            $null = Reset-QOTicketStorageCache
+            if (Test-Path $env:QOT_TEST_MAIL) { Remove-Item -LiteralPath $env:QOT_TEST_MAIL }
+        }
+    }
     Check 'email import deduplicates and retains full Unicode body' {
         $message = [pscustomobject]@{ Subject='New request'; MessageId='message1'; Body=('sample '+[char]0x03b2)*300; From='client@example.invalid' }
         $first = Add-QOTicketFromEmail -Email $message

@@ -3,7 +3,8 @@ param(
     [string]$ReplyCommand = "Send-QOTicketReply",
     [int]$MaxFailureRetries = 5,
     [int]$StaleSendingSeconds = 600,
-    [int]$ReplySendTimeoutSeconds = 120
+    [int]$ReplySendTimeoutSeconds = 120,
+    [string]$StorePath
 )
 
 $ErrorActionPreference = "Stop"
@@ -232,6 +233,7 @@ try {
     if (-not $coreModule) {
         throw ("Core tickets module could not be imported: " + $coreModulePath)
     }
+    if ($StorePath) { Assert-QOTicketWorkerStore -StorePath $StorePath }
 
     $buildQualifiedCommandName = {
         param([Parameter(Mandatory=$true)][string]$CommandName)
@@ -331,10 +333,6 @@ try {
 
             $ticketId = ([string]($nextEntry.TicketId + "")).Trim()
             $draftId = ([string]($nextEntry.DraftId + "")).Trim()
-            $subject = ([string]($nextEntry.Subject + "")).Trim()
-            $body = [string]($nextEntry.Body + "")
-            $retryCount = 0
-            try { $retryCount = [int]$nextEntry.RetryCount } catch { $retryCount = 0 }
 
             if ([string]::IsNullOrWhiteSpace($ticketId) -or [string]::IsNullOrWhiteSpace($draftId)) {
                 Write-QOTReplyQueueRunnerLog "Reply queue entry was missing TicketId or DraftId. Skipping malformed entry." "WARN"
@@ -346,8 +344,11 @@ try {
                 Write-QOTReplyQueueRunnerLog ("Recovering stale sending reply DraftId='{0}' TicketId='{1}'." -f $draftId, $ticketId) "WARN"
             }
 
-            $claimed = & $setPendingReplyStateCmd -TicketId $ticketId -DraftId $draftId -SendState Sending -FailureNote "" -RetryCount $retryCount -NextAttemptAt ""
+            $claimed = & $setPendingReplyStateCmd -TicketId $ticketId -DraftId $draftId -SendState Sending -FailureNote "" -NextAttemptAt ""
             if (-not $claimed) { continue }
+            $subject = ([string]$claimed.Subject).Trim()
+            $body = [string]$claimed.Body
+            $retryCount = [int]$claimed.RetryCount
 
             $db = & $getTicketsCmd -Quiet
             $ticket = @(

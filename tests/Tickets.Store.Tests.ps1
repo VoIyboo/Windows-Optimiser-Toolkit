@@ -131,6 +131,93 @@ try {
         $replacement = & $module $retry $old.Id
         Assert ($replacement.DraftId -ne 'failed' -and $replacement.To -eq $current.EmailTo -and !(Get-QOTTicketPendingReply -TicketId $old.Id -DraftId failed)) 'Retry failed to replace the original draft'
     }
+    Check 'cancelling cannot erase a receipt written after the queue was displayed' {
+        $ticket = Add-QOTicket (New-QOTicket -Title 'Cancel during delivery' -EmailTo 'client@example.invalid')
+        $null = Add-QOTTicketPendingReply -TicketId $ticket.Id -DraftId 'raced' -Subject Race -Body Fixture
+        $cancel = & $module {
+            param($id)
+            $lookup = Get-Command Get-QOTTicketPendingReply
+            function Get-QOTTicketPendingReply($TicketId,$DraftId) {
+                $old = & $lookup -TicketId $TicketId -DraftId $DraftId
+                $null = Set-QOTTicketPendingReplyState $TicketId $DraftId Sent -DeliveryReceipt ([pscustomobject]@{Success=$true;SentEntryId='accepted'})
+                return $old
+            }
+            Cancel-QOTTicketPendingReply $id raced
+        } $ticket.Id
+        $row = (Get-QOTickets -Quiet).Tickets | Where-Object Id -eq $ticket.Id
+        Assert (!$cancel.Cancelled -and $row.PendingReplies[0].DeliveryReceipt.SentEntryId -eq 'accepted') 'Cancellation discarded a confirmed submission'
+    }
+    Check 'a worker cannot dispatch superseded draft text' {
+        $ticket = Add-QOTicket (New-QOTicket -Title 'Edited before claim' -EmailTo 'client@example.invalid')
+        $picked = Add-QOTTicketPendingReply -TicketId $ticket.Id -DraftId edited -Subject 'First' -Body 'Obsolete body'
+        $null = Add-QOTTicketPendingReply -TicketId $ticket.Id -DraftId edited -Subject 'Final' -Body 'Corrected body'
+        $claimed = Set-QOTTicketPendingReplyState $ticket.Id edited Sending
+        $result = & $module {
+            param($row,$picked)
+            function Import-QOTOutlookIntegrationModule { $true }
+            function Send-QOTicketOutlookEmail { [pscustomobject]@{Success=$true} }
+            Send-QOTicketReply -Ticket $row -Subject $picked.Subject -Body $picked.Body -PendingReplyDraftId edited -TransportOnly
+        } $ticket $picked
+        Assert ($claimed.Body -eq 'Corrected body' -and !$result.Success -and $result.Note -like '*content*') 'Transport accepted obsolete draft text'
+    }
+    Check 'an outbound receipt does not invalidate other fresh-mail replies on the same ticket' {
+        $ticket = Add-QOTicket (New-QOTicket -Title 'Two outbound replies' -EmailTo 'client@example.invalid')
+        $null = Add-QOTTicketPendingReply -TicketId $ticket.Id -DraftId first -Subject First -Body First
+        $null = Add-QOTTicketPendingReply -TicketId $ticket.Id -DraftId second -Subject Second -Body Second
+        $null = Set-QOTTicketPendingReplyState $ticket.Id first Sending
+        $receipt = [pscustomobject]@{Success=$true; ConversationId='first-outbound-conversation'}
+        $null = Set-QOTTicketPendingReplyState $ticket.Id first Sent -DeliveryReceipt $receipt
+        $recorded = Complete-QOTTicketReplySend $ticket First First $receipt -PendingReplyDraftId first
+        $null = Set-QOTTicketPendingReplyState $ticket.Id second Sending
+        $result = & $module {
+            param($row)
+            function Import-QOTOutlookIntegrationModule { $true }
+            function Send-QOTicketOutlookEmail { param($To); [pscustomobject]@{Success=$true;To=$To} }
+            function Send-QOTicketOutlookReply { throw 'The second message must still be a fresh outbound email' }
+            Send-QOTicketReply -Ticket $row -Subject Second -Body Second -PendingReplyDraftId second -TransportOnly
+        } $ticket
+        Assert ($recorded.Persisted -and $result.Success -and $result.To -eq 'client@example.invalid') 'Recording the first reply blocked the second queued email'
+    }
+    Check 'an unrecognized saved delivery state requires review before sending' {
+        $ticket = Add-QOTicket (New-QOTicket -Title 'Legacy mail state' -EmailTo 'client@example.invalid')
+        $null = Add-QOTTicketPendingReply -TicketId $ticket.Id -DraftId legacy -Subject Legacy -Body Fixture
+        $db = Get-QOTickets -Quiet
+        ($db.Tickets | Where-Object Id -eq $ticket.Id).PendingReplies[0].SendState = 'UnknownState'
+        Save-QOTickets $db -Quiet
+        $entry = Get-QOTTicketPendingReply $ticket.Id legacy
+        Assert ($entry.SendState -eq 'Failed') 'An unknown state was selected for automatic delivery'
+        $null = & $module { Repair-QOTPendingReplyQueueState -Quiet }
+        $entry = Get-QOTTicketPendingReply $ticket.Id legacy
+        Assert ($entry.SendState -eq 'Failed' -and $entry.FailureNote -like '*review*') 'Unrecognized delivery state lacks an actionable explanation'
+    }
+    Check 'a launched queue worker is pinned to the requested ticket store' {
+        $observed = & $module {
+            $capture = @{}
+            function Get-QOTPendingReplyQueueSnapshot { [pscustomobject]@{ActiveCount=1} }
+            function Test-QOTicketsReplyQueueWorkerRunning { $false }
+            function Test-QOTProcessElevated { $false }
+            function Start-Process($FilePath,$ArgumentList,$WorkingDirectory,$WindowStyle,[switch]$PassThru) {
+                $capture.Arguments = $ArgumentList
+                [pscustomobject]@{Id=123}
+            }
+            $null = Start-QOTicketsReplyQueueWorker
+            $capture.Arguments
+        }
+        $expected = & $module { Convert-QOTReplyQueueProcessArgumentString @('-StorePath',(Get-QOTicketsStorePath)) }
+        Assert ($observed.Contains($expected)) 'The queue worker launch omitted the original store'
+    }
+    Check 'older queued entries keep the same distinct IDs through read, claim and reload' {
+        $path = Join-Path $fixture 'Tickets.json'
+        $body = [pscustomobject]@{Subject='Legacy';Body='Identical';To='legacy@example.invalid';SendState='Queued'}
+        $known = [pscustomobject]@{ReplyId='legacy-reply-id';Subject='Known';Body='Known';To='legacy@example.invalid';SendState='Queued'}
+        $row = [pscustomobject]@{Id='old-queue';Title='Old queue';PendingReplies=@($body,$body,$known)}
+        [IO.File]::WriteAllText($path,(ConvertTo-Json -InputObject @($row) -Depth 10))
+        $first = @(Get-QOTicketPendingReplies -TicketId $row.Id)
+        $next = Get-QOTNextPendingReply
+        $claimed = Set-QOTTicketPendingReplyState $next.TicketId $next.DraftId Sending
+        $second = @(Get-QOTicketPendingReplies -TicketId $row.Id)
+        Assert ($claimed -and $first[2].DraftId -eq 'legacy-reply-id' -and (@($second.DraftId | Select-Object -Unique).Count -eq 3) -and (($first.DraftId -join ',') -ceq ($second.DraftId -join ','))) 'Repeated reads changed the ID and the worker could not claim the legacy entry'
+    }
     Check 'legacy text deletion flags keep active tickets visible' {
         $legacy = @(
             @{Id='text-false'; Title='Visible'; IsDeleted='False'}

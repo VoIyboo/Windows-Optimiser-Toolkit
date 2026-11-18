@@ -86,6 +86,7 @@ try {
     }
 
     $payload = $payloadRaw | ConvertFrom-Json -ErrorAction Stop
+    if ($payload.PSObject.Properties['StorePath']) { Assert-QOTicketWorkerStore -StorePath $payload.StorePath }
     $ticketId = ""
     $subject = ""
     $body = ""

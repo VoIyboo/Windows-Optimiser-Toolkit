@@ -236,8 +236,13 @@ function Invoke-QOTRunSelectedAppsActions {
             $ErrorActionPreference = 'Stop'
             Import-Module $AppsModule -DisableNameChecking
             Import-Module $InstallModule -DisableNameChecking
+            $uninstallResults = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
             foreach ($request in $Requests) {
                 if ($CancelState.CancelRequested) { break }
+                if ($request.Kind -eq 'Uninstall' -and $uninstallResults.ContainsKey([string]$request.Command)) {
+                    $uninstallResults[[string]$request.Command]
+                    continue
+                }
                 $status = 'Success'
                 $reason = ''
                 try {
@@ -255,7 +260,9 @@ function Invoke-QOTRunSelectedAppsActions {
                     $status = 'Failed'
                     $reason = $_.Exception.Message
                 }
-                [pscustomobject]@{ Status=$status; Reason=$reason }
+                $outcome = [pscustomobject]@{ Status=$status; Reason=$reason }
+                if ($request.Kind -eq 'Uninstall') { $uninstallResults[[string]$request.Command] = $outcome }
+                $outcome
             }
         }).AddArgument($PSCommandPath).AddArgument((Join-Path $PSScriptRoot 'InstallCommonApps.psm1')).AddArgument(@($requests)).AddArgument($script:QOT_AppsActionsCancelState)
         $pending = $worker.BeginInvoke()

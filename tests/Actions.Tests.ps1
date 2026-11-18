@@ -86,13 +86,16 @@ try {
             "$env:SystemDrive\ESD\Recovery\install.esd"
             "$env:SystemRoot\Panther\setupact.log"
             "$env:LOCALAPPDATA\Microsoft\Teams\current\Teams.exe"
+            "$env:APPDATA\Microsoft\Teams\Backgrounds\Uploads\portrait.png"
+            "$env:APPDATA\Microsoft\Teams\desktop-config.json"
+            "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Backgrounds\Uploads\portrait.png"
             "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\other\data"
             "$env:TEMP\QuinnOptimiserToolkit\App\Current\toolkit.ps1"
         )
         $disposable = @(
             "$env:SystemRoot\Panther\setupact.log.bak"
             "$env:APPDATA\Microsoft\Teams\Cache\data"
-            "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\data"
+            "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\Code Cache\js\data"
             "$env:TEMP\ordinary\nested\data"
         )
         foreach ($path in $preserve + $disposable) {
@@ -154,7 +157,7 @@ try {
     Check ($result.Status -eq 'Skipped') 'Firewall reset requires an affirmative answer'
 
     $networkFixture = Join-Path $fixture 'network-fixture.exe'
-    Add-Type -TypeDefinition @'
+    & (Join-Path $PSScriptRoot 'New-TestExecutable.ps1') -Path $networkFixture -Source @'
 using System;
 using System.IO;
 using System.Diagnostics;
@@ -171,7 +174,7 @@ class NetworkFixture {
         }
     }
 }
-'@ -OutputAssembly $networkFixture -OutputType ConsoleApplication
+'@
     $runNetworkFixture = {
         param($file,$seconds)
         function Test-QOTIsAdmin { $true }
@@ -207,6 +210,22 @@ class NetworkFixture {
     }
 
     $driverModule = Import-Module "$repo/src/Advanced/AdvancedCleaning/AdvancedCleaning.psm1" -PassThru
+    foreach ($operation in 'Disable','Enable') {
+        $attempts = [Collections.Generic.List[string]]::new()
+        $result = & $driverModule {
+            param($operation,$attempts)
+            function Test-QOTIsAdmin { $true }
+            function Get-ScheduledTask { [pscustomobject]@{ State = if ($operation -eq 'Disable') {'Ready'} else {'Disabled'} } }
+            function Set-FixtureTask($name) {
+                $attempts.Add($name)
+                if ($name -eq 'Consolidator') { throw 'Fixture task update failed' }
+            }
+            function Disable-ScheduledTask($TaskPath,$TaskName) { Set-FixtureTask $TaskName }
+            function Enable-ScheduledTask($TaskPath,$TaskName) { Set-FixtureTask $TaskName }
+            if ($operation -eq 'Disable') { Invoke-QDisableTelemetryScheduledTasks } else { Invoke-QEnableTelemetryScheduledTasks }
+        } $operation $attempts
+        Check ($attempts.Count -eq 5 -and $result.Status -eq 'Failed' -and $result.Reason -match '4' -and $result.Reason -match '1') "$operation reports a partially updated scheduled-task group"
+    }
     $driverFixture = Join-Path $fixture 'driver-fixture.cmd'
     foreach ($exitCode in 0,1) {
         @('@echo off', 'echo Publizierter Name: oem12.inf', 'echo Original Name: oem12.inf', "exit /b $exitCode") | Set-Content -LiteralPath $driverFixture -Encoding ASCII
